@@ -17,7 +17,8 @@ pub(crate) fn read_file_limit(path: &str, limit: usize) -> Result<Box<[u8]>> {
     Ok(buf.into_boxed_slice())
 }
 
-pub(crate) fn get_file_inode(path: &str) -> Result<FileIdentity> {
+pub(crate) fn get_file_inode(path: impl AsRef<str>) -> Result<FileIdentity> {
+    let path = path.as_ref();
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata(path)?;
     Ok(FileIdentity {

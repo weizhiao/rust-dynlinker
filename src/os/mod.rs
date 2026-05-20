@@ -14,7 +14,7 @@ cfg_if::cfg_if! {
         pub(crate) fn read_file_limit(_path: &str, _limit: usize) -> crate::Result<alloc::boxed::Box<[u8]>> {
             Err(crate::Error::Unsupported)
         }
-        pub(crate) fn get_file_inode(_path: &str) -> crate::Result<FileIdentity> {
+        pub(crate) fn get_file_inode(_path: impl AsRef<str>) -> crate::Result<FileIdentity> {
             Err(crate::Error::Unsupported)
         }
     }

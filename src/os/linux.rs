@@ -193,7 +193,8 @@ pub(crate) fn read_file_limit(path: &str, limit: usize) -> Result<Box<[u8]>> {
     read_result
 }
 
-pub(crate) fn get_file_inode(path: &str) -> Result<FileIdentity> {
+pub(crate) fn get_file_inode(path: impl AsRef<str>) -> Result<FileIdentity> {
+    let path = path.as_ref();
     let mut path_c = Vec::from(path.as_bytes());
     path_c.push(0);
 
