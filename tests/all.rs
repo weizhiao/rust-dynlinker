@@ -138,6 +138,22 @@ fn promotion() {
 }
 
 #[test]
+fn soname_alias() {
+    compile();
+    let path = lib_path("libpromotion.so");
+
+    let lib = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
+    assert_eq!(lib.shortname(), "libpromotion_soname.so.1");
+
+    let by_soname = ElfLibrary::dlopen(
+        "libpromotion_soname.so.1",
+        OpenFlags::RTLD_NOW | OpenFlags::RTLD_NOLOAD,
+    )
+    .expect("SONAME should be an alias for the already loaded object");
+    assert_eq!(by_soname.name(), lib.name());
+}
+
+#[test]
 fn nodelete() {
     compile();
     let path = lib_path("libnodelete.so");

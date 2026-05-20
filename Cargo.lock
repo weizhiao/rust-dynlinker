@@ -313,8 +313,9 @@ checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
 
 [[package]]
 name = "elf_loader"
-version = "0.14.1"
-source = "git+https://github.com/weizhiao/Relink.git#96247220b2949e15567918e4e3139211df8c1c6a"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9959f211c58cc7b8d62c9bc49968081d44aa92d7544baa700aae07e6cedca1ef"
 dependencies = [
  "bitflags",
  "cfg-if",

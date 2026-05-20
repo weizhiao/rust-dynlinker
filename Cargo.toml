@@ -35,8 +35,7 @@ default-features = false
 features = ["default-hasher"]
 
 [dependencies.elf_loader]
-git = "https://github.com/weizhiao/Relink.git"
-#path = "../elf_loader"
+version = "0.15.1"
 default-features = false
 features = ["log", "tls", "lazy-binding"]
 
