@@ -9,8 +9,8 @@ use super::{
 };
 use crate::OpenFlags;
 use alloc::{borrow::Cow, string::String, vec::Vec};
-use elf_loader::image::ModuleHandle;
 use elf_loader::linker::LinkContext;
+use elf_loader::{image::ModuleHandle, memory::HostRegion};
 use hashbrown::{DefaultHashBuilder, HashMap};
 use spin::{Lazy, RwLock};
 
@@ -18,7 +18,7 @@ type IndexMap<K, V> = indexmap::IndexMap<K, V, DefaultHashBuilder>;
 
 #[inline]
 fn loaded_from_module(module: &ModuleHandle) -> Option<LoadedDylib> {
-    module.as_loaded::<ExtraData>().cloned()
+    module.as_loaded::<ExtraData, HostRegion>().cloned()
 }
 
 #[macro_export]

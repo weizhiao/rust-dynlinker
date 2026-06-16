@@ -16,20 +16,56 @@ use core::{
     ptr::null,
 };
 use elf_loader::{
-    Loader,
-    elf::{ElfDyn, ElfPhdr, ElfProgramType, Lifecycle},
+    arch::NativeArch,
+    elf::{ElfDyn, ElfPhdr, ElfProgramType},
     image::{LoadedCore, RawDynamic, Symbol},
+    memory::{RegionAccess, VmAddr},
+    observer::{AfterDynamicLoadEvent, InitEvent, LoadObserver, RelocationObserver},
 };
 
+#[cfg(not(feature = "std"))]
 pub(crate) type ElfDylib = RawDynamic<ExtraData>;
 pub(crate) type LoadedDylib = LoadedCore<ExtraData>;
-pub(crate) type RuntimeLoader =
-    Loader<elf_loader::os::DefaultMmap, (), ExtraData, ActiveTlsResolver>;
+#[cfg(not(feature = "std"))]
+pub(crate) type RuntimeLoader = elf_loader::Loader<DlopenObserver, ExtraData, ActiveTlsResolver>;
 
 #[cfg(not(feature = "std"))]
-use crate::rtld::ActiveTlsResolver;
+pub(crate) use crate::rtld::ActiveTlsResolver;
 #[cfg(feature = "std")]
-use elf_loader::tls::DefaultTlsResolver as ActiveTlsResolver;
+pub(crate) use elf_loader::tls::DefaultTlsResolver as ActiveTlsResolver;
+
+#[derive(Clone, Copy)]
+pub(crate) struct DlopenObserver;
+
+impl LoadObserver<ExtraData> for DlopenObserver {
+    fn on_after_dynamic_load<R: RegionAccess>(
+        &mut self,
+        mut event: AfterDynamicLoadEvent<'_, ExtraData, elf_loader::arch::NativeArch, R>,
+    ) -> elf_loader::Result<()> {
+        let raw = event.raw_mut();
+        let file_path = raw.name().contains('/').then(|| raw.name().to_owned());
+        finalize_raw_dylib(raw, file_path.as_deref());
+        Ok(())
+    }
+}
+
+impl RelocationObserver for DlopenObserver {
+    fn on_init<D: 'static, R: RegionAccess>(
+        &mut self,
+        event: &mut InitEvent<'_, D, elf_loader::arch::NativeArch, R>,
+    ) -> elf_loader::Result<()> {
+        let argc = unsafe { *core::ptr::addr_of!(ARGC) };
+        let argv = unsafe { *core::ptr::addr_of!(ARGV) };
+        let envp = unsafe { *core::ptr::addr_of!(ENVP) as *const *mut c_char };
+        type InitFn = unsafe extern "C" fn(c_int, *const *mut c_char, *const *mut c_char);
+        for init in event.lifecycle().func_addrs() {
+            let init: InitFn = unsafe { core::mem::transmute(init) };
+            unsafe { init(argc as c_int, argv, envp) };
+        }
+        event.lifecycle_mut().clear();
+        Ok(())
+    }
+}
 
 /// Searches for a symbol in a list of relocated libraries.
 ///
@@ -45,33 +81,10 @@ pub(crate) fn find_symbol<'lib, T>(
         .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
 }
 
-pub(crate) fn new_loader() -> RuntimeLoader {
-    Loader::new()
-        .with_tls_resolver::<ActiveTlsResolver>()
-        .with_dynamic_initializer::<ExtraData>(|raw| {
-            let file_path = raw.name().contains('/').then(|| raw.name().to_owned());
-            finalize_raw_dylib(raw, file_path.as_deref());
-            Ok(())
-        })
-        .with_init(|ctx: &Lifecycle| {
-            let argc = unsafe { *core::ptr::addr_of!(ARGC) };
-            let argv = unsafe { *core::ptr::addr_of!(ARGV) };
-            let envp = unsafe { *core::ptr::addr_of!(ENVP) as *const *mut c_char };
-            type InitFn = unsafe extern "C" fn(c_int, *const *mut c_char, *const *mut c_char);
-            if let Some(init) = ctx.func() {
-                let init: InitFn = unsafe { core::mem::transmute(init) };
-                unsafe { init(argc as c_int, argv, envp) };
-            }
-            if let Some(init_array) = ctx.func_array() {
-                for &f in init_array {
-                    let f: InitFn = unsafe { core::mem::transmute(f) };
-                    unsafe { f(argc as c_int, argv, envp) };
-                }
-            }
-        })
-}
-
-pub(crate) fn finalize_raw_dylib(dylib: &mut ElfDylib, file_path: Option<&str>) {
+pub(crate) fn finalize_raw_dylib<R: RegionAccess>(
+    dylib: &mut RawDynamic<ExtraData, NativeArch, R>,
+    file_path: Option<&str>,
+) {
     let needed_libs = dylib
         .needed_libs()
         .iter()
@@ -84,7 +97,7 @@ pub(crate) fn finalize_raw_dylib(dylib: &mut ElfDylib, file_path: Option<&str>) 
         .phdrs()
         .iter()
         .find(|p: &&ElfPhdr| p.program_type() == ElfProgramType::DYNAMIC)
-        .map(|p: &ElfPhdr| (base + p.p_vaddr()) as *mut ElfDyn)
+        .map(|p: &ElfPhdr| (base + p.p_vaddr()).as_mut_ptr::<ElfDyn>())
         .unwrap_or(core::ptr::null_mut());
 
     let phdrs = dylib.phdrs();
@@ -98,10 +111,14 @@ pub(crate) fn finalize_raw_dylib(dylib: &mut ElfDylib, file_path: Option<&str>) 
 
     let user_data = dylib.user_data_mut().unwrap();
     user_data.needed_libs = needed_libs;
+    if !dynamic_ptr.is_null() {
+        user_data.dynamic_table =
+            Some(unsafe { copy_dynamic_table(dynamic_ptr) }.into_boxed_slice());
+    }
     let c_name = CString::new(name).unwrap();
 
     let mut link_map = Box::new(LinkMap {
-        l_addr: base as *mut _,
+        l_addr: base.as_mut_ptr(),
         l_name: c_name.as_ptr(),
         l_ld: dynamic_ptr as *mut _,
         l_next: core::ptr::null_mut(),
@@ -131,6 +148,19 @@ pub(crate) fn finalize_raw_dylib(dylib: &mut ElfDylib, file_path: Option<&str>) 
             log::warn!("Failed to get file identity for [{}]", path);
         }
     }
+}
+
+unsafe fn copy_dynamic_table(mut dynamic: *const ElfDyn) -> Vec<ElfDyn> {
+    let mut table = Vec::new();
+    while !dynamic.is_null() {
+        let entry = unsafe { &*dynamic };
+        table.push(ElfDyn::new(entry.tag(), entry.value()));
+        if entry.tag() == elf_loader::elf::ElfDynamicTag::NULL {
+            break;
+        }
+        dynamic = unsafe { dynamic.add(1) };
+    }
+    table
 }
 
 /// Represents a successfully loaded and relocated dynamic library.
@@ -212,14 +242,8 @@ impl ElfLibrary {
 
     /// Get the base address of the dynamic library.
     #[inline]
-    pub fn base(&self) -> usize {
+    pub fn base(&self) -> VmAddr {
         self.inner.base()
-    }
-
-    /// Gets the memory length of the elf object map.
-    #[inline]
-    pub fn mapped_len(&self) -> usize {
-        self.inner.mapped_len()
     }
 
     /// Get the program headers of the dynamic library.
@@ -287,4 +311,27 @@ impl ElfLibrary {
                 .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
         }
     }
+}
+
+#[inline]
+pub(crate) fn contains_addr(lib: &LoadedDylib, addr: usize) -> bool {
+    lib.segments()
+        .contains_addr(elf_loader::memory::VmAddr::new(addr))
+}
+
+#[inline]
+pub(crate) fn mapped_end(lib: &LoadedDylib) -> usize {
+    let base = lib.base().get();
+    lib.segments()
+        .ranges()
+        .iter()
+        .filter_map(|range| {
+            range
+                .offset
+                .get()
+                .checked_add(range.len)
+                .and_then(|end| base.checked_add(end))
+        })
+        .max()
+        .unwrap_or(base)
 }

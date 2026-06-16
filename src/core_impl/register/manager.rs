@@ -16,8 +16,11 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use elf_loader::image::{ModuleHandle, ModuleScope};
 use elf_loader::linker::{KeyId, LinkContext};
+use elf_loader::{
+    image::{ModuleHandle, ModuleScope},
+    memory::HostRegion,
+};
 
 impl Manager {
     fn loaded_by_id(&self, id: KeyId) -> Option<LoadedDylib> {
@@ -292,7 +295,7 @@ impl Manager {
         let mut scope = Vec::with_capacity(group_scope.len() + self.global.len());
         let mut push_unique = |module: ModuleHandle| {
             let shortname = module
-                .as_loaded::<ExtraData>()
+                .as_loaded::<ExtraData, HostRegion>()
                 .map(DylibExt::shortname)
                 .unwrap_or_else(|| shortname_from_name(module.name()));
             if seen.insert(shortname.to_owned()) {
@@ -339,7 +342,7 @@ impl Manager {
                     .meta(id)
                     .cloned()
                     .expect("load_order entries must resolve to committed metadata");
-                let direct_deps = if let Some(lib) = module.as_loaded::<ExtraData>() {
+                let direct_deps = if let Some(lib) = module.as_loaded::<ExtraData, HostRegion>() {
                     self.canonical_direct_deps(lib)
                 } else {
                     self.link_ctx

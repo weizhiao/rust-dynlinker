@@ -16,6 +16,7 @@ use core::{
 };
 use elf_loader::{
     elf::{ElfDyn, ElfDynamicTag, ElfHeader, ElfPhdr, ElfProgramType},
+    memory::VmOffset,
     tls::{DefaultTlsResolver, TlsTpOffset},
 };
 use spin::Once;
@@ -101,7 +102,7 @@ unsafe fn find_r_debug(phdr_addr: usize, phnum: usize, interpreter_base: usize) 
     let mut dynamic_phdr = None;
     for phdr in phdrs {
         if phdr.program_type() == ElfProgramType::PHDR {
-            load_bias = Some(phdr_addr.wrapping_sub(phdr.p_vaddr()));
+            load_bias = Some(phdr_addr.wrapping_sub(phdr.p_vaddr().get()));
         } else if phdr.program_type() == ElfProgramType::DYNAMIC {
             dynamic_phdr = Some(phdr);
         }
@@ -110,7 +111,7 @@ unsafe fn find_r_debug(phdr_addr: usize, phnum: usize, interpreter_base: usize) 
     if load_bias.is_none() {
         for phdr in phdrs {
             if phdr.program_type() == ElfProgramType::LOAD && phdr.p_offset() == 0 {
-                let linked_phdr_addr = phdr.p_vaddr() + 64;
+                let linked_phdr_addr = phdr.p_vaddr().get() + 64;
                 load_bias = Some(phdr_addr.wrapping_sub(linked_phdr_addr));
                 break;
             }
@@ -118,8 +119,9 @@ unsafe fn find_r_debug(phdr_addr: usize, phnum: usize, interpreter_base: usize) 
     }
 
     if let (Some(bias), Some(phdr)) = (load_bias, dynamic_phdr) {
-        let ptr =
-            unsafe { find_debug_in_dynamic((bias.wrapping_add(phdr.p_vaddr())) as *const ElfDyn) };
+        let ptr = unsafe {
+            find_debug_in_dynamic((bias.wrapping_add(phdr.p_vaddr().get())) as *const ElfDyn)
+        };
         if !ptr.is_null() {
             return ptr;
         }
@@ -139,7 +141,7 @@ unsafe fn find_r_debug(phdr_addr: usize, phnum: usize, interpreter_base: usize) 
         {
             let ptr = unsafe {
                 find_debug_in_dynamic(
-                    (interpreter_base.wrapping_add(phdr.p_vaddr())) as *const ElfDyn,
+                    (interpreter_base.wrapping_add(phdr.p_vaddr().get())) as *const ElfDyn,
                 )
             };
             if !ptr.is_null() {
@@ -266,7 +268,7 @@ unsafe fn from_raw(
             .find(|p| p.program_type() == ElfProgramType::DYNAMIC)
         {
             let offset = (table.as_ptr() as usize).wrapping_sub(base);
-            p.set_p_vaddr(offset);
+            p.set_p_vaddr(VmOffset::new(offset));
         }
     }
 
@@ -326,7 +328,7 @@ fn get_phdrs_and_len(base: usize, extra: Option<&[ElfPhdr]>) -> (Vec<ElfPhdr>, u
     let len = phdrs
         .iter()
         .filter(|phdr| phdr.program_type() == ElfProgramType::LOAD)
-        .map(|phdr| phdr.p_vaddr() + phdr.p_memsz())
+        .map(|phdr| phdr.p_vaddr().get() + phdr.p_memsz())
         .max()
         .unwrap_or(0);
 
@@ -460,7 +462,7 @@ unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut 
     let dynamic_ptr = phdrs
         .iter()
         .find(|p| p.program_type() == ElfProgramType::DYNAMIC)
-        .map(|p| (base + p.p_vaddr()) as *const ElfDyn)
+        .map(|p| (base + p.p_vaddr().get()) as *const ElfDyn)
         .expect("No PT_DYNAMIC found in phdrs");
 
     // Calculate static TLS offset if applicable
@@ -488,7 +490,7 @@ unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut 
     log::info!(
         "Initialize lib: [{}] @ [{:#x}]",
         lib.shortname(),
-        lib.base()
+        lib.base().get()
     );
     register_loaded(
         lib,

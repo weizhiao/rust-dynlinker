@@ -8,14 +8,14 @@ use crate::{
     OpenFlags, Result,
     api::dlopen::{LinkRoot, OpenContext, link_root},
     core_impl::{
-        ARGC, ARGV, ENVP, ElfDylib, ElfLibrary, LoadedDylib, MANAGER, RuntimeLoader, new_loader,
-        register_loaded, shortname_from_name,
+        ARGC, ARGV, DlopenObserver, ENVP, ElfDylib, ElfLibrary, ExtraData, LoadedDylib, MANAGER,
+        RuntimeLoader, register_loaded, shortname_from_name,
     },
     error::find_lib_error,
 };
 use alloc::borrow::ToOwned;
 use core::ffi::{CStr, c_char, c_void};
-use elf_loader::{image::RawExec, input::PathBuf};
+use elf_loader::{Loader, image::RawExec, input::PathBuf, memory::VmAddr};
 
 use self::bootstrap::{BootstrapMode, BootstrapObject, BootstrapState};
 
@@ -84,7 +84,10 @@ unsafe fn prepare_kernel_mapped_main(state: &BootstrapState) -> Result<usize> {
         ENVP = state.envp as *const *const c_char;
     }
 
-    let mut loader = new_loader();
+    let mut loader = Loader::new()
+        .with_data::<ExtraData>()
+        .with_observer(DlopenObserver)
+        .with_tls_resolver::<ActiveTlsResolver>();
     let rtld = unsafe { load_borrowed(&mut loader, RTLD_NAME, state.rtld)? };
     let rtld = unsafe { LoadedDylib::from_core(rtld.core()) };
     register_loaded(
@@ -120,7 +123,10 @@ unsafe fn prepare_direct_exec(state: &BootstrapState) -> Result<usize> {
     let exec_path = unsafe { CStr::from_ptr(state.exec_path.cast()) }
         .to_str()
         .map_err(|_| find_lib_error("direct exec path is not utf-8"))?;
-    let mut loader = new_loader();
+    let mut loader = Loader::new()
+        .with_data::<ExtraData>()
+        .with_observer(DlopenObserver)
+        .with_tls_resolver::<ActiveTlsResolver>();
     let rtld = unsafe { load_borrowed(&mut loader, RTLD_NAME, state.rtld)? };
     let rtld = unsafe { LoadedDylib::from_core(rtld.core()) };
     register_loaded(
@@ -176,7 +182,7 @@ unsafe fn load_borrowed(
     }
 
     let phdrs = unsafe { core::slice::from_raw_parts(object.phdr, object.phnum) }.to_vec();
-    unsafe { loader.load_mapped_dynamic(name, object.load_bias, phdrs, object.entry) }
+    unsafe { loader.load_mapped_dynamic(name, VmAddr::new(object.load_bias), phdrs, object.entry) }
         .map_err(Into::into)
 }
 

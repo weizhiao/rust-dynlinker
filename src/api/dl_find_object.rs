@@ -1,4 +1,4 @@
-use crate::core_impl::{LinkMap, addr2dso};
+use crate::core_impl::{LinkMap, addr2dso, mapped_end};
 use core::{
     ffi::{c_int, c_void},
     ptr::null_mut,
@@ -33,13 +33,13 @@ pub unsafe fn dl_find_object(pc: *const c_void, dlfo: *mut c_void) -> c_int {
     let eh_frame = phdrs
         .iter()
         .find(|p| p.program_type() == ElfProgramType::GNU_EH_FRAME)
-        .map(|p| dso.base() + p.p_vaddr())
+        .map(|p| (dso.base() + p.p_vaddr()).get())
         .unwrap_or(0);
 
     let info = unsafe { &mut *dlfo.cast::<DlFindObject>() };
     info.dlfo_flags = 0;
-    info.dlfo_map_start = dso.base() as *mut c_void;
-    info.dlfo_map_end = (dso.base() + dso.mapped_len()) as *mut c_void;
+    info.dlfo_map_start = dso.base().as_mut_ptr();
+    info.dlfo_map_end = mapped_end(&dso.inner) as *mut c_void;
     info.dlfo_link_map = user_data
         .link_map
         .as_ref()

@@ -4,9 +4,7 @@ use super::{
     should_continue_library_search,
 };
 use crate::{
-    Result,
-    core_impl::{ExtraData, reserve_pending},
-    error::find_lib_error,
+    Result, core_impl::reserve_pending, error::find_lib_error,
     utils::linker_script::get_linker_script_libs,
 };
 use alloc::{
@@ -17,11 +15,11 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use elf_loader::image::ModuleHandle;
 use elf_loader::input::{ElfBinary, ElfFile, ElfReader, PathBuf as ElfPath};
 use elf_loader::linker::{
     DependencyRequest, KeyResolver, ResolvedKey, RootRequest, VisibleModules,
 };
+use elf_loader::{arch::NativeArch, image::ModuleHandle};
 
 fn into_linker_error(err: crate::error::Error) -> elf_loader::Error {
     match err {
@@ -47,10 +45,10 @@ impl<'ctx, 'mgr> DlopenVisible<'ctx, 'mgr> {
     }
 }
 
-impl VisibleModules<String, ExtraData> for DlopenVisible<'_, '_> {
-    fn contains_key(&self, key: &String) -> bool {
+impl VisibleModules<String> for DlopenVisible<'_, '_> {
+    fn visible_key(&self, key: &String) -> Option<String> {
         self.shared
-            .with_manager(|manager| manager.visible_contains(key))
+            .with_manager(|manager| manager.visible_contains(key).then(|| key.clone()))
     }
 
     fn direct_deps(&self, key: &String) -> Option<Box<[String]>> {
@@ -58,7 +56,7 @@ impl VisibleModules<String, ExtraData> for DlopenVisible<'_, '_> {
             .with_manager(|manager| manager.visible_direct_deps(key))
     }
 
-    fn module(&self, key: &String) -> Option<ModuleHandle> {
+    fn module(&self, key: &String) -> Option<ModuleHandle<NativeArch>> {
         self.shared
             .with_manager(|manager| manager.visible_loaded(key).map(Into::into))
     }
@@ -320,7 +318,7 @@ impl<'ctx, 'mgr, 'bytes> KeyResolver<'bytes, String> for LinkResolver<'ctx, 'mgr
             .runpath()
             .map(|r| fixup_rpath(owner_name, r))
             .unwrap_or_default();
-        let is_visible = |key: &str| req.is_visible(&key.to_owned());
+        let is_visible = |key: &str| req.visible_key(&key.to_owned()).is_some();
         let env = ResolveEnv::new(Some(&is_visible), &rpath, &runpath);
         self.resolve_request(env, req.needed(), CandidateSource::File)
             .map_err(into_linker_error)

@@ -10,7 +10,10 @@ use self::{
 };
 use crate::{
     OpenFlags, Result,
-    core_impl::{AsFilename, DylibExt, ENVP, ElfLibrary, MANAGER, new_loader},
+    core_impl::{
+        ActiveTlsResolver, AsFilename, DlopenObserver, DylibExt, ENVP, ElfLibrary, ExtraData,
+        MANAGER,
+    },
     error::find_lib_error,
     utils::ld_cache::LdCache,
 };
@@ -96,8 +99,14 @@ pub(crate) fn link_root<'mgr, 'bytes>(
     let visible_modules = DlopenVisible::new(&ctx.shared);
     let mut link_ctx = LinkContext::new();
     let relocation_planner = DlopenPlanner::new(&ctx.shared);
-    let mut linker = Linker::<String, ()>::new()
-        .map_loader(|_| new_loader())
+    let mut linker = Linker::<String>::new()
+        .map_loader(|loader| {
+            loader
+                .with_data::<ExtraData>()
+                .with_observer(DlopenObserver)
+                .with_tls_resolver::<ActiveTlsResolver>()
+        })
+        .map_relocator(|relocator| relocator.observer(DlopenObserver))
         .visible_modules(visible_modules)
         .resolver(key_resolver)
         .planner(relocation_planner);

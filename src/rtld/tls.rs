@@ -88,7 +88,7 @@ unsafe impl Sync for StaticTlsArea {}
 
 static STATIC_TLS: Mutex<Option<StaticTlsArea>> = Mutex::new(None);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct StaticTlsModule {
     info: TlsInfo,
     offset: TlsTpOffset,
@@ -134,10 +134,10 @@ fn register_static_module(tls_info: &TlsInfo) -> Result<(TlsModuleId, TlsTpOffse
 
     let offset = TlsTpOffset::new(-(used as isize));
     let module = StaticTlsModule {
-        info: *tls_info,
+        info: tls_info.clone(),
         offset,
     };
-    unsafe { init_static_tls_module(area.tp, module) };
+    unsafe { init_static_tls_module(area.tp, &module) };
 
     area.used = used;
     area.max_align = area.max_align.max(align);
@@ -150,7 +150,7 @@ pub(crate) unsafe fn refresh_static_tls() {
     let Some(tp) = STATIC_TLS.lock().as_ref().map(|area| area.tp) else {
         return;
     };
-    for module in STATIC_TLS_MODULES.lock().iter().copied() {
+    for module in STATIC_TLS_MODULES.lock().iter() {
         unsafe { init_static_tls_module(tp, module) };
     }
 }
@@ -219,7 +219,7 @@ pub(crate) unsafe fn init(storage: *mut u8) -> *mut u8 {
         return ptr::null_mut();
     }
 
-    for module in STATIC_TLS_MODULES.lock().iter().copied() {
+    for module in STATIC_TLS_MODULES.lock().iter() {
         unsafe { init_static_tls_module(storage, module) };
     }
 
@@ -264,10 +264,10 @@ fn allocate_storage() -> Option<*mut u8> {
     Some(tp)
 }
 
-unsafe fn init_static_tls_module(tp: *mut u8, module: StaticTlsModule) {
+unsafe fn init_static_tls_module(tp: *mut u8, module: &StaticTlsModule) {
     let dst = unsafe { tp.offset(module.offset.get()) };
     unsafe {
-        ptr::copy_nonoverlapping(module.info.image.as_ptr(), dst, module.info.filesz);
+        ptr::copy_nonoverlapping(module.info.image().as_ptr(), dst, module.info.filesz);
         ptr::write_bytes(
             dst.add(module.info.filesz),
             0,

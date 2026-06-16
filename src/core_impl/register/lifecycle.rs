@@ -1,7 +1,7 @@
 use super::{MANAGER, Manager, libc_compat_aliases, normalized_flags};
 use crate::{
     ElfLibrary, OpenFlags,
-    core_impl::{DylibExt, FileIdentity, LoadedDylib},
+    core_impl::{DylibExt, FileIdentity, LoadedDylib, contains_addr, mapped_end},
 };
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::ffi::{c_int, c_void};
@@ -65,8 +65,8 @@ impl Drop for ElfLibrary {
             }
         }
         for lib in removed_libs {
-            let base = lib.base();
-            let range = base..(base + lib.mapped_len());
+            let base = lib.base().get();
+            let range = base..mapped_end(&lib);
             finalize(base as *mut _, Some(range));
         }
     }
@@ -153,11 +153,7 @@ pub(crate) unsafe fn next_find<'a, T>(addr: usize, name: &str) -> Option<crate::
     let lock = crate::lock_read!(MANAGER);
     let libs = lock.all_values().collect::<Vec<_>>();
     // Find the library containing the address
-    let idx = libs.iter().position(|v| {
-        let start = v.base();
-        let end = start + v.mapped_len();
-        (start..end).contains(&addr)
-    })?;
+    let idx = libs.iter().position(|v| contains_addr(v, addr))?;
 
     // Search in all subsequent libraries
     libs.into_iter().skip(idx + 1).find_map(|lib| unsafe {
@@ -175,11 +171,7 @@ pub(crate) unsafe fn next_find<'a, T>(addr: usize, name: &str) -> Option<crate::
 pub(crate) fn addr2dso(addr: usize) -> Option<ElfLibrary> {
     log::trace!("addr2dso: addr [{:#x}]", addr);
     let manager = crate::lock_read!(MANAGER);
-    let entry = manager.all_values().find(|v| {
-        let start = v.base();
-        let end = start + v.mapped_len();
-        (start..end).contains(&addr)
-    })?;
+    let entry = manager.all_values().find(|v| contains_addr(v, addr))?;
     let deps = manager.library_scope(entry.shortname())?;
     Some(ElfLibrary {
         inner: entry,
@@ -218,10 +210,8 @@ fn finalize(dso_handle: *mut c_void, range: Option<core::ops::Range<usize>>) {
         if range.is_none() && !dso_handle.is_null() {
             let manager = MANAGER.read();
             for v in manager.all_values() {
-                let start = v.base();
-                let end = start + v.mapped_len();
-                if (start..end).contains(&(dso_handle as usize)) {
-                    range = Some(start..end);
+                if contains_addr(&v, dso_handle as usize) {
+                    range = Some(v.base().get()..mapped_end(&v));
                     break;
                 }
             }

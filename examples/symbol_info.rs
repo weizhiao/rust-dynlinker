@@ -25,7 +25,7 @@ fn main() -> Result<(), String> {
         if let Some(sname) = info.symbol_name() {
             println!("  Symbol: {}", sname);
         }
-        println!("  Base address: {:#x}", info.dylib().base());
+        println!("  Base address: {:#x}", info.dylib().base().get());
         println!("  Symbol address: {:#x}", info.symbol_addr().unwrap_or(0));
     }
 

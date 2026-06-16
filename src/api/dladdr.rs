@@ -1,6 +1,6 @@
 use crate::{ElfLibrary, core_impl::addr2dso};
 use core::{
-    ffi::{CStr, c_char, c_int, c_void},
+    ffi::{c_char, c_int, c_void},
     fmt::Debug,
     ptr::null,
 };
@@ -17,7 +17,7 @@ pub struct DlInfo {
     /// dylib
     dylib: ElfLibrary,
     /// Name of symbol whose definition overlaps addr
-    sname: Option<&'static CStr>,
+    sname: Option<&'static str>,
     /// Exact address of symbol named in dli_sname
     saddr: usize,
 }
@@ -31,7 +31,7 @@ impl DlInfo {
     /// Name of symbol whose definition overlaps addr
     #[inline]
     pub fn symbol_name(&self) -> Option<&str> {
-        self.sname.and_then(|s| s.to_str().ok())
+        self.sname
     }
 
     /// Exact address of symbol
@@ -65,41 +65,41 @@ impl ElfLibrary {
             addr
         );
         addr2dso(addr).map(|dylib| {
-            let mut dl_info = DlInfo {
+            let (sname, saddr) = find_best_symbol(&dylib, addr).unwrap_or((None, 0));
+            DlInfo {
                 dylib,
-                sname: None,
-                saddr: 0,
-            };
-            let symtab = dl_info.dylib.inner.symtab();
-            let mut best_match: Option<(usize, &CStr)> = None;
-            for i in 0..symtab.count_syms() {
-                let (sym, syminfo) = symtab.symbol_idx(i);
-                if sym.st_value() == 0 || !sym.is_ok_bind() || !sym.is_ok_type() {
-                    continue;
-                }
-                let start = dl_info.dylib.base() + sym.st_value();
-                let end = start + sym.st_size();
-                if start <= addr && (sym.st_size() == 0 || addr < end) {
-                    if let Some((best_start, _)) = best_match {
-                        if start > best_start {
-                            if let Some(cname) = syminfo.cname() {
-                                best_match = Some((start, cname));
-                            }
-                        }
-                    } else {
-                        if let Some(cname) = syminfo.cname() {
-                            best_match = Some((start, cname));
-                        }
-                    }
-                }
+                sname,
+                saddr,
             }
-            if let Some((start, cname)) = best_match {
-                dl_info.sname = Some(unsafe { core::mem::transmute(cname) });
-                dl_info.saddr = start;
-            }
-            dl_info
         })
     }
+}
+
+fn find_best_symbol(dylib: &ElfLibrary, addr: usize) -> Option<(Option<&'static str>, usize)> {
+    let base = dylib.base().get();
+    let core = unsafe { dylib.inner.core_ref() };
+    let exports = core.exports();
+    let symbols = exports.symbols();
+    let mut best_match = None;
+
+    for sym in symbols {
+        if sym.is_undef() || sym.st_value() == 0 || !sym.is_ok_bind() || !sym.is_ok_type() {
+            continue;
+        }
+
+        let start = base + sym.st_value();
+        let end = start + sym.st_size();
+        if start <= addr && (sym.st_size() == 0 || addr < end) {
+            if best_match.is_none_or(|(_, best_start)| start > best_start) {
+                let name = exports
+                    .symbol_name(sym)
+                    .map(|name| unsafe { core::mem::transmute(name) });
+                best_match = Some((name, start));
+            }
+        }
+    }
+
+    best_match
 }
 
 /// # Safety
@@ -108,10 +108,12 @@ impl ElfLibrary {
 pub unsafe extern "C" fn dladdr(addr: *const c_void, info: *mut CDlinfo) -> c_int {
     if let Some(dl_info) = ElfLibrary::dladdr(addr as usize) {
         let info = unsafe { &mut *info };
-        info.dli_fbase = dl_info.dylib().base() as _;
+        info.dli_fbase = dl_info.dylib().base().as_mut_ptr();
         info.dli_fname = dl_info.dylib().cname();
         info.dli_saddr = dl_info.symbol_addr().unwrap_or(0) as _;
-        info.dli_sname = dl_info.sname.map_or(null(), |s| s.as_ptr());
+        info.dli_sname = dl_info
+            .sname
+            .map_or(null(), |s| s.as_ptr() as *const c_char);
         1
     } else {
         0

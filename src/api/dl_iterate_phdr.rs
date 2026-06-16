@@ -83,7 +83,7 @@ impl ElfLibrary {
             }
             let tls_modid = lib.tls_mod_id();
             let info = DlPhdrInfo {
-                lib_base: lib.base(),
+                lib_base: lib.base().get(),
                 lib_name: extra_data
                     .c_name
                     .as_ref()

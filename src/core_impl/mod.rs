@@ -6,7 +6,10 @@ mod types;
 pub use loader::ElfLibrary;
 pub use traits::AsFilename;
 
-pub(crate) use loader::{DylibExt, LoadedDylib, find_symbol, new_loader};
+pub(crate) use loader::{
+    ActiveTlsResolver, DlopenObserver, DylibExt, LoadedDylib, contains_addr, find_symbol,
+    mapped_end,
+};
 #[cfg(not(feature = "std"))]
 pub(crate) use loader::{ElfDylib, RuntimeLoader, shortname_from_name};
 pub(crate) use register::{
