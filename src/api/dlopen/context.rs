@@ -10,7 +10,7 @@ use alloc::borrow::ToOwned;
 use alloc::{collections::BTreeSet, string::String, sync::Arc};
 use core::cell::RefCell;
 use elf_loader::image::ModuleScope;
-use elf_loader::linker::{KeyId, LinkContext};
+use elf_loader::linker::{LinkContext, ModuleId};
 use spin::RwLockWriteGuard;
 
 /// The context for a `dlopen` operation.
@@ -244,7 +244,7 @@ impl<'a> OpenContext<'a> {
     pub(super) fn complete_relocation(
         &mut self,
         link_ctx: &LinkContext<String, ExtraData, GlobalMeta>,
-        committed: impl IntoIterator<Item = KeyId>,
+        committed: impl IntoIterator<Item = ModuleId>,
     ) {
         let mut lock = self
             .shared
@@ -266,9 +266,6 @@ impl<'a> OpenContext<'a> {
     pub(super) fn finish(mut self, deps: Arc<[LoadedDylib]>) -> ElfLibrary {
         self.committed = true;
         let core = deps[0].clone();
-        ElfLibrary {
-            inner: core,
-            deps: Some(deps),
-        }
+        ElfLibrary { inner: core, deps }
     }
 }

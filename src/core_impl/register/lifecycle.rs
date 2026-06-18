@@ -25,7 +25,6 @@ impl Drop for ElfLibrary {
             let has_global = flags.is_global();
             // Dylib ref in committed link_ctx + dylib ref in this handle's deps list
             // + global ref (if present) + handle's inner ref.
-            debug_assert!(self.deps.is_some());
             let threshold = 3 + has_global as usize;
 
             log::debug!(
@@ -42,24 +41,22 @@ impl Drop for ElfLibrary {
                 lock.remove(shortname);
 
                 // Check dependencies
-                if let Some(deps) = self.deps.as_ref() {
-                    for dep in deps.iter().skip(1) {
-                        let dep_shortname = dep.shortname();
-                        let Some(dep_flags) = lock.flags(dep_shortname) else {
-                            continue;
-                        };
-                        if dep_flags.is_nodelete() {
-                            continue;
-                        }
-                        // Dylib ref in committed link_ctx + dylib ref in the owner deps list
-                        // + global ref (if present).
-                        let dep_threshold = 3 + dep_flags.is_global() as usize;
+                for dep in self.deps.iter().skip(1) {
+                    let dep_shortname = dep.shortname();
+                    let Some(dep_flags) = lock.flags(dep_shortname) else {
+                        continue;
+                    };
+                    if dep_flags.is_nodelete() {
+                        continue;
+                    }
+                    // Dylib ref in committed link_ctx + dylib ref in the owner deps list
+                    // + global ref (if present).
+                    let dep_threshold = 3 + dep_flags.is_global() as usize;
 
-                        if unsafe { dep.core_ref().strong_count() } == dep_threshold {
-                            log::info!("Destroying dylib [{}]", dep.name());
-                            removed_libs.push(dep.clone());
-                            lock.remove(dep_shortname);
-                        }
+                    if unsafe { dep.core_ref().strong_count() } == dep_threshold {
+                        log::info!("Destroying dylib [{}]", dep.name());
+                        removed_libs.push(dep.clone());
+                        lock.remove(dep_shortname);
                     }
                 }
             }
@@ -116,7 +113,7 @@ pub(crate) fn register_loaded(lib: LoadedDylib, flags: OpenFlags, manager: &mut 
         flags
     );
 
-    manager.add_loaded(shortname.clone(), lib.clone(), flags);
+    let module_id = manager.add_loaded(shortname.clone(), lib.clone(), flags);
 
     if let Some(identity) = lib.user_data().file_identity {
         manager.add_identity(identity, &shortname);
@@ -126,7 +123,7 @@ pub(crate) fn register_loaded(lib: LoadedDylib, flags: OpenFlags, manager: &mut 
         manager.add_alias(&shortname, alias);
     }
     if flags.is_global() || is_main {
-        manager.add_global(shortname, lib);
+        manager.add_global(module_id);
     }
 }
 
@@ -173,10 +170,7 @@ pub(crate) fn addr2dso(addr: usize) -> Option<ElfLibrary> {
     let manager = crate::lock_read!(MANAGER);
     let entry = manager.all_values().find(|v| contains_addr(v, addr))?;
     let deps = manager.library_scope(entry.shortname())?;
-    Some(ElfLibrary {
-        inner: entry,
-        deps: Some(deps),
-    })
+    Some(ElfLibrary { inner: entry, deps })
 }
 
 fn register_atexit(

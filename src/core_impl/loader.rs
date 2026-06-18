@@ -171,7 +171,7 @@ unsafe fn copy_dynamic_table(mut dynamic: *const ElfDyn) -> Vec<ElfDyn> {
 pub struct ElfLibrary {
     pub(crate) inner: LoadedDylib,
     /// The flattened dependency scope (Searchlist) used by this library.
-    pub(crate) deps: Option<Arc<[LoadedDylib]>>,
+    pub(crate) deps: Arc<[LoadedDylib]>,
 }
 
 impl Debug for ElfLibrary {
@@ -287,7 +287,7 @@ impl ElfLibrary {
     /// ```
     #[inline]
     pub unsafe fn get<'lib, T>(&'lib self, name: &str) -> Result<Symbol<'lib, T>> {
-        find_symbol(self.deps.as_ref().unwrap(), name)
+        find_symbol(&self.deps, name)
     }
 
     /// Load a versioned symbol from the dynamic library.

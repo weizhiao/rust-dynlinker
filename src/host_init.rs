@@ -509,10 +509,6 @@ fn init() {
             iterate_phdr(debug.map, |iter| {
                 iter(Some(callback), null_mut());
             });
-
-            // Publish the host libraries into the committed link graph.
-            let mut lock = crate::lock_write!(MANAGER);
-            lock.rebuild_link_ctx();
         }
         log::info!("init: initialization complete");
     });

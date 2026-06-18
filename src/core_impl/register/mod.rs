@@ -9,17 +9,12 @@ use super::{
 };
 use crate::OpenFlags;
 use alloc::{borrow::Cow, string::String, vec::Vec};
-use elf_loader::linker::LinkContext;
-use elf_loader::{image::ModuleHandle, memory::HostRegion};
+use elf_loader::linker::{LinkContext, ModuleId};
 use hashbrown::{DefaultHashBuilder, HashMap};
 use spin::{Lazy, RwLock};
 
 type IndexMap<K, V> = indexmap::IndexMap<K, V, DefaultHashBuilder>;
-
-#[inline]
-fn loaded_from_module(module: &ModuleHandle) -> Option<LoadedDylib> {
-    module.as_loaded::<ExtraData, HostRegion>().cloned()
-}
+type IndexSet<K> = indexmap::IndexSet<K, DefaultHashBuilder>;
 
 #[macro_export]
 macro_rules! lock_write {
@@ -133,9 +128,7 @@ pub(crate) struct Manager {
     /// committed to the dependency graph.
     pending: IndexMap<String, PendingDylib>,
     /// Libraries available in the global symbol scope (RTLD_GLOBAL).
-    global: IndexMap<String, LoadedDylib>,
-    /// Alias names that resolve to a canonical short name.
-    aliases: HashMap<String, String>,
+    global: IndexSet<ModuleId>,
     /// Maps file identities to the canonical short name for fast inode-based lookup.
     identities: HashMap<FileIdentity, String>,
     /// Fully linked modules indexed by canonical key.
@@ -150,8 +143,7 @@ pub(crate) struct Manager {
 pub(crate) static MANAGER: Lazy<RwLock<Manager>> = Lazy::new(|| {
     RwLock::new(Manager {
         pending: IndexMap::with_hasher(DefaultHashBuilder::default()),
-        global: IndexMap::with_hasher(DefaultHashBuilder::default()),
-        aliases: HashMap::new(),
+        global: IndexSet::with_hasher(DefaultHashBuilder::default()),
         identities: HashMap::new(),
         link_ctx: LinkContext::new(),
         adds: 0,
