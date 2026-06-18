@@ -1,5 +1,6 @@
 use super::{
-    GlobalMeta, LibraryLookup, Manager, PendingDylib, libc_compat_aliases, normalized_flags,
+    GlobalMeta, LibraryLookup, Manager, PendingDylib, PendingModuleId, libc_compat_aliases,
+    normalized_flags,
 };
 use crate::core_impl::loader::shortname_from_name;
 use crate::{
@@ -30,48 +31,57 @@ impl Manager {
         self.link_ctx.module_id(id)
     }
 
-    fn contains_canonical_key(&self, key: &str) -> bool {
-        self.pending.contains_key(key) || self.committed_module(key).is_some()
+    fn pending_id(&self, key: &str) -> Option<PendingModuleId> {
+        self.pending_keys.get(key).copied()
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.pending_keys.contains_key(key) || self.committed_module(key).is_some()
     }
 
     fn committed_lookup<'a>(&'a self, key: &str) -> Option<LibraryLookup<'a>> {
         let id = self.committed_module(key)?;
-        let inner = self.link_ctx.get(id)?;
         let shortname = self
             .link_ctx
             .module_key(id)
             .expect("committed module must resolve to an entry key");
-        Some(LibraryLookup::Relocated {
-            shortname: Cow::Borrowed(shortname),
-            name: Cow::Borrowed(inner.name()),
-        })
+        Some(LibraryLookup::relocated(Cow::Borrowed(shortname)))
     }
 
     fn pending_lookup<'a>(&'a self, key: &str) -> Option<LibraryLookup<'a>> {
+        let id = self.pending_id(key)?;
         self.pending
-            .get_key_value(key)
-            .map(|(shortname, _)| LibraryLookup::Pending {
-                shortname: Cow::Borrowed(shortname),
-            })
+            .get(&id)
+            .map(|lib| LibraryLookup::pending(Cow::Borrowed(lib.shortname())))
     }
 
-    fn pending_alias_canonical<'a>(&'a self, alias: &str) -> Option<&'a str> {
-        self.pending.iter().find_map(|(shortname, lib)| {
-            lib.libnames
-                .iter()
-                .any(|name| name == alias)
-                .then_some(shortname.as_str())
-        })
+    fn add_pending_alias(&mut self, id: PendingModuleId, alias: &str) {
+        let lib = self
+            .pending
+            .get_mut(&id)
+            .expect("pending alias target must be pending");
+        lib.libnames.push(alias.to_owned());
+        let previous = self.pending_keys.insert(alias.to_owned(), id);
+        debug_assert!(previous.is_none(), "pending alias inserted twice");
     }
 
-    fn canonical_name_owned(&self, name: &str) -> Option<String> {
-        Some(self.lookup(name)?.shortname().to_owned())
-    }
-
-    fn promoted_name(&mut self, name: &str, flags: OpenFlags) -> Option<String> {
-        let canonical = self.canonical_name_owned(name)?;
-        self.promote(&canonical, flags);
-        Some(canonical)
+    fn remove_pending(&mut self, id: PendingModuleId) -> Option<PendingDylib> {
+        let lib = self.pending.shift_remove(&id)?;
+        let previous = self.pending_keys.remove(lib.shortname());
+        debug_assert_eq!(
+            previous,
+            Some(id),
+            "pending canonical name must point to the removed module"
+        );
+        for alias in &lib.libnames {
+            let previous = self.pending_keys.remove(alias);
+            debug_assert_eq!(
+                previous,
+                Some(id),
+                "pending alias must point to the removed module"
+            );
+        }
+        Some(lib)
     }
 
     pub(crate) fn add_global(&mut self, id: ModuleId) {
@@ -95,15 +105,15 @@ impl Manager {
         flags: OpenFlags,
     ) -> ModuleId {
         debug_assert!(
-            !self.contains_canonical_key(&name),
+            !self.contains_key(&name),
             "Library [{}] is already registered",
             name
         );
-        let direct_deps = self.canonical_direct_deps(&lib);
+        let direct_deps = self.resolved_direct_deps(&lib);
         let id = self
             .link_ctx
             .insert_with_meta(
-                name.clone(),
+                name,
                 lib,
                 direct_deps,
                 GlobalMeta {
@@ -113,76 +123,67 @@ impl Manager {
             )
             .expect("registry insert must not insert duplicate keys");
         self.adds += 1;
+        let name = self
+            .link_ctx
+            .module_key(id)
+            .expect("registered module must resolve to an entry key");
         log::trace!("Registered [{}] in global manager", name);
         id
     }
 
     pub(super) fn add_pending_reservation(&mut self, name: String, flags: OpenFlags) {
         debug_assert!(
-            !self.contains_canonical_key(&name),
+            !self.contains_key(&name),
             "Library [{}] is already registered",
             name
         );
-        let previous = self
-            .pending
-            .insert(name.clone(), PendingDylib::reserved(flags));
+        let id = PendingModuleId::new(self.pending_next_id);
+        self.pending_next_id = self
+            .pending_next_id
+            .checked_add(1)
+            .expect("pending module id overflow");
+        let previous = self.pending_keys.insert(name.clone(), id);
         debug_assert!(previous.is_none(), "Library [{}] is already pending", name);
+        let pending = PendingDylib::reserved(name, flags);
         self.adds += 1;
-        log::trace!("Reserved pending library [{}] in global manager", name);
+        log::trace!(
+            "Reserved pending library [{}] in global manager",
+            pending.shortname()
+        );
+        let previous = self.pending.insert(id, pending);
+        debug_assert!(previous.is_none(), "pending module id inserted twice");
     }
 
-    pub(crate) fn add_alias(&mut self, canonical: &str, alias: &str) {
-        debug_assert!(
-            self.contains_canonical_key(canonical),
-            "Canonical library [{}] must be registered before adding aliases",
-            canonical
-        );
+    pub(crate) fn add_alias(&mut self, target: &str, alias: &str) {
+        let pending_id = self.pending_id(target);
 
-        if alias.is_empty() || alias == canonical {
+        if alias.is_empty() || alias == target {
             return;
         }
 
-        if self.contains_canonical_key(alias) {
+        if self.contains_key(alias) {
             log::trace!(
-                "Skipping alias [{}] for [{}]: the name is already used as a canonical key",
+                "Skipping alias [{}] for [{}]: the name is already used",
                 alias,
-                canonical
+                target
             );
             return;
         }
 
-        if let Some(existing) = self.pending_alias_canonical(alias) {
-            if existing != canonical {
-                log::trace!(
-                    "Skipping alias [{}] for [{}]: it already resolves to [{}]",
-                    alias,
-                    canonical,
-                    existing
-                );
-            }
-            return;
-        }
-
-        log::trace!("Adding alias [{}] to library [{}]", alias, canonical);
-        if let Some(lib) = self.pending.get_mut(canonical) {
-            lib.libnames.push(alias.to_owned());
+        log::trace!("Adding alias [{}] to library [{}]", alias, target);
+        if let Some(id) = pending_id {
+            self.add_pending_alias(id, alias);
         } else {
-            let canonical = canonical.to_owned();
             let id = self
                 .link_ctx
-                .add_alias(&canonical, alias.to_owned())
+                .add_alias(target, alias.to_owned())
                 .expect("library alias must not target a different committed module");
             self.link_ctx
                 .meta_mut(id)
-                .expect("Canonical library must be registered before adding aliases")
+                .expect("Alias target library must be registered before adding aliases")
                 .libnames
                 .push(alias.to_owned());
         }
-    }
-
-    pub(super) fn add_loaded_aliases(&mut self, canonical: &str, lib: &LoadedDylib) {
-        self.add_alias(canonical, lib.shortname());
-        self.add_alias(canonical, lib.path().file_name());
     }
 
     pub(crate) fn add_identity(&mut self, identity: FileIdentity, name: &str) {
@@ -191,7 +192,10 @@ impl Manager {
     }
 
     pub(crate) fn remove(&mut self, shortname: &str) {
-        let removed = if let Some(lib) = self.pending.shift_remove(shortname) {
+        let removed = if let Some(id) = self.pending_id(shortname) {
+            let lib = self
+                .remove_pending(id)
+                .expect("pending name must resolve to a pending module");
             Some((None, lib.flags))
         } else if let Some(id) = self.committed_module(shortname) {
             self.link_ctx
@@ -223,8 +227,7 @@ impl Manager {
         if let Some(lib) = self.pending_lookup(name) {
             return Some(lib);
         }
-        let canonical = self.pending_alias_canonical(name)?;
-        self.pending_lookup(canonical)
+        None
     }
 
     pub(crate) fn flags(&self, name: &str) -> Option<OpenFlags> {
@@ -234,11 +237,14 @@ impl Manager {
         {
             return Some(meta.flags);
         }
-        if let Some(lib) = self.pending.get(name) {
+        if let Some(id) = self.pending_id(name) {
+            let lib = self
+                .pending
+                .get(&id)
+                .expect("pending name must resolve to a pending module");
             return Some(lib.flags);
         }
-        let canonical = self.pending_alias_canonical(name)?;
-        self.pending.get(canonical).map(|lib| lib.flags)
+        None
     }
 
     #[inline]
@@ -281,7 +287,7 @@ impl Manager {
         Some(ElfLibrary { inner: lib, deps })
     }
 
-    pub(crate) fn canonical_direct_deps(&self, lib: &LoadedDylib) -> Box<[String]> {
+    pub(crate) fn resolved_direct_deps(&self, lib: &LoadedDylib) -> Box<[String]> {
         let mut deps = Vec::with_capacity(lib.needed_libs().len());
         let mut seen = BTreeSet::new();
 
@@ -365,7 +371,13 @@ impl Manager {
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            let pending = self.pending.shift_remove(&key);
+            let pending = self.pending_id(&key).and_then(|id| {
+                self.pending
+                    .get(&id)
+                    .is_some_and(|lib| lib.shortname() == key)
+                    .then(|| self.remove_pending(id))
+                    .flatten()
+            });
             let was_pending = pending.is_some();
             let meta = pending
                 .map(|lib| GlobalMeta {
@@ -401,7 +413,8 @@ impl Manager {
                 self.add_identity(identity, &key);
             }
             if let Some(lib) = loaded.as_ref() {
-                self.add_loaded_aliases(&key, lib);
+                self.add_alias(&key, lib.shortname());
+                self.add_alias(&key, lib.path().file_name());
             }
             for alias in libc_compat_aliases(&key) {
                 self.add_alias(&key, alias);
@@ -418,14 +431,17 @@ impl Manager {
         );
     }
 
-    pub(crate) fn visible_contains(&self, name: &str) -> bool {
-        self.canonical_name_owned(name)
-            .is_some_and(|canonical| self.link_ctx.contains_key(&canonical))
+    pub(crate) fn visible_key(&self, name: &str) -> Option<String> {
+        let lookup = self.lookup(name)?;
+        self.link_ctx
+            .contains_key(lookup.shortname())
+            .then(|| lookup.shortname().to_owned())
     }
 
     pub(crate) fn visible_direct_deps(&self, name: &str) -> Option<Box<[String]>> {
-        let canonical = self.canonical_name_owned(name)?;
-        if let Some(id) = self.committed_module(&canonical) {
+        let lookup = self.lookup(name)?;
+        let shortname = lookup.shortname();
+        if let Some(id) = self.committed_module(shortname) {
             let direct_deps = self
                 .link_ctx
                 .direct_deps(id)?
@@ -441,34 +457,42 @@ impl Manager {
             return Some(direct_deps);
         }
 
-        let lib = self.pending.get(&canonical)?;
-        Some(self.canonical_direct_deps(lib.dylib_ref()?))
+        let id = self.pending_id(shortname)?;
+        let lib = self.pending.get(&id)?;
+        Some(self.resolved_direct_deps(lib.dylib_ref()?))
     }
 
     pub(crate) fn visible_loaded(&self, name: &str) -> Option<LoadedDylib> {
-        let canonical = self.canonical_name_owned(name)?;
-        self.committed_module(&canonical)
+        let lookup = self.lookup(name)?;
+        let shortname = lookup.shortname();
+        self.committed_module(shortname)
             .and_then(|id| self.loaded_by_module(id))
-            .or_else(|| self.pending.get(&canonical).and_then(PendingDylib::dylib))
+            .or_else(|| {
+                let id = self.pending_id(shortname)?;
+                self.pending.get(&id).and_then(PendingDylib::dylib)
+            })
     }
 
-    pub(crate) fn open_existing(&mut self, name: &str, flags: OpenFlags) -> Option<ElfLibrary> {
-        let canonical = self.promoted_name(name, flags)?;
-        self.get_lib(&canonical)
+    pub(crate) fn open_existing(
+        &mut self,
+        shortname: &str,
+        flags: OpenFlags,
+    ) -> Option<ElfLibrary> {
+        self.promote(shortname, flags);
+        self.get_lib(shortname)
     }
 
     pub(crate) fn get_lib(&mut self, name: &str) -> Option<ElfLibrary> {
-        let canonical = self.canonical_name_owned(name)?;
-        let id = self.committed_module(&canonical)?;
+        let lookup = self.lookup(name)?;
+        let id = self.committed_module(lookup.shortname())?;
         let deps = self.library_scope_by_module(id)?;
         let inner = self.loaded_by_module(id)?;
         Some(ElfLibrary { inner, deps })
     }
 
     pub(crate) fn promote(&mut self, shortname: &str, flags: OpenFlags) {
-        let key = shortname.to_owned();
         let id = self
-            .committed_module(&key)
+            .committed_module(shortname)
             .expect("Library must be registered");
         let promotable = flags.promotable();
         let add_global = {
@@ -489,8 +513,8 @@ impl Manager {
     }
 
     pub(crate) fn library_scope(&self, name: &str) -> Option<Arc<[LoadedDylib]>> {
-        let canonical = self.canonical_name_owned(name)?;
-        let id = self.committed_module(&canonical)?;
+        let lookup = self.lookup(name)?;
+        let id = self.committed_module(lookup.shortname())?;
         self.library_scope_by_module(id)
     }
 

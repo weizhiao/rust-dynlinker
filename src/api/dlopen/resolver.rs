@@ -45,18 +45,17 @@ impl<'ctx, 'mgr> DlopenVisible<'ctx, 'mgr> {
     }
 }
 
-impl VisibleModules<String> for DlopenVisible<'_, '_> {
-    fn visible_key(&self, key: &String) -> Option<String> {
-        self.shared
-            .with_manager(|manager| manager.visible_contains(key).then(|| key.clone()))
+impl VisibleModules<String, NativeArch, str> for DlopenVisible<'_, '_> {
+    fn visible_key(&self, key: &str) -> Option<String> {
+        self.shared.with_manager(|manager| manager.visible_key(key))
     }
 
-    fn direct_deps(&self, key: &String) -> Option<Box<[String]>> {
+    fn direct_deps(&self, key: &str) -> Option<Box<[String]>> {
         self.shared
             .with_manager(|manager| manager.visible_direct_deps(key))
     }
 
-    fn module(&self, key: &String) -> Option<ModuleHandle<NativeArch>> {
+    fn module(&self, key: &str) -> Option<ModuleHandle<NativeArch>> {
         self.shared
             .with_manager(|manager| manager.visible_loaded(key).map(Into::into))
     }
@@ -142,7 +141,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
 
         self.shared
             .lookup(Some(&*self.added_names), path.as_str(), shortname)
-            .map(|lib| ResolvedKey::existing(lib.into_shortname_owned()))
+            .map(|lib| ResolvedKey::existing(lib.shortname().to_owned()))
     }
 
     fn resolve_script(
@@ -290,10 +289,12 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
     }
 }
 
-impl<'ctx, 'mgr, 'bytes> KeyResolver<'bytes, String> for LinkResolver<'ctx, 'mgr, 'bytes> {
+impl<'ctx, 'mgr, 'bytes> KeyResolver<'bytes, String, NativeArch, str>
+    for LinkResolver<'ctx, 'mgr, 'bytes>
+{
     fn load_root(
         &mut self,
-        req: &RootRequest<'_, String>,
+        req: &RootRequest<'_, String, str>,
     ) -> core::result::Result<ResolvedKey<'bytes, String>, elf_loader::Error> {
         let key = req.key();
         let source = if *key == self.root_request {
@@ -307,7 +308,7 @@ impl<'ctx, 'mgr, 'bytes> KeyResolver<'bytes, String> for LinkResolver<'ctx, 'mgr
 
     fn resolve_dependency(
         &mut self,
-        req: &DependencyRequest<'_, String>,
+        req: &DependencyRequest<'_, String, str>,
     ) -> core::result::Result<ResolvedKey<'bytes, String>, elf_loader::Error> {
         let owner_name = req.owner_name();
         let rpath = req
@@ -318,7 +319,7 @@ impl<'ctx, 'mgr, 'bytes> KeyResolver<'bytes, String> for LinkResolver<'ctx, 'mgr
             .runpath()
             .map(|r| fixup_rpath(owner_name, r))
             .unwrap_or_default();
-        let is_visible = |key: &str| req.visible_key(&key.to_owned()).is_some();
+        let is_visible = |key: &str| req.visible_key(key).is_some();
         let env = ResolveEnv::new(Some(&is_visible), &rpath, &runpath);
         self.resolve_request(env, req.needed(), CandidateSource::File)
             .map_err(into_linker_error)

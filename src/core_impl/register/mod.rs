@@ -28,21 +28,38 @@ macro_rules! lock_read {
 
 #[derive(Clone)]
 pub(crate) struct PendingDylib {
+    shortname: String,
     inner: Option<LoadedDylib>,
     pub(crate) flags: OpenFlags,
     pub(crate) libnames: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PendingModuleId(usize);
+
+impl PendingModuleId {
+    #[inline]
+    fn new(index: usize) -> Self {
+        Self(index)
+    }
 }
 
 unsafe impl Send for PendingDylib {}
 unsafe impl Sync for PendingDylib {}
 
 impl PendingDylib {
-    fn reserved(flags: OpenFlags) -> Self {
+    fn reserved(shortname: String, flags: OpenFlags) -> Self {
         Self {
+            shortname,
             inner: None,
             flags,
             libnames: Vec::new(),
         }
+    }
+
+    #[inline]
+    fn shortname(&self) -> &str {
+        &self.shortname
     }
 
     #[inline]
@@ -57,51 +74,38 @@ impl PendingDylib {
 }
 
 #[derive(Clone)]
-pub(crate) enum LibraryLookup<'a> {
-    Pending {
-        shortname: Cow<'a, str>,
-    },
-    Relocated {
-        shortname: Cow<'a, str>,
-        name: Cow<'a, str>,
-    },
+pub(crate) struct LibraryLookup<'a> {
+    shortname: Cow<'a, str>,
+    relocated: bool,
 }
 
 impl<'a> LibraryLookup<'a> {
+    pub(crate) fn pending(shortname: Cow<'a, str>) -> Self {
+        Self {
+            shortname,
+            relocated: false,
+        }
+    }
+
+    pub(crate) fn relocated(shortname: Cow<'a, str>) -> Self {
+        Self {
+            shortname,
+            relocated: true,
+        }
+    }
+
     pub(crate) fn is_relocated(&self) -> bool {
-        matches!(self, Self::Relocated { .. })
+        self.relocated
     }
 
     pub(crate) fn shortname(&self) -> &str {
-        match self {
-            Self::Pending { shortname } | Self::Relocated { shortname, .. } => shortname,
-        }
-    }
-
-    pub(crate) fn name(&self) -> Option<&str> {
-        match self {
-            Self::Relocated { name, .. } => Some(name),
-            Self::Pending { .. } => None,
-        }
+        &self.shortname
     }
 
     pub(crate) fn into_owned(self) -> LibraryLookup<'static> {
-        match self {
-            Self::Pending { shortname } => LibraryLookup::Pending {
-                shortname: Cow::Owned(shortname.into_owned()),
-            },
-            Self::Relocated { shortname, name } => LibraryLookup::Relocated {
-                shortname: Cow::Owned(shortname.into_owned()),
-                name: Cow::Owned(name.into_owned()),
-            },
-        }
-    }
-
-    pub(crate) fn into_shortname_owned(self) -> String {
-        match self {
-            Self::Pending { shortname } | Self::Relocated { shortname, .. } => {
-                shortname.into_owned()
-            }
+        LibraryLookup {
+            shortname: Cow::Owned(self.shortname.into_owned()),
+            relocated: self.relocated,
         }
     }
 }
@@ -126,7 +130,10 @@ impl Default for GlobalMeta {
 pub(crate) struct Manager {
     /// Libraries that are visible to concurrent `dlopen` calls but are not yet
     /// committed to the dependency graph.
-    pending: IndexMap<String, PendingDylib>,
+    pending: IndexMap<PendingModuleId, PendingDylib>,
+    /// Visible names for pending libraries, indexed by canonical name/alias -> pending module.
+    pending_keys: HashMap<String, PendingModuleId>,
+    pending_next_id: usize,
     /// Libraries available in the global symbol scope (RTLD_GLOBAL).
     global: IndexSet<ModuleId>,
     /// Maps file identities to the canonical short name for fast inode-based lookup.
@@ -143,6 +150,8 @@ pub(crate) struct Manager {
 pub(crate) static MANAGER: Lazy<RwLock<Manager>> = Lazy::new(|| {
     RwLock::new(Manager {
         pending: IndexMap::with_hasher(DefaultHashBuilder::default()),
+        pending_keys: HashMap::new(),
+        pending_next_id: 0,
         global: IndexSet::with_hasher(DefaultHashBuilder::default()),
         identities: HashMap::new(),
         link_ctx: LinkContext::new(),

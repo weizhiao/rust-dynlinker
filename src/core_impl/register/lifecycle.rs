@@ -118,7 +118,8 @@ pub(crate) fn register_loaded(lib: LoadedDylib, flags: OpenFlags, manager: &mut 
     if let Some(identity) = lib.user_data().file_identity {
         manager.add_identity(identity, &shortname);
     }
-    manager.add_loaded_aliases(&shortname, &lib);
+    manager.add_alias(&shortname, lib.shortname());
+    manager.add_alias(&shortname, lib.path().file_name());
     for alias in libc_compat_aliases(&shortname) {
         manager.add_alias(&shortname, alias);
     }

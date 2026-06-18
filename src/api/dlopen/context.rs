@@ -175,7 +175,7 @@ impl<'a> OpenShared<'a> {
             log::info!(
                 "dlopen: Found existing library by inode match: requested [{}], existing [{}] (dev={}, ino={})",
                 shortname,
-                lib.name().unwrap_or(lib.shortname()),
+                lib.shortname(),
                 identity.dev,
                 identity.ino
             );
@@ -217,15 +217,15 @@ impl<'a> OpenContext<'a> {
         path: &str,
         lib: LibraryLookup<'static>,
     ) -> ElfLibrary {
-        let canonical_shortname = lib.into_shortname_owned();
+        let shortname = lib.shortname();
         log::info!(
             "dlopen: Found existing library [{}] (canonical name: {})",
             path,
-            canonical_shortname
+            shortname
         );
         let elf_lib = self.shared.with_manager_mut(|manager| {
             manager
-                .open_existing(&canonical_shortname, self.shared.flags)
+                .open_existing(shortname, self.shared.flags)
                 .expect("Existing library must be retrievable")
         });
         self.committed = true;

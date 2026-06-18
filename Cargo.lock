@@ -314,7 +314,7 @@ checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
 [[package]]
 name = "elf_loader"
 version = "0.15.1"
-source = "git+https://github.com/weizhiao/Relink.git#aebe7ace24452d15a761d35ced0173142342fe91"
+source = "git+https://github.com/weizhiao/Relink.git#6c5a653f17e11e29db8a5303239084b63d140554"
 dependencies = [
  "bitflags",
  "cfg-if",
