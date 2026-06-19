@@ -11,6 +11,7 @@ mod memory;
 mod runtime;
 mod symbols;
 mod tls;
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = ""))]
 mod versions;
 
 #[doc(hidden)]

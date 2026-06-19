@@ -45,14 +45,14 @@ libc = { version = "0.2.171", default-features = false, optional = true }
 
 [dependencies]
 bitflags = "2.6.0"
-log = "0.4.22"
+log = { version = "0.4.22", default-features = false }
 syscalls = { version = "0.8.1", default-features = false }
 cfg-if = "1.0.0"
 ctor = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
-std = ["spin/std", "dep:ctor", "dep:libc", "elf_loader/libc"]
+std = ["spin/std", "dep:ctor", "dep:libc", "elf_loader/libc", "log/std"]
 # activate specific versions of symbols for dynamic library loading
 version = ["elf_loader/version"]
 use-syscall = ["elf_loader/use-syscall"]

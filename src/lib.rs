@@ -53,6 +53,7 @@ mod utils;
 
 use bitflags::bitflags;
 
+pub use crate::abi::{elf, memory, relocation};
 pub use crate::api::dlsym::{dlsym_default, dlsym_next};
 pub use crate::core_impl::{AsFilename, ElfLibrary};
 pub use crate::error::Error;

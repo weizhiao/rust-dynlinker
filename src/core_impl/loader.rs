@@ -24,10 +24,11 @@ use elf_loader::{
 };
 
 #[cfg(not(feature = "std"))]
-pub(crate) type ElfDylib = RawDynamic<ExtraData>;
+pub type ElfDylib = RawDynamic<ExtraData>;
 pub(crate) type LoadedDylib = LoadedCore<ExtraData>;
 #[cfg(not(feature = "std"))]
-pub(crate) type RuntimeLoader = elf_loader::Loader<DlopenObserver, ExtraData, ActiveTlsResolver>;
+pub type RuntimeLoader =
+    elf_loader::Loader<DlopenObserver, ExtraData, crate::rtld::ActiveTlsResolver>;
 
 #[cfg(not(feature = "std"))]
 pub(crate) use crate::rtld::ActiveTlsResolver;
@@ -35,7 +36,7 @@ pub(crate) use crate::rtld::ActiveTlsResolver;
 pub(crate) use elf_loader::tls::DefaultTlsResolver as ActiveTlsResolver;
 
 #[derive(Clone, Copy)]
-pub(crate) struct DlopenObserver;
+pub struct DlopenObserver;
 
 impl LoadObserver<ExtraData> for DlopenObserver {
     fn on_after_dynamic_load<R: RegionAccess>(

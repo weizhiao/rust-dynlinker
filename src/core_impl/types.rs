@@ -19,7 +19,7 @@ pub(crate) struct FileIdentity {
 
 /// User data associated with a dynamic library, used for internal tracking and debugging information.
 #[derive(Default)]
-pub(crate) struct ExtraData {
+pub struct ExtraData {
     /// Canonical name of the library as a C-compatible string.
     pub(crate) c_name: Option<CString>,
     /// The link map entry for this library, following the glibc-compatible structure.

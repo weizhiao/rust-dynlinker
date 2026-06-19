@@ -9,7 +9,8 @@ global_asm!(
 _start:
     movq %rsp, %rbx
     movq %rbx, %rdi
-    leaq _DYNAMIC(%rip), %rsi
+    leaq __ehdr_start(%rip), %rsi
+    leaq _DYNAMIC(%rip), %rdx
     andq $-16, %rsp
     call rtld_bootstrap
     movq %rbx, %rsp

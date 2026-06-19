@@ -16,7 +16,7 @@ pub extern "C" fn _dl_debug_state() {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __tls_get_addr(index: *const usize) -> *mut c_void {
-    dlopen_rs::rtld::tls_get_addr(index)
+    crate::tls::get_addr(index)
 }
 
 #[unsafe(no_mangle)]
@@ -31,23 +31,23 @@ pub unsafe extern "C" fn _dl_find_object(pc: *const c_void, dlfo: *mut c_void) -
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _dl_allocate_tls(storage: *mut c_void) -> *mut c_void {
-    unsafe { dlopen_rs::rtld::tls_allocate(storage) }
+    unsafe { crate::tls::allocate(storage) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _dl_allocate_tls_init(storage: *mut c_void, _main_thread: bool) -> *mut c_void {
-    unsafe { dlopen_rs::rtld::tls_init(storage) }
+    unsafe { crate::tls::init(storage) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _dl_deallocate_tls(storage: *mut c_void, dealloc_tcb: bool) {
     unsafe { crate::glibc::deallocate_tcb(storage.cast()) };
-    unsafe { dlopen_rs::rtld::tls_deallocate(storage, dealloc_tcb) };
+    unsafe { crate::tls::deallocate(storage, dealloc_tcb) };
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _dl_get_tls_static_info(size: *mut usize, align: *mut usize) {
-    let (tls_size, tls_align) = dlopen_rs::rtld::tls_static_info();
+    let (tls_size, tls_align) = crate::tls::static_info();
     unsafe {
         if !size.is_null() {
             size.write(tls_size);

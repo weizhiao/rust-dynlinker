@@ -22,7 +22,7 @@ impl RelocationPlanner<String, ExtraData> for DlopenPlanner<'_, '_> {
     fn plan(
         &mut self,
         req: &RelocationRequest<'_, String, ExtraData>,
-    ) -> core::result::Result<RelocationInputs<ExtraData>, elf_loader::Error> {
+    ) -> core::result::Result<RelocationInputs, elf_loader::Error> {
         if self.relocation_scope.is_none() {
             self.relocation_scope = Some(self.shared.prepare_relocation(req.scope()));
         }

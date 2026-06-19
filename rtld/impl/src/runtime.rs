@@ -1,5 +1,5 @@
-use core::panic::PanicInfo;
-use core::{alloc::Layout, ptr::null_mut};
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = ""))]
+use core::{alloc::Layout, panic::PanicInfo, ptr::null_mut};
 
 use syscalls::Sysno;
 
@@ -33,16 +33,20 @@ pub(crate) fn exit(status: usize) -> ! {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = ""))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     exit(RTLD_FATAL_EXIT_STATUS)
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = ""))]
 struct RtldAllocator;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = ""))]
 #[global_allocator]
 static ALLOCATOR: RtldAllocator = RtldAllocator;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = ""))]
 unsafe impl core::alloc::GlobalAlloc for RtldAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = page_rounded_size(layout);
@@ -93,6 +97,7 @@ unsafe impl core::alloc::GlobalAlloc for RtldAllocator {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = ""))]
 fn page_rounded_size(layout: Layout) -> usize {
     let size = layout.size().max(layout.align());
     (size + 0xfff) & !0xfff

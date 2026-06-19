@@ -27,10 +27,23 @@ pub mod elf {
     #[allow(unused_imports)]
     pub use elf_loader::elf::{
         ElfDyn, ElfDynamicTag, ElfHeader, ElfPhdr, ElfProgramType, ElfRel, ElfRelType, ElfRela,
-        ElfRelocationType,
+        ElfRelocationType, ElfRelr,
     };
     #[allow(unused_imports)]
     pub use elf_loader::{arch::NativeArch, relocation::RelocationArch};
+}
+
+pub mod memory {
+    #[allow(unused_imports)]
+    pub use elf_loader::{
+        Result as ElfResult,
+        memory::{ImageMemory, VmAddr, VmOffset},
+    };
+}
+
+pub mod relocation {
+    #[allow(unused_imports)]
+    pub use elf_loader::relocation::{relocate_relative, relocate_relr};
 }
 
 pub mod debug {
