@@ -13,5 +13,5 @@ doctest = false
 
 [dependencies]
 dlopen-rs = { path = "../..", default-features = false, features = ["use-syscall"] }
-spin = { version = "0.10.0", default-features = false, features = ["mutex", "spin_mutex"] }
+spin = { version = "0.12.0", default-features = false, features = ["mutex", "spin_mutex"] }
 syscalls = { version = "0.8.1", default-features = false }
