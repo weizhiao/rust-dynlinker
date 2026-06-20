@@ -3,9 +3,8 @@ mod stack;
 mod stage0;
 mod stage1;
 mod stage2;
-mod state;
 
-use crate::globals::publish_tls_static_info;
+use crate::globals::{publish_rseq_offset, publish_tls_static_info};
 use dlopen_rs::rtld::elf::ElfHeader;
 
 #[unsafe(no_mangle)]
@@ -22,7 +21,14 @@ pub extern "C" fn rtld_bootstrap(
 }
 
 fn finish_stage1(entry: usize) -> usize {
-    let (size, align) = crate::tls::static_info();
-    unsafe { publish_tls_static_info(size, align) };
+    publish_tls_layout();
     entry
+}
+
+pub(super) fn publish_tls_layout() {
+    let (size, align) = crate::tls::static_info();
+    unsafe {
+        publish_tls_static_info(size, align);
+        publish_rseq_offset(crate::tls::rseq_offset());
+    }
 }

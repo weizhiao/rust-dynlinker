@@ -4,10 +4,9 @@ use core::{
     ffi::{c_char, c_int, c_ulonglong, c_void},
     ptr::null_mut,
 };
-use elf_loader::{
-    elf::ElfPhdr,
-    tls::{DefaultTlsResolver, TlsModuleId},
-};
+#[cfg(feature = "std")]
+use elf_loader::tls::DefaultTlsResolver;
+use elf_loader::{elf::ElfPhdr, tls::TlsModuleId};
 
 /// same as dl_phdr_info in libc
 #[repr(C)]
@@ -29,7 +28,19 @@ pub struct DlPhdrInfo<'lib> {
     dlpi_adds: c_ulonglong,
     dlpi_subs: c_ulonglong,
     tls_modid: usize,
-    tls_data: Option<&'lib [u8]>,
+    tls_data: *mut c_void,
+}
+
+#[cfg(not(feature = "std"))]
+fn tls_data_ptr(mod_id: TlsModuleId) -> *mut c_void {
+    crate::rtld::tls_get_addr_soft(mod_id).cast()
+}
+
+#[cfg(feature = "std")]
+fn tls_data_ptr(mod_id: TlsModuleId) -> *mut c_void {
+    DefaultTlsResolver::get_ptr(mod_id)
+        .map(|ptr| ptr.cast())
+        .unwrap_or(null_mut())
 }
 
 impl DlPhdrInfo<'_> {
@@ -81,7 +92,8 @@ impl ElfLibrary {
             if phdrs.is_empty() {
                 continue;
             }
-            let tls_modid = lib.tls_mod_id();
+            let tls_modid = lib.tls().mod_id();
+            let tls_data = tls_modid.map(tls_data_ptr).unwrap_or(null_mut());
             let info = DlPhdrInfo {
                 lib_base: lib.base().get(),
                 lib_name: extra_data
@@ -93,7 +105,7 @@ impl ElfLibrary {
                 dlpi_adds,
                 dlpi_subs,
                 tls_modid: tls_modid.unwrap_or(TlsModuleId::RESERVED).get(),
-                tls_data: tls_modid.and_then(DefaultTlsResolver::get_tls_data),
+                tls_data,
             };
             callback(&info)?;
         }
@@ -120,10 +132,7 @@ pub unsafe extern "C" fn dl_iterate_phdr(callback: Option<CallBack>, data: *mut 
             dlpi_adds: info.dlpi_adds,
             dlpi_subs: info.dlpi_subs,
             dlpi_tls_modid: info.tls_modid,
-            dlpi_tls_data: info
-                .tls_data
-                .map(|data| data.as_ptr() as _)
-                .unwrap_or(null_mut()),
+            dlpi_tls_data: info.tls_data,
         };
         unsafe {
             let ret = callback(&mut c_info, size_of::<CDlPhdrInfo>(), data);

@@ -1,20 +1,21 @@
 use crate::arch::{
     DL_NNS, EXEC_PAGESIZE, FPU_DEFAULT, PTHREAD_MUTEX_RECURSIVE_NP, STDERR_FILENO,
-    X86_CPU_FEATURES_SIZE, X86_HWCAP_FLAGS, X86_PLATFORMS,
+    X86_CPU_FEATURES_SIZE,
 };
 use core::{
     ffi::{c_int, c_void},
     ptr::{addr_of, addr_of_mut, null, null_mut},
 };
-use dlopen_rs::rtld::debug::{LinkMap, RDebug};
+use dlopen_rs::rtld::{debug::RDebug, link_map::LinkMap};
 
 mod tls;
 
-pub(crate) use tls::{deallocate_tcb, init_tcb};
+pub(crate) use tls::{deallocate_tcb, dtv_value, init_tcb, set_dtv_value};
 
-const RTLD_GLOBAL_SIZE: usize = 4352;
-const RTLD_GLOBAL_RO_SIZE: usize = 952;
-const LINK_NAMESPACE_SIZE: usize = 160;
+const RTLD_GLOBAL_SIZE: usize = 2120;
+const RTLD_GLOBAL_RO_SIZE: usize = 928;
+const LINK_NAMESPACE_SIZE: usize = 112;
+const DEFAULT_STACK_PROT_FLAGS: c_int = 0x1 | 0x2;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -106,20 +107,6 @@ impl RtldUniqueSymTable {
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct RtldDebugExtended {
-    base: RDebug,
-    next: *mut RtldDebugExtended,
-}
-
-impl RtldDebugExtended {
-    const ZERO: Self = Self {
-        base: RDebug::zero(),
-        next: null_mut(),
-    };
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
 struct RtldLinkNamespace {
     loaded: *mut LinkMap,
     nloaded: u32,
@@ -129,7 +116,6 @@ struct RtldLinkNamespace {
     global_scope_pending_adds: u32,
     libc_map: *mut LinkMap,
     unique_sym_table: RtldUniqueSymTable,
-    debug: RtldDebugExtended,
 }
 
 impl RtldLinkNamespace {
@@ -142,23 +128,6 @@ impl RtldLinkNamespace {
         global_scope_pending_adds: 0,
         libc_map: null_mut(),
         unique_sym_table: RtldUniqueSymTable::ZERO,
-        debug: RtldDebugExtended::ZERO,
-    };
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct RtldAuditState {
-    cookie: usize,
-    bindflags: u32,
-    _padding: u32,
-}
-
-impl RtldAuditState {
-    const ZERO: Self = Self {
-        cookie: 0,
-        bindflags: 0,
-        _padding: 0,
     };
 }
 
@@ -185,11 +154,9 @@ pub(crate) struct RtldGlobal {
     dl_num_relocations: usize,
     dl_num_cache_relocations: usize,
     dl_all_dirs: *mut c_void,
-    dl_rtld_map: LinkMap,
-    dl_rtld_auditstate: [RtldAuditState; DL_NNS],
     dl_x86_feature_1: u32,
     dl_x86_feature_control: RtldX86FeatureControl,
-    dl_stack_flags: u32,
+    dl_stack_prot_flags: c_int,
     dl_tls_dtv_gaps: bool,
     _padding_after_tls_dtv_gaps: [u8; 3],
     dl_tls_max_dtv_idx: usize,
@@ -223,11 +190,9 @@ impl RtldGlobal {
             dl_num_relocations: 0,
             dl_num_cache_relocations: 0,
             dl_all_dirs: null_mut(),
-            dl_rtld_map: LinkMap::zero(),
-            dl_rtld_auditstate: [RtldAuditState::ZERO; DL_NNS],
             dl_x86_feature_1: 0,
             dl_x86_feature_control: RtldX86FeatureControl::DEFAULT,
-            dl_stack_flags: 0,
+            dl_stack_prot_flags: DEFAULT_STACK_PROT_FLAGS,
             dl_tls_dtv_gaps: false,
             _padding_after_tls_dtv_gaps: [0; 3],
             dl_tls_max_dtv_idx: 0,
@@ -248,26 +213,22 @@ impl RtldGlobal {
         }
     }
 
-    pub(crate) fn rtld_link_map(&mut self) -> *mut LinkMap {
-        addr_of_mut!(self.dl_rtld_map)
-    }
-
     pub(crate) unsafe fn publish(
         &mut self,
         main: *mut LinkMap,
         main_searchlist: *mut RtldScopeElem,
-        r_debug: RDebug,
+        _r_debug: RDebug,
+        nloaded: usize,
+        libc_map: *mut LinkMap,
     ) {
+        let nloaded = nloaded as u32;
         unsafe {
             addr_of_mut!(self.dl_nns).write(1);
-            addr_of_mut!(self.dl_load_adds).write(2);
+            addr_of_mut!(self.dl_load_adds).write(nloaded as u64);
             addr_of_mut!(self.dl_ns[0].loaded).write(main);
-            addr_of_mut!(self.dl_ns[0].nloaded).write(2);
+            addr_of_mut!(self.dl_ns[0].nloaded).write(nloaded);
             addr_of_mut!(self.dl_ns[0].main_searchlist).write(main_searchlist);
-            addr_of_mut!(self.dl_ns[0].debug).write(RtldDebugExtended {
-                base: r_debug,
-                next: null_mut(),
-            });
+            addr_of_mut!(self.dl_ns[0].libc_map).write(libc_map);
             init_list(addr_of_mut!(self.dl_stack_used));
             init_list(addr_of_mut!(self.dl_stack_user));
             init_list(addr_of_mut!(self.dl_stack_cache));
@@ -297,9 +258,8 @@ pub(crate) struct RtldGlobalRo {
     dl_hwcap: u64,
     dl_auxv: *const usize,
     dl_x86_cpu_features: [u8; X86_CPU_FEATURES_SIZE],
-    dl_x86_hwcap_flags: [[u8; 9]; 3],
-    dl_x86_platforms: [[u8; 9]; 4],
-    _padding_after_x86_platforms: u8,
+    dl_x86_tlsdesc_dynamic: *const c_void,
+    dl_x86_64_runtime_resolve: *const c_void,
     dl_inhibit_rpath: *const u8,
     dl_origin_path: *const u8,
     dl_tls_static_size: usize,
@@ -315,6 +275,7 @@ pub(crate) struct RtldGlobalRo {
     dl_vdso_time: *const c_void,
     dl_vdso_getcpu: *const c_void,
     dl_vdso_clock_getres_time64: *const c_void,
+    dl_vdso_getrandom: *const c_void,
     dl_hwcap2: u64,
     dl_hwcap3: u64,
     dl_hwcap4: u64,
@@ -330,6 +291,7 @@ pub(crate) struct RtldGlobalRo {
     dl_tls_get_addr_soft: *const c_void,
     dl_libc_freeres: *const c_void,
     dl_find_object: *const c_void,
+    dl_readonly_area: *const c_void,
     dl_dlfcn_hook: *const c_void,
     dl_audit: *mut c_void,
     dl_naudit: u32,
@@ -359,9 +321,8 @@ impl RtldGlobalRo {
             dl_hwcap: 0,
             dl_auxv: null(),
             dl_x86_cpu_features: [0; X86_CPU_FEATURES_SIZE],
-            dl_x86_hwcap_flags: X86_HWCAP_FLAGS,
-            dl_x86_platforms: X86_PLATFORMS,
-            _padding_after_x86_platforms: 0,
+            dl_x86_tlsdesc_dynamic: null(),
+            dl_x86_64_runtime_resolve: null(),
             dl_inhibit_rpath: null(),
             dl_origin_path: null(),
             dl_tls_static_size: 0,
@@ -377,6 +338,7 @@ impl RtldGlobalRo {
             dl_vdso_time: null(),
             dl_vdso_getcpu: null(),
             dl_vdso_clock_getres_time64: null(),
+            dl_vdso_getrandom: null(),
             dl_hwcap2: 0,
             dl_hwcap3: 0,
             dl_hwcap4: 0,
@@ -392,6 +354,7 @@ impl RtldGlobalRo {
             dl_tls_get_addr_soft: null(),
             dl_libc_freeres: null(),
             dl_find_object: null(),
+            dl_readonly_area: null(),
             dl_dlfcn_hook: null(),
             dl_audit: null_mut(),
             dl_naudit: 0,
@@ -414,14 +377,9 @@ impl RtldGlobalRo {
         }
     }
 
-    pub(crate) unsafe fn publish(
-        &mut self,
-        initial_searchlist: *mut [*mut LinkMap; 2],
-        main: *mut LinkMap,
-        rtld: *mut LinkMap,
-        ro_aux: RtldGlobalRoAux,
-    ) {
+    pub(crate) unsafe fn publish_aux(&mut self, ro_aux: RtldGlobalRoAux) {
         unsafe {
+            self.publish_function_pointers();
             let pagesize = if ro_aux.pagesize == 0 {
                 EXEC_PAGESIZE
             } else {
@@ -446,11 +404,29 @@ impl RtldGlobalRo {
             addr_of_mut!(self.dl_hwcap3).write(ro_aux.hwcap3 as u64);
             addr_of_mut!(self.dl_hwcap4).write(ro_aux.hwcap4 as u64);
             self.publish_x86_cpu_defaults();
-            addr_of_mut!((*initial_searchlist)[0]).write(main);
-            addr_of_mut!((*initial_searchlist)[1]).write(rtld);
+        }
+    }
+
+    unsafe fn publish_function_pointers(&mut self) {
+        unsafe {
+            addr_of_mut!(self.dl_catch_error)
+                .write(crate::symbols::dl_catch_error as *const c_void);
+            addr_of_mut!(self.dl_error_free).write(crate::symbols::dl_error_free as *const c_void);
+            addr_of_mut!(self.dl_tls_get_addr_soft)
+                .write(crate::symbols::dl_tls_get_addr_soft as *const c_void);
+            addr_of_mut!(self.dl_dlfcn_hook).write(crate::symbols::dlfcn_hook());
+        }
+    }
+
+    pub(crate) unsafe fn publish_initial_searchlist(
+        &mut self,
+        initial_searchlist: *mut *mut LinkMap,
+        nlist: usize,
+    ) {
+        unsafe {
             addr_of_mut!(self.dl_initial_searchlist).write(RtldScopeElem {
-                list: addr_of_mut!(*initial_searchlist) as *mut *mut LinkMap,
-                nlist: 2,
+                list: initial_searchlist,
+                nlist: nlist as u32,
                 _padding: 0,
             });
         }
@@ -517,12 +493,26 @@ const _: [(); RTLD_GLOBAL_SIZE] = [(); core::mem::size_of::<RtldGlobal>()];
 const _: [(); RTLD_GLOBAL_RO_SIZE] = [(); core::mem::size_of::<RtldGlobalRo>()];
 const _: [(); LINK_NAMESPACE_SIZE] = [(); core::mem::size_of::<RtldLinkNamespace>()];
 const _: [(); 0] = [(); core::mem::offset_of!(RtldGlobal, dl_ns)];
-const _: [(); 2560] = [(); core::mem::offset_of!(RtldGlobal, dl_nns)];
-const _: [(); 2736] = [(); core::mem::offset_of!(RtldGlobal, dl_rtld_map)];
+const _: [(); 1792] = [(); core::mem::offset_of!(RtldGlobal, dl_nns)];
+const _: [(); 1968] = [(); core::mem::offset_of!(RtldGlobal, dl_x86_feature_1)];
+const _: [(); 1976] = [(); core::mem::offset_of!(RtldGlobal, dl_stack_prot_flags)];
+const _: [(); 1984] = [(); core::mem::offset_of!(RtldGlobal, dl_tls_max_dtv_idx)];
+const _: [(); 2024] = [(); core::mem::offset_of!(RtldGlobal, dl_initial_dtv)];
+const _: [(); 2032] = [(); core::mem::offset_of!(RtldGlobal, dl_tls_generation)];
+const _: [(); 2048] = [(); core::mem::offset_of!(RtldGlobal, dl_stack_used)];
 const _: [(); 24] = [(); core::mem::offset_of!(RtldGlobalRo, dl_pagesize)];
 const _: [(); 96] = [(); core::mem::offset_of!(RtldGlobalRo, dl_hwcap)];
 const _: [(); 112] = [(); core::mem::offset_of!(RtldGlobalRo, dl_x86_cpu_features)];
-const _: [(); 816] = [(); core::mem::offset_of!(RtldGlobalRo, dl_hwcap2)];
+const _: [(); 640] = [(); core::mem::offset_of!(RtldGlobalRo, dl_x86_tlsdesc_dynamic)];
+const _: [(); 648] = [(); core::mem::offset_of!(RtldGlobalRo, dl_x86_64_runtime_resolve)];
+const _: [(); 656] = [(); core::mem::offset_of!(RtldGlobalRo, dl_inhibit_rpath)];
+const _: [(); 672] = [(); core::mem::offset_of!(RtldGlobalRo, dl_tls_static_size)];
+const _: [(); 720] = [(); core::mem::offset_of!(RtldGlobalRo, dl_sysinfo_dso)];
+const _: [(); 776] = [(); core::mem::offset_of!(RtldGlobalRo, dl_vdso_getrandom)];
+const _: [(); 784] = [(); core::mem::offset_of!(RtldGlobalRo, dl_hwcap2)];
+const _: [(); 888] = [(); core::mem::offset_of!(RtldGlobalRo, dl_find_object)];
+const _: [(); 896] = [(); core::mem::offset_of!(RtldGlobalRo, dl_readonly_area)];
+const _: [(); 904] = [(); core::mem::offset_of!(RtldGlobalRo, dl_dlfcn_hook)];
 const RTLD_GLOBAL_RO_X86_FEATURES_OFFSET: usize =
     core::mem::offset_of!(RtldGlobalRo, dl_x86_cpu_features);
 

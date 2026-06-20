@@ -2,10 +2,9 @@ use super::{
     GlobalMeta, LibraryLookup, Manager, PendingDylib, PendingModuleId, libc_compat_aliases,
     normalized_flags,
 };
-use crate::core_impl::loader::shortname_from_name;
 use crate::{
     ElfLibrary, OpenFlags,
-    core_impl::{DylibExt, ExtraData, FileIdentity, LoadedDylib},
+    core_impl::{ActiveTlsResolver, DylibExt, ExtraData, FileIdentity, LoadedDylib},
 };
 use alloc::{
     borrow::{Cow, ToOwned},
@@ -16,8 +15,15 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use elf_loader::image::{ModuleHandle, ModuleScope};
 use elf_loader::linker::{LinkContext, ModuleId};
+use elf_loader::{
+    arch::NativeArch,
+    image::{ModuleHandle, ModuleScope, ModuleScopeBuilder},
+};
+
+type DlopenModuleHandle = ModuleHandle<NativeArch, ActiveTlsResolver>;
+type DlopenModuleScope = ModuleScope<NativeArch, ActiveTlsResolver>;
+type DlopenModuleScopeBuilder = ModuleScopeBuilder<NativeArch, ActiveTlsResolver>;
 
 impl Manager {
     fn loaded_by_module(&self, id: ModuleId) -> Option<LoadedDylib> {
@@ -306,17 +312,13 @@ impl Manager {
 
     pub(crate) fn relocation_scope(
         &self,
-        group_scope: &ModuleScope,
+        group_scope: &DlopenModuleScope,
         flags: OpenFlags,
-    ) -> ModuleScope {
+    ) -> DlopenModuleScope {
         let mut seen = BTreeSet::new();
         let mut scope = Vec::with_capacity(group_scope.len() + self.global.len());
-        let mut push_unique = |module: ModuleHandle| {
-            let shortname = module
-                .downcast_ref::<LoadedDylib>()
-                .map(DylibExt::shortname)
-                .unwrap_or_else(|| shortname_from_name(module.name()));
-            if seen.insert(shortname.to_owned()) {
+        let mut push_unique = |module: DlopenModuleHandle| {
+            if seen.insert(module.name().to_owned()) {
                 scope.push(module);
             }
         };
@@ -337,12 +339,14 @@ impl Manager {
             }
         }
 
-        ModuleScope::from(scope)
+        let mut builder = DlopenModuleScopeBuilder::new();
+        builder.extend(scope);
+        builder.into_scope()
     }
 
     pub(crate) fn merge_link_context(
         &mut self,
-        source: &LinkContext<String, ExtraData, GlobalMeta>,
+        source: &LinkContext<String, ExtraData, GlobalMeta, NativeArch, ActiveTlsResolver>,
         committed: impl IntoIterator<Item = ModuleId>,
         flags: OpenFlags,
     ) {
@@ -413,7 +417,7 @@ impl Manager {
                 self.add_identity(identity, &key);
             }
             if let Some(lib) = loaded.as_ref() {
-                self.add_alias(&key, lib.shortname());
+                self.add_alias(&key, lib.name());
                 self.add_alias(&key, lib.path().file_name());
             }
             for alias in libc_compat_aliases(&key) {

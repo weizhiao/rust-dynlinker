@@ -1,4 +1,5 @@
-use super::types::{ARGC, ARGV, ENVP, ExtraData, LinkMap};
+use super::types::{ARGC, ARGV, ENVP, ExtraData};
+use crate::abi::link_map::LinkMap;
 use crate::utils::debug::add_debug_link_map;
 use crate::{OpenFlags, Result, error::find_symbol_error};
 use alloc::{
@@ -19,13 +20,11 @@ use elf_loader::{
     arch::NativeArch,
     elf::{ElfDyn, ElfPhdr, ElfProgramType},
     image::{LoadedCore, RawDynamic, Symbol},
-    memory::{RegionAccess, VmAddr},
+    memory::{HostRegion, RegionAccess, VmAddr},
     observer::{AfterDynamicLoadEvent, InitEvent, LoadObserver, RelocationObserver},
+    tls::TlsResolver,
 };
 
-#[cfg(not(feature = "std"))]
-pub type ElfDylib = RawDynamic<ExtraData>;
-pub(crate) type LoadedDylib = LoadedCore<ExtraData>;
 #[cfg(not(feature = "std"))]
 pub type RuntimeLoader =
     elf_loader::Loader<DlopenObserver, ExtraData, crate::rtld::ActiveTlsResolver>;
@@ -34,14 +33,17 @@ pub type RuntimeLoader =
 pub(crate) use crate::rtld::ActiveTlsResolver;
 #[cfg(feature = "std")]
 pub(crate) use elf_loader::tls::DefaultTlsResolver as ActiveTlsResolver;
+#[cfg(not(feature = "std"))]
+pub type ElfDylib = RawDynamic<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
+pub(crate) type LoadedDylib = LoadedCore<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
 
 #[derive(Clone, Copy)]
 pub struct DlopenObserver;
 
 impl LoadObserver<ExtraData> for DlopenObserver {
-    fn on_after_dynamic_load<R: RegionAccess>(
+    fn on_after_dynamic_load<R: RegionAccess, Tls: TlsResolver>(
         &mut self,
-        mut event: AfterDynamicLoadEvent<'_, ExtraData, elf_loader::arch::NativeArch, R>,
+        mut event: AfterDynamicLoadEvent<'_, ExtraData, NativeArch, R, Tls>,
     ) -> elf_loader::Result<()> {
         let raw = event.raw_mut();
         let file_path = raw.name().contains('/').then(|| raw.name().to_owned());
@@ -51,9 +53,9 @@ impl LoadObserver<ExtraData> for DlopenObserver {
 }
 
 impl RelocationObserver for DlopenObserver {
-    fn on_init<D: 'static, R: RegionAccess>(
+    fn on_init<D: 'static, R: RegionAccess, Tls: TlsResolver>(
         &mut self,
-        event: &mut InitEvent<'_, D, elf_loader::arch::NativeArch, R>,
+        event: &mut InitEvent<'_, D, NativeArch, R, Tls>,
     ) -> elf_loader::Result<()> {
         let argc = unsafe { *core::ptr::addr_of!(ARGC) };
         let argv = unsafe { *core::ptr::addr_of!(ARGV) };
@@ -82,8 +84,8 @@ pub(crate) fn find_symbol<'lib, T>(
         .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
 }
 
-pub(crate) fn finalize_raw_dylib<R: RegionAccess>(
-    dylib: &mut RawDynamic<ExtraData, NativeArch, R>,
+pub(crate) fn finalize_raw_dylib<R: RegionAccess, Tls: TlsResolver>(
+    dylib: &mut RawDynamic<ExtraData, NativeArch, R, Tls>,
     file_path: Option<&str>,
 ) {
     let needed_libs = dylib
@@ -93,6 +95,15 @@ pub(crate) fn finalize_raw_dylib<R: RegionAccess>(
         .collect::<Vec<_>>();
 
     let name = dylib.name().to_string();
+    let path = dylib.path().as_str().to_owned();
+    let link_name = if path.is_empty() {
+        name.as_str()
+    } else {
+        path.as_str()
+    };
+    let identity_path = file_path
+        .map(ToOwned::to_owned)
+        .or_else(|| path.contains('/').then(|| path.clone()));
     let base = dylib.base();
     let dynamic_ptr = dylib
         .phdrs()
@@ -109,14 +120,13 @@ pub(crate) fn finalize_raw_dylib<R: RegionAccess>(
     };
     let phnum = phdrs.len().min(u16::MAX as usize) as u16;
     let entry = dylib.entry();
+    let tls = dylib.tls();
+    let tls_mod_id = tls.mod_id().map(|id| id.get());
+    let tls_tp_offset = tls.tp_offset().map(|offset| offset.get());
 
-    let user_data = dylib.user_data_mut().unwrap();
-    user_data.needed_libs = needed_libs;
-    if !dynamic_ptr.is_null() {
-        user_data.dynamic_table =
-            Some(unsafe { copy_dynamic_table(dynamic_ptr) }.into_boxed_slice());
-    }
-    let c_name = CString::new(name).unwrap();
+    let dynamic_table = (!dynamic_ptr.is_null())
+        .then(|| unsafe { copy_dynamic_table(dynamic_ptr) }.into_boxed_slice());
+    let c_name = CString::new(link_name).unwrap();
 
     let mut link_map = Box::new(LinkMap {
         l_addr: base.as_mut_ptr(),
@@ -129,14 +139,18 @@ pub(crate) fn finalize_raw_dylib<R: RegionAccess>(
         l_phnum: phnum,
         ..LinkMap::zero()
     });
+    populate_link_map_tls(&mut link_map, base, phdrs, tls_mod_id, tls_tp_offset);
     link_map.l_real = link_map.as_mut() as *mut LinkMap;
 
     unsafe { add_debug_link_map(link_map.as_mut()) };
+    let user_data = dylib.user_data_mut().unwrap();
+    user_data.needed_libs = needed_libs;
+    user_data.dynamic_table = dynamic_table;
     user_data.link_map = Some(link_map);
     user_data.c_name = Some(c_name);
 
     // Get file identity (inode) if path is provided
-    if let Some(path) = file_path {
+    if let Some(path) = identity_path.as_deref() {
         if let Ok(identity) = crate::os::get_file_inode(path) {
             user_data.file_identity = Some(identity);
             log::debug!(
@@ -148,6 +162,34 @@ pub(crate) fn finalize_raw_dylib<R: RegionAccess>(
         } else {
             log::warn!("Failed to get file identity for [{}]", path);
         }
+    }
+}
+
+fn populate_link_map_tls(
+    link_map: &mut LinkMap,
+    base: VmAddr,
+    phdrs: &[ElfPhdr],
+    tls_mod_id: Option<usize>,
+    tls_tp_offset: Option<isize>,
+) {
+    let Some(mod_id) = tls_mod_id else {
+        return;
+    };
+    link_map.l_tls_modid = mod_id;
+    link_map.l_tls_offset = tls_tp_offset.unwrap_or(0);
+
+    let Some(tls) = phdrs
+        .iter()
+        .find(|phdr| phdr.program_type() == ElfProgramType::TLS)
+    else {
+        return;
+    };
+    link_map.l_tls_blocksize = tls.p_memsz();
+    link_map.l_tls_align = tls.p_align();
+    link_map.l_tls_firstbyte_offset = tls.p_vaddr().get() & tls.p_align().saturating_sub(1);
+    link_map.l_tls_initimage_size = tls.p_filesz();
+    if tls.p_filesz() != 0 {
+        link_map.l_tls_initimage = (base + tls.p_vaddr()).as_mut_ptr();
     }
 }
 
@@ -183,29 +225,12 @@ impl Debug for ElfLibrary {
 
 pub trait DylibExt {
     fn needed_libs(&self) -> &[String];
-    fn shortname(&self) -> &str;
-}
-
-#[inline]
-pub(crate) fn shortname_from_name(name: &str) -> &str {
-    if name.is_empty() {
-        "main"
-    } else {
-        name.rsplit(|c| c == '/' || c == '\\')
-            .next()
-            .unwrap_or(name)
-    }
 }
 
 impl DylibExt for LoadedDylib {
     #[inline]
     fn needed_libs(&self) -> &[String] {
         &self.user_data().needed_libs
-    }
-
-    #[inline]
-    fn shortname(&self) -> &str {
-        shortname_from_name(self.name())
     }
 }
 
@@ -227,17 +252,11 @@ impl ElfLibrary {
             .unwrap_or(core::ptr::null())
     }
 
-    /// Get the short name of the dynamic library.
-    #[inline]
-    pub fn shortname(&self) -> &str {
-        self.inner.shortname()
-    }
-
     /// Get the current flags of the dynamic library from the global registry.
     pub fn flags(&self) -> OpenFlags {
         use super::register::MANAGER;
         crate::lock_read!(MANAGER)
-            .flags(self.shortname())
+            .flags(self.name())
             .unwrap_or(OpenFlags::empty())
     }
 

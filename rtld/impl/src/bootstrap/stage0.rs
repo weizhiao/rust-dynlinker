@@ -1,4 +1,7 @@
-use crate::runtime::{RTLD_FATAL_EXIT_STATUS, exit, read_usize};
+use crate::{
+    arch::{NATIVE_RELOCATION_ENTRY_SIZE_TAG, NATIVE_RELOCATION_SIZE_TAG, NATIVE_RELOCATION_TAG},
+    runtime::{RTLD_FATAL_EXIT_STATUS, exit, read_usize},
+};
 use core::ptr::{NonNull, null};
 use dlopen_rs::rtld::{
     auxv::{
@@ -296,21 +299,6 @@ impl Relocs {
         }
     }
 }
-
-#[cfg(any(target_arch = "x86", target_arch = "arm"))]
-const NATIVE_RELOCATION_TAG: ElfDynamicTag = ElfDynamicTag::REL;
-#[cfg(all(not(target_arch = "x86"), not(target_arch = "arm")))]
-const NATIVE_RELOCATION_TAG: ElfDynamicTag = ElfDynamicTag::RELA;
-
-#[cfg(any(target_arch = "x86", target_arch = "arm"))]
-const NATIVE_RELOCATION_SIZE_TAG: ElfDynamicTag = ElfDynamicTag::RELSZ;
-#[cfg(all(not(target_arch = "x86"), not(target_arch = "arm")))]
-const NATIVE_RELOCATION_SIZE_TAG: ElfDynamicTag = ElfDynamicTag::RELASZ;
-
-#[cfg(any(target_arch = "x86", target_arch = "arm"))]
-const NATIVE_RELOCATION_ENTRY_SIZE_TAG: ElfDynamicTag = ElfDynamicTag::RELENT;
-#[cfg(all(not(target_arch = "x86"), not(target_arch = "arm")))]
-const NATIVE_RELOCATION_ENTRY_SIZE_TAG: ElfDynamicTag = ElfDynamicTag::RELAENT;
 
 pub(super) unsafe fn can_tail_jump_main(dynamic: *const usize) -> bool {
     if dynamic.is_null() {

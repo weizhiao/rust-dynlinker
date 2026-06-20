@@ -1,3 +1,5 @@
+mod support;
+
 use dlopen_rs::{ElfLibrary, OpenFlags, dlsym_default, dlsym_next};
 use std::env::consts;
 use std::path::PathBuf;
@@ -45,6 +47,7 @@ fn compile() {
                 .env("CARGO_PROFILE_RELEASE_PANIC", "unwind")
                 .arg("--target")
                 .arg(TARGET_TRIPLE.get().unwrap().as_str());
+            support::apply_local_relink_patch(&mut cmd);
             assert!(
                 cmd.status()
                     .expect("could not compile the test helpers!")

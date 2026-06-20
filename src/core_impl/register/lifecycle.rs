@@ -1,7 +1,7 @@
 use super::{MANAGER, Manager, libc_compat_aliases, normalized_flags};
 use crate::{
     ElfLibrary, OpenFlags,
-    core_impl::{DylibExt, FileIdentity, LoadedDylib, contains_addr, mapped_end},
+    core_impl::{FileIdentity, LoadedDylib, contains_addr, mapped_end},
 };
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::ffi::{c_int, c_void};
@@ -12,7 +12,7 @@ impl Drop for ElfLibrary {
         let mut removed_libs = Vec::new();
         {
             let mut lock = crate::lock_write!(MANAGER);
-            let shortname = self.inner.shortname();
+            let shortname = self.inner.name();
             let Some(flags) = lock.flags(shortname) else {
                 return;
             };
@@ -42,7 +42,7 @@ impl Drop for ElfLibrary {
 
                 // Check dependencies
                 for dep in self.deps.iter().skip(1) {
-                    let dep_shortname = dep.shortname();
+                    let dep_shortname = dep.name();
                     let Some(dep_flags) = lock.flags(dep_shortname) else {
                         continue;
                     };
@@ -103,7 +103,7 @@ pub(crate) fn reserve_pending(
 pub(crate) fn register_loaded(lib: LoadedDylib, flags: OpenFlags, manager: &mut Manager) {
     let name = lib.name();
     let is_main = name.is_empty();
-    let shortname = lib.shortname().to_owned();
+    let shortname = name.to_owned();
     let flags = normalized_flags(name, flags);
 
     log::debug!(
@@ -118,7 +118,6 @@ pub(crate) fn register_loaded(lib: LoadedDylib, flags: OpenFlags, manager: &mut 
     if let Some(identity) = lib.user_data().file_identity {
         manager.add_identity(identity, &shortname);
     }
-    manager.add_alias(&shortname, lib.shortname());
     manager.add_alias(&shortname, lib.path().file_name());
     for alias in libc_compat_aliases(&shortname) {
         manager.add_alias(&shortname, alias);
@@ -170,7 +169,7 @@ pub(crate) fn addr2dso(addr: usize) -> Option<ElfLibrary> {
     log::trace!("addr2dso: addr [{:#x}]", addr);
     let manager = crate::lock_read!(MANAGER);
     let entry = manager.all_values().find(|v| contains_addr(v, addr))?;
-    let deps = manager.library_scope(entry.shortname())?;
+    let deps = manager.library_scope(entry.name())?;
     Some(ElfLibrary { inner: entry, deps })
 }
 

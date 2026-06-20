@@ -5,15 +5,18 @@ use core::{
 };
 
 use super::{
-    publish::publish_bootstrap_objects,
+    publish::{
+        BootstrapObject, BootstrapState, publish_bootstrap_objects, publish_loaded_globals,
+        publish_rtld_link_map,
+    },
     stack::rewrite_initial_stack_for_program,
     stage0::Stage0,
     stage2::Stage1Failure,
-    state::{BootstrapObject, BootstrapState},
 };
 use crate::{
     cli::handle_direct_invocation,
     globals::{__libc_stack_end, _dl_argv},
+    runtime::{RTLD_FATAL_EXIT_STATUS, exit},
 };
 use dlopen_rs::{
     Error, OpenFlags, Result,
@@ -23,26 +26,66 @@ use dlopen_rs::{
         elf::ElfPhdr,
     },
 };
+use syscalls::Sysno;
 
 const RTLD_NAME: &str = "ld-linux-x86-64.so.2";
+const AT_FDCWD: usize = -100isize as usize;
+const F_GETFD: usize = 1;
+const O_RDONLY: usize = 0;
+const O_WRONLY: usize = 1;
+const O_NOFOLLOW: usize = 0o400000;
 
 pub(super) fn stage1(stage0: &Stage0) -> core::result::Result<usize, Stage1Failure> {
-    install_stage1_context(stage0);
+    install_stage1_runtime(stage0.stack);
 
     if stage0.direct_invocation {
         let state = unsafe { publish_direct_exec_state(stage0) };
+        unsafe { install_process_context(&state) };
+        check_standard_fds_if_secure(stage0.aux.secure);
         return unsafe { prepare_direct_exec(&state) }.map_err(Stage1Failure::DirectExec);
     }
 
     let state = unsafe { publish_kernel_mapped_main_state(stage0) };
+    unsafe { install_process_context(&state) };
+    check_standard_fds_if_secure(stage0.aux.secure);
     unsafe { prepare_kernel_mapped_main(&state) }.map_err(Stage1Failure::KernelMappedMain)
 }
 
-fn install_stage1_context(stage0: &Stage0) {
+fn install_stage1_runtime(stack: *const usize) {
     crate::tls::install_resolver_ops();
+    unsafe { addr_of_mut!(__libc_stack_end).write(stack) };
+}
+
+unsafe fn install_process_context(state: &BootstrapState) {
     unsafe {
-        addr_of_mut!(_dl_argv).write(stage0.argv);
-        addr_of_mut!(__libc_stack_end).write(stage0.stack);
+        addr_of_mut!(_dl_argv).write(state.argv);
+        rtld::set_initial_process_state(state.argc, state.argv, state.envp);
+    }
+}
+
+fn check_standard_fds_if_secure(secure: usize) {
+    if secure == 0 {
+        return;
+    }
+
+    check_standard_fd(0, b"/dev/full\0", O_WRONLY | O_NOFOLLOW);
+    check_standard_fd(1, b"/dev/null\0", O_RDONLY | O_NOFOLLOW);
+    check_standard_fd(2, b"/dev/null\0", O_RDONLY | O_NOFOLLOW);
+}
+
+fn check_standard_fd(fd: usize, path: &[u8], flags: usize) {
+    if unsafe { syscalls::syscall2(Sysno::fcntl, fd, F_GETFD).is_ok() } {
+        return;
+    }
+
+    let Ok(opened) =
+        (unsafe { syscalls::syscall4(Sysno::openat, AT_FDCWD, path.as_ptr() as usize, flags, 0) })
+    else {
+        exit(RTLD_FATAL_EXIT_STATUS);
+    };
+
+    if opened != fd {
+        exit(RTLD_FATAL_EXIT_STATUS);
     }
 }
 
@@ -83,33 +126,21 @@ unsafe fn publish_kernel_mapped_main_state(stage0: &Stage0) -> BootstrapState {
 }
 
 unsafe fn prepare_kernel_mapped_main(state: &BootstrapState) -> Result<usize> {
-    unsafe { rtld::set_initial_process_state(state.argc, state.argv, state.envp) };
-
     let mut loader = rtld::new_loader();
-    let rtld_dylib = unsafe { load_bootstrap_object(&mut loader, RTLD_NAME, state.rtld)? };
-    rtld::register_loaded_object(
-        &rtld_dylib,
-        OpenFlags::RTLD_GLOBAL | OpenFlags::RTLD_NODELETE,
-    );
+    let rtld_link_map = unsafe { load_bootstrap_rtld(&mut loader, state.rtld)? };
 
     let main = unsafe { load_bootstrap_object(&mut loader, "", state.main)? };
     let entry = main.entry();
-    unsafe { link_startup_root("", main)? };
+    unsafe { link_startup_root("", main, state, rtld_link_map)? };
     Ok(entry)
 }
 
 unsafe fn prepare_direct_exec(state: &BootstrapState) -> Result<usize> {
-    unsafe { rtld::set_initial_process_state(state.argc, state.argv, state.envp) };
-
     let exec_path = unsafe { CStr::from_ptr(state.exec_path.cast()) }
         .to_str()
         .map_err(|_| Error::InvalidPath)?;
     let mut loader = rtld::new_loader();
-    let rtld_dylib = unsafe { load_bootstrap_object(&mut loader, RTLD_NAME, state.rtld)? };
-    rtld::register_loaded_object(
-        &rtld_dylib,
-        OpenFlags::RTLD_GLOBAL | OpenFlags::RTLD_NODELETE,
-    );
+    let rtld_link_map = unsafe { load_bootstrap_rtld(&mut loader, state.rtld)? };
 
     let exec = loader.load_exec(exec_path).map_err(Error::from)?;
     let (phdr, phnum) = exec
@@ -130,12 +161,29 @@ unsafe fn prepare_direct_exec(state: &BootstrapState) -> Result<usize> {
     }
 
     match exec {
-        rtld::RawExec::Dynamic(dynamic) => unsafe { link_startup_root(exec_path, dynamic)? },
+        rtld::RawExec::Dynamic(dynamic) => unsafe {
+            link_startup_root(exec_path, dynamic, state, rtld_link_map)?
+        },
         rtld::RawExec::Static(static_exec) => {
             core::mem::forget(static_exec);
         }
     }
     Ok(entry)
+}
+
+unsafe fn load_bootstrap_rtld(
+    loader: &mut rtld::RuntimeLoader,
+    object: BootstrapObject,
+) -> Result<*mut rtld::link_map::LinkMap> {
+    let dylib = unsafe { load_bootstrap_object(loader, RTLD_NAME, object)? };
+    let link_map = rtld::raw_link_map(&dylib);
+    if link_map.is_null() {
+        return Err(Error::FindLibError {
+            msg: String::from("bootstrap rtld is missing link map"),
+        });
+    }
+    rtld::register_loaded_object(&dylib, OpenFlags::RTLD_GLOBAL | OpenFlags::RTLD_NODELETE);
+    Ok(link_map)
 }
 
 unsafe fn load_bootstrap_object(
@@ -161,18 +209,28 @@ unsafe fn load_bootstrap_object(
     .map_err(Into::into)
 }
 
-unsafe fn link_startup_root(root_request: &str, root: rtld::ElfDylib) -> Result<()> {
+unsafe fn link_startup_root(
+    root_request: &str,
+    root: rtld::ElfDylib,
+    state: &BootstrapState,
+    rtld_link_map: *mut rtld::link_map::LinkMap,
+) -> Result<()> {
+    let main = rtld::raw_link_map(&root);
+    if main.is_null() {
+        return Err(Error::FindLibError {
+            msg: String::from("startup root is missing link map"),
+        });
+    }
+
     let startup_flags = OpenFlags::RTLD_GLOBAL | OpenFlags::RTLD_NOW | OpenFlags::RTLD_NODELETE;
     let handle = rtld::link_mapped_root(root_request, root, startup_flags)?;
-    unsafe { rtld::refresh_static_tls() };
-    unsafe { run_glibc_startup_hooks() };
+    let rtld = unsafe { publish_rtld_link_map(rtld_link_map) };
+    let link_maps = rtld::startup_link_maps(&handle, rtld);
+    unsafe { publish_loaded_globals(state, main, link_maps) };
+    super::publish_tls_layout();
+    unsafe { call_libc_early_init() };
     drop(handle);
     Ok(())
-}
-
-unsafe fn run_glibc_startup_hooks() {
-    unsafe { call_libc_early_init() };
-    unsafe { call_libc_ctype_init() };
 }
 
 unsafe fn call_libc_early_init() {
@@ -181,14 +239,6 @@ unsafe fn call_libc_early_init() {
         return;
     };
     unsafe { init(true) };
-}
-
-unsafe fn call_libc_ctype_init() {
-    type CtypeInit = unsafe extern "C" fn();
-    let Some(init) = (unsafe { rtld::find_loaded_symbol::<CtypeInit>("__ctype_init") }) else {
-        return;
-    };
-    unsafe { init() };
 }
 
 unsafe fn patch_exec_auxv(

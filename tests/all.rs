@@ -1,3 +1,5 @@
+mod support;
+
 use dlopen_rs::{ElfLibrary, OpenFlags};
 use std::env::consts;
 use std::path::PathBuf;
@@ -53,6 +55,7 @@ fn compile() {
                 .env("CARGO_PROFILE_RELEASE_PANIC", "unwind")
                 .arg("--target")
                 .arg(TARGET_TRIPLE.get().unwrap().as_str());
+            support::apply_local_relink_patch(&mut cmd);
             assert!(
                 cmd.status()
                     .expect("could not compile the test helpers!")
@@ -143,7 +146,7 @@ fn soname_alias() {
     let path = lib_path("libpromotion.so");
 
     let lib = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
-    assert_eq!(lib.shortname(), "libpromotion_soname.so.1");
+    assert_eq!(lib.name(), "libpromotion_soname.so.1");
 
     let by_soname = ElfLibrary::dlopen(
         "libpromotion_soname.so.1",

@@ -46,14 +46,10 @@ pub mod relocation {
     pub use elf_loader::relocation::{relocate_relative, relocate_relr};
 }
 
-pub mod debug {
-    use core::ffi::{c_char, c_int, c_void};
+pub mod link_map {
+    use core::ffi::{c_char, c_void};
 
     use super::elf::ElfPhdr;
-
-    pub const RT_CONSISTENT: c_int = 0;
-    pub const RT_ADD: c_int = 1;
-    pub const RT_DELETE: c_int = 2;
 
     #[derive(Debug, Clone, Copy)]
     #[repr(C)]
@@ -72,7 +68,18 @@ pub mod debug {
         pub l_phnum: u16,
         pub l_ldnum: u16,
         pub _pad_after_ldnum: u32,
-        pub _reserved_tail: [usize; 56],
+        pub _reserved_before_tls: [usize; 45],
+        pub l_tls_initimage: *mut c_void,
+        pub l_tls_initimage_size: usize,
+        pub l_tls_blocksize: usize,
+        pub l_tls_align: usize,
+        pub l_tls_firstbyte_offset: usize,
+        pub l_tls_offset: isize,
+        pub l_tls_modid: usize,
+        pub l_tls_dtor_count: usize,
+        pub l_relro_addr: usize,
+        pub l_relro_size: usize,
+        pub l_serial: u64,
     }
 
     impl LinkMap {
@@ -92,15 +99,39 @@ pub mod debug {
                 l_phnum: 0,
                 l_ldnum: 0,
                 _pad_after_ldnum: 0,
-                _reserved_tail: [0; 56],
+                _reserved_before_tls: [0; 45],
+                l_tls_initimage: core::ptr::null_mut(),
+                l_tls_initimage_size: 0,
+                l_tls_blocksize: 0,
+                l_tls_align: 0,
+                l_tls_firstbyte_offset: 0,
+                l_tls_offset: 0,
+                l_tls_modid: 0,
+                l_tls_dtor_count: 0,
+                l_relro_addr: 0,
+                l_relro_size: 0,
+                l_serial: 0,
             }
         }
     }
 
     const _: [(); 1208] = [(); core::mem::size_of::<LinkMap>()];
+    const _: [(); 1120] = [(); core::mem::offset_of!(LinkMap, l_tls_initimage)];
+    const _: [(); 1160] = [(); core::mem::offset_of!(LinkMap, l_tls_offset)];
+    const _: [(); 1168] = [(); core::mem::offset_of!(LinkMap, l_tls_modid)];
 
     unsafe impl Send for LinkMap {}
     unsafe impl Sync for LinkMap {}
+}
+
+pub mod debug {
+    use core::ffi::{c_int, c_void};
+
+    use super::link_map::LinkMap;
+
+    pub const RT_CONSISTENT: c_int = 0;
+    pub const RT_ADD: c_int = 1;
+    pub const RT_DELETE: c_int = 2;
 
     #[derive(Clone, Copy)]
     #[repr(C)]

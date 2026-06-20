@@ -4,17 +4,21 @@ mod manager;
 pub(crate) use lifecycle::{addr2dso, global_find, next_find, register_loaded, reserve_pending};
 
 use super::{
-    loader::LoadedDylib,
+    loader::{ActiveTlsResolver, LoadedDylib},
     types::{ExtraData, FileIdentity},
 };
 use crate::OpenFlags;
 use alloc::{borrow::Cow, string::String, vec::Vec};
-use elf_loader::linker::{LinkContext, ModuleId};
+use elf_loader::{
+    arch::NativeArch,
+    linker::{LinkContext, ModuleId},
+};
 use hashbrown::{DefaultHashBuilder, HashMap};
 use spin::{Lazy, RwLock};
 
 type IndexMap<K, V> = indexmap::IndexMap<K, V, DefaultHashBuilder>;
 type IndexSet<K> = indexmap::IndexSet<K, DefaultHashBuilder>;
+type GlobalLinkContext = LinkContext<String, ExtraData, GlobalMeta, NativeArch, ActiveTlsResolver>;
 
 #[macro_export]
 macro_rules! lock_write {
@@ -139,7 +143,7 @@ pub(crate) struct Manager {
     /// Maps file identities to the canonical short name for fast inode-based lookup.
     identities: HashMap<FileIdentity, String>,
     /// Fully linked modules indexed by canonical key.
-    link_ctx: LinkContext<String, ExtraData, GlobalMeta>,
+    link_ctx: GlobalLinkContext,
     /// The number of times a new object has been added to the link map.
     adds: u64,
     /// The number of times an object has been removed from the link map.

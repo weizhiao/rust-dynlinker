@@ -4,7 +4,9 @@ use super::{
     should_continue_library_search,
 };
 use crate::{
-    Result, core_impl::reserve_pending, error::find_lib_error,
+    Result,
+    core_impl::{ActiveTlsResolver, reserve_pending},
+    error::find_lib_error,
     utils::linker_script::get_linker_script_libs,
 };
 use alloc::{
@@ -20,6 +22,8 @@ use elf_loader::linker::{
     DependencyRequest, KeyResolver, ResolvedKey, RootRequest, VisibleModules,
 };
 use elf_loader::{arch::NativeArch, image::ModuleHandle};
+
+type DlopenResolvedKey<'cfg> = ResolvedKey<'cfg, String, NativeArch, ActiveTlsResolver>;
 
 fn into_linker_error(err: crate::error::Error) -> elf_loader::Error {
     match err {
@@ -45,7 +49,7 @@ impl<'ctx, 'mgr> DlopenVisible<'ctx, 'mgr> {
     }
 }
 
-impl VisibleModules<String, NativeArch, str> for DlopenVisible<'_, '_> {
+impl VisibleModules<String, NativeArch, str, ActiveTlsResolver> for DlopenVisible<'_, '_> {
     fn visible_key(&self, key: &str) -> Option<String> {
         self.shared.with_manager(|manager| manager.visible_key(key))
     }
@@ -55,7 +59,7 @@ impl VisibleModules<String, NativeArch, str> for DlopenVisible<'_, '_> {
             .with_manager(|manager| manager.visible_direct_deps(key))
     }
 
-    fn module(&self, key: &str) -> Option<ModuleHandle<NativeArch>> {
+    fn module(&self, key: &str) -> Option<ModuleHandle<NativeArch, ActiveTlsResolver>> {
         self.shared
             .with_manager(|manager| manager.visible_loaded(key).map(Into::into))
     }
@@ -133,7 +137,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         &self,
         path: &ElfPath,
         env: ResolveEnv<'_>,
-    ) -> Option<ResolvedKey<'static, String>> {
+    ) -> Option<DlopenResolvedKey<'static>> {
         let shortname = path.file_name();
         if env.contains_visible(shortname) {
             return Some(ResolvedKey::existing(shortname.to_owned()));
@@ -148,7 +152,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         &mut self,
         env: ResolveEnv<'_>,
         libs: Vec<String>,
-    ) -> Result<ResolvedKey<'bytes, String>> {
+    ) -> Result<DlopenResolvedKey<'bytes>> {
         self.resolve_first(libs, |resolver, lib| {
             resolver.resolve_request(env, &lib, CandidateSource::File)
         })?
@@ -160,7 +164,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         env: ResolveEnv<'_>,
         path: &ElfPath,
         source: CandidateSource<'bytes>,
-    ) -> Result<ResolvedKey<'bytes, String>> {
+    ) -> Result<DlopenResolvedKey<'bytes>> {
         let shortname = path.file_name();
         if let Some(module) = self.resolve_existing(path, env) {
             return Ok(module);
@@ -213,8 +217,8 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
     fn resolve_first<Candidate>(
         &mut self,
         candidates: impl IntoIterator<Item = Candidate>,
-        mut resolve: impl FnMut(&mut Self, Candidate) -> Result<ResolvedKey<'bytes, String>>,
-    ) -> Result<Option<ResolvedKey<'bytes, String>>> {
+        mut resolve: impl FnMut(&mut Self, Candidate) -> Result<DlopenResolvedKey<'bytes>>,
+    ) -> Result<Option<DlopenResolvedKey<'bytes>>> {
         for candidate in candidates {
             match resolve(self, candidate) {
                 Ok(module) => return Ok(Some(module)),
@@ -230,7 +234,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         env: ResolveEnv<'_>,
         paths: impl IntoIterator<Item = ElfPath>,
         source: CandidateSource<'bytes>,
-    ) -> Result<Option<ResolvedKey<'bytes, String>>> {
+    ) -> Result<Option<DlopenResolvedKey<'bytes>>> {
         self.resolve_first(paths, |resolver, path| {
             resolver.resolve_candidate_path(env, &path, source)
         })
@@ -241,7 +245,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         env: ResolveEnv<'_>,
         lib_name: &str,
         source: CandidateSource<'bytes>,
-    ) -> Result<ResolvedKey<'bytes, String>> {
+    ) -> Result<DlopenResolvedKey<'bytes>> {
         if lib_name.contains('/') {
             let path = ElfPath::from(lib_name);
             return self.resolve_candidate_path(env, &path, source);
@@ -289,13 +293,13 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
     }
 }
 
-impl<'ctx, 'mgr, 'bytes> KeyResolver<'bytes, String, NativeArch, str>
+impl<'ctx, 'mgr, 'bytes> KeyResolver<'bytes, String, NativeArch, str, ActiveTlsResolver>
     for LinkResolver<'ctx, 'mgr, 'bytes>
 {
     fn load_root(
         &mut self,
         req: &RootRequest<'_, String, str>,
-    ) -> core::result::Result<ResolvedKey<'bytes, String>, elf_loader::Error> {
+    ) -> core::result::Result<DlopenResolvedKey<'bytes>, elf_loader::Error> {
         let key = req.key();
         let source = if *key == self.root_request {
             self.root_source.take()
@@ -309,7 +313,7 @@ impl<'ctx, 'mgr, 'bytes> KeyResolver<'bytes, String, NativeArch, str>
     fn resolve_dependency(
         &mut self,
         req: &DependencyRequest<'_, String, str>,
-    ) -> core::result::Result<ResolvedKey<'bytes, String>, elf_loader::Error> {
+    ) -> core::result::Result<DlopenResolvedKey<'bytes>, elf_loader::Error> {
         let owner_name = req.owner_name();
         let rpath = req
             .rpath()

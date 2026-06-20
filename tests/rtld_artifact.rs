@@ -1,6 +1,14 @@
 #![cfg(target_arch = "x86_64")]
 
-use std::{fs, path::PathBuf, process::Command, sync::OnceLock};
+mod support;
+
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::OnceLock,
+};
 
 const RTLD_TARGET: &str = "x86_64-unknown-linux-none";
 
@@ -46,6 +54,66 @@ fn command_output(program: &str, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("command output must be utf-8")
 }
 
+fn first_existing_path(candidates: &[&str]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+}
+
+type SymbolId = (String, Option<String>);
+
+fn parse_symbol_id(name: &str) -> SymbolId {
+    let Some((name, version)) = name.split_once('@') else {
+        return (name.to_owned(), None);
+    };
+    let version = version.trim_start_matches('@');
+    (
+        name.to_owned(),
+        (!version.is_empty()).then(|| version.to_owned()),
+    )
+}
+
+fn format_symbol_id((name, version): &SymbolId) -> String {
+    match version {
+        Some(version) => format!("{name}@{version}"),
+        None => name.clone(),
+    }
+}
+
+fn readelf_symbols(path: &Path) -> Vec<Vec<String>> {
+    let symbols = command_output("readelf", &["-Ws", path.to_str().unwrap()]);
+    symbols
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|fields| fields.len() >= 8 && fields[0].ends_with(':'))
+        .collect()
+}
+
+fn undefined_symbols(path: &Path) -> BTreeSet<SymbolId> {
+    readelf_symbols(path)
+        .into_iter()
+        .filter(|fields| fields[6] == "UND")
+        .map(|fields| parse_symbol_id(&fields[7]))
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
+}
+
+fn exported_symbols(path: &Path) -> BTreeSet<SymbolId> {
+    readelf_symbols(path)
+        .into_iter()
+        .filter(|fields| matches!(fields[3].as_str(), "FUNC" | "OBJECT" | "NOTYPE"))
+        .filter(|fields| matches!(fields[4].as_str(), "GLOBAL" | "WEAK"))
+        .filter(|fields| fields[6] != "UND")
+        .map(|fields| parse_symbol_id(&fields[7]))
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
+}
+
 fn cargo_is_nightly() -> bool {
     static IS_NIGHTLY: OnceLock<bool> = OnceLock::new();
 
@@ -69,19 +137,19 @@ fn build_rtld() -> Option<PathBuf> {
         return None;
     }
 
-    let output = Command::new("cargo")
-        .args([
-            "-Z",
-            "build-std=core,alloc,compiler_builtins",
-            "build",
-            "-p",
-            "rtld",
-            "--release",
-            "--target",
-            RTLD_TARGET,
-        ])
-        .output()
-        .expect("failed to invoke cargo");
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "-Z",
+        "build-std=core,alloc,compiler_builtins",
+        "build",
+        "-p",
+        "rtld",
+        "--release",
+        "--target",
+        RTLD_TARGET,
+    ]);
+    support::apply_local_relink_patch(&mut cmd);
+    let output = cmd.output().expect("failed to invoke cargo");
     assert!(
         output.status.success(),
         "rtld release build failed\nstdout:\n{}\nstderr:\n{}",
@@ -95,6 +163,10 @@ fn test_work_dir(name: &str) -> PathBuf {
     let dir = target_dir().join("rtld-tests").join(name);
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+fn c_string_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[test]
@@ -165,16 +237,69 @@ fn rtld_artifact_has_interpreter_shape() {
     assert!(
         symbols.lines().any(|line| {
             line.contains("_rtld_global@@GLIBC_PRIVATE")
-                && line.split_whitespace().nth(2) == Some("4352")
+                && line.split_whitespace().nth(2) == Some("2120")
         }),
         "_rtld_global must keep glibc's x86_64 size\n{symbols}"
     );
     assert!(
         symbols.lines().any(|line| {
             line.contains("_rtld_global_ro@@GLIBC_PRIVATE")
-                && line.split_whitespace().nth(2) == Some("952")
+                && line.split_whitespace().nth(2) == Some("928")
         }),
         "_rtld_global_ro must keep glibc's x86_64 size\n{symbols}"
+    );
+}
+
+#[test]
+fn rtld_artifact_exports_libc_needed_ld_so_symbols() {
+    if !has_command("readelf") {
+        eprintln!("skipping libc/ld.so symbol ABI test because readelf is unavailable");
+        return;
+    }
+
+    let Some(path) = build_rtld() else {
+        return;
+    };
+    let Some(libc) = first_existing_path(&[
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib64/libc.so.6",
+    ]) else {
+        eprintln!("skipping libc/ld.so symbol ABI test because libc.so.6 was not found");
+        return;
+    };
+    let Some(system_rtld) = first_existing_path(&[
+        "/lib64/ld-linux-x86-64.so.2",
+        "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    ]) else {
+        eprintln!(
+            "skipping libc/ld.so symbol ABI test because system ld-linux-x86-64.so.2 was not found"
+        );
+        return;
+    };
+
+    let libc_undefined = undefined_symbols(&libc);
+    let system_rtld_exports = exported_symbols(&system_rtld);
+    let required = libc_undefined
+        .intersection(&system_rtld_exports)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        required.contains(&("__tls_get_addr".to_owned(), Some("GLIBC_2.3".to_owned())))
+            && required.contains(&("_rtld_global".to_owned(), Some("GLIBC_PRIVATE".to_owned()))),
+        "test did not discover expected libc-private ld.so requirements: {required:?}"
+    );
+
+    let rtld_exports = exported_symbols(&path);
+    let missing = required
+        .difference(&rtld_exports)
+        .map(format_symbol_id)
+        .collect::<Vec<_>>();
+    let required = required.iter().map(format_symbol_id).collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "rtld artifact is missing libc-required ld.so exports: {missing:?}\nrequired: {required:?}"
     );
 }
 
@@ -353,6 +478,180 @@ int main(void) {
 }
 
 #[test]
+fn rtld_artifact_can_create_pthread_with_local_exec_tls() {
+    if !has_command("cc") {
+        eprintln!("skipping pthread TLS PT_INTERP test because cc is unavailable");
+        return;
+    }
+
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+    let interp = rtld_interp_path();
+    assert!(interp.exists(), "missing {}", interp.display());
+
+    let dir = test_work_dir("pt-interp-pthread-tls");
+    let source = dir.join("pthread_tls.c");
+    let program = dir.join("pthread_tls");
+    fs::write(
+        &source,
+        br#"
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+
+static __thread int tls_value __attribute__((tls_model("local-exec"))) = 3;
+
+static void *worker(void *arg) {
+    tls_value += (int)(intptr_t)arg;
+    return (void *)(intptr_t)tls_value;
+}
+
+int main(void) {
+    pthread_t thread;
+    void *ret = 0;
+    tls_value = 7;
+    if (pthread_create(&thread, 0, worker, (void *)(intptr_t)5) != 0) {
+        return 10;
+    }
+    if (pthread_join(thread, &ret) != 0) {
+        return 11;
+    }
+    printf("pthread-tls:%ld:%d\n", (long)(intptr_t)ret, tls_value);
+    return (intptr_t)ret == 8 && tls_value == 7 ? 0 : 12;
+}
+"#,
+    )
+    .unwrap();
+
+    assert!(
+        Command::new("cc")
+            .arg(&source)
+            .arg("-pthread")
+            .arg(format!("-Wl,--dynamic-linker={}", interp.display()))
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .expect("failed to compile pthread TLS test program")
+            .success(),
+        "failed to compile pthread TLS test program"
+    );
+
+    let output = Command::new(&program)
+        .output()
+        .expect("failed to execute pthread TLS test program");
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "pthread TLS test failed with {:?}\nstdout:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "pthread-tls:8:7\n");
+}
+
+#[test]
+fn rtld_artifact_reports_tls_data_from_dl_iterate_phdr() {
+    if !has_command("cc") {
+        eprintln!("skipping dl_iterate_phdr TLS PT_INTERP test because cc is unavailable");
+        return;
+    }
+
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+    let interp = rtld_interp_path();
+    assert!(interp.exists(), "missing {}", interp.display());
+
+    let dir = test_work_dir("pt-interp-phdr-tls");
+    let source = dir.join("phdr_tls.c");
+    let program = dir.join("phdr_tls");
+    fs::write(
+        &source,
+        br#"
+#define _GNU_SOURCE
+#include <elf.h>
+#include <link.h>
+#include <stdint.h>
+#include <stdio.h>
+
+static __thread int tls_value __attribute__((tls_model("local-exec"))) = 123;
+static int found;
+
+static int callback(struct dl_phdr_info *info, size_t size, void *data) {
+    (void) size;
+    (void) data;
+    if (info->dlpi_tls_modid == 0 || info->dlpi_tls_data == 0) {
+        return 0;
+    }
+
+    uintptr_t tls_addr = (uintptr_t) &tls_value;
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+        if (phdr->p_type != PT_TLS) {
+            continue;
+        }
+        uintptr_t start = (uintptr_t) info->dlpi_tls_data;
+        uintptr_t end = start + phdr->p_memsz;
+        if (start <= tls_addr && tls_addr < end) {
+            found = (int) info->dlpi_tls_modid;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int main(void) {
+    tls_value = 321;
+    dl_iterate_phdr(callback, 0);
+    if (found == 0 || tls_value != 321) {
+        return 10;
+    }
+    printf("phdr-tls:%d:%d\n", found, tls_value);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    assert!(
+        Command::new("cc")
+            .arg(&source)
+            .arg(format!("-Wl,--dynamic-linker={}", interp.display()))
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .expect("failed to compile dl_iterate_phdr TLS test program")
+            .success(),
+        "failed to compile dl_iterate_phdr TLS test program"
+    );
+
+    let output = Command::new(&program)
+        .output()
+        .expect("failed to execute dl_iterate_phdr TLS test program");
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "dl_iterate_phdr TLS test failed with {:?}\nstdout:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("phdr-tls:"),
+        "unexpected stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn rtld_artifact_publishes_glibc_rtld_globals() {
     if !has_command("cc") {
         eprintln!("skipping rtld globals ABI test because cc is unavailable");
@@ -437,6 +736,444 @@ int main(void) {
         "unexpected stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+#[test]
+fn rtld_artifact_exposes_glibc_tunable_defaults() {
+    if !has_command("cc") {
+        eprintln!("skipping tunables PT_INTERP test because cc is unavailable");
+        return;
+    }
+
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+    let interp = rtld_interp_path();
+    assert!(interp.exists(), "missing {}", interp.display());
+
+    let dir = test_work_dir("pt-interp-tunables");
+    let source = dir.join("tunables.c");
+    let program = dir.join("tunables");
+    fs::write(
+        &source,
+        br#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+
+struct tunable_str_t {
+    const char *str;
+    size_t len;
+};
+
+typedef void (*tunable_get_val_fn)(size_t, void *, void *);
+typedef bool (*tunable_is_initialized_fn)(size_t);
+
+enum {
+    glibc_cpu_hwcaps = 0,
+    glibc_pthread_stack_cache_size = 29,
+    glibc_rtld_dynamic_sort = 31,
+    glibc_rtld_optional_static_tls = 35,
+};
+
+int main(void) {
+    tunable_get_val_fn get_val =
+        (tunable_get_val_fn) dlsym(RTLD_DEFAULT, "__tunable_get_val");
+    tunable_is_initialized_fn is_initialized =
+        (tunable_is_initialized_fn) dlsym(RTLD_DEFAULT, "__tunable_is_initialized");
+    if (get_val == 0 || is_initialized == 0) {
+        return 10;
+    }
+
+    size_t stack_cache_size = 0;
+    int dynamic_sort = 0;
+    size_t optional_static_tls = 0;
+    const struct tunable_str_t *hwcaps = (const struct tunable_str_t *) 1;
+
+    get_val(glibc_pthread_stack_cache_size, &stack_cache_size, 0);
+    get_val(glibc_rtld_dynamic_sort, &dynamic_sort, 0);
+    get_val(glibc_rtld_optional_static_tls, &optional_static_tls, 0);
+    get_val(glibc_cpu_hwcaps, &hwcaps, 0);
+
+    if (is_initialized(glibc_rtld_optional_static_tls)) {
+        return 11;
+    }
+    if (stack_cache_size != 41943040) {
+        return 12;
+    }
+    if (dynamic_sort != 2) {
+        return 13;
+    }
+    if (optional_static_tls != 512) {
+        return 14;
+    }
+    if (hwcaps == 0 || hwcaps->str != 0 || hwcaps->len != 0) {
+        return 15;
+    }
+
+    printf("tunables:%zu:%d:%zu:%zu\n",
+           stack_cache_size, dynamic_sort, optional_static_tls, hwcaps->len);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    assert!(
+        Command::new("cc")
+            .arg(&source)
+            .arg(format!("-Wl,--dynamic-linker={}", interp.display()))
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .expect("failed to compile tunables ABI test program")
+            .success(),
+        "failed to compile tunables ABI test program"
+    );
+
+    let output = Command::new(&program)
+        .output()
+        .expect("failed to execute tunables ABI test program");
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "tunables ABI test failed with {:?}\nstdout:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "tunables:41943040:2:512:0\n"
+    );
+}
+
+#[test]
+fn rtld_artifact_reports_dlinfo_search_paths() {
+    if !has_command("cc") {
+        eprintln!("skipping dlinfo SERINFO PT_INTERP test because cc is unavailable");
+        return;
+    }
+
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+    let interp = rtld_interp_path();
+    assert!(interp.exists(), "missing {}", interp.display());
+
+    let dir = test_work_dir("pt-interp-dlinfo-serinfo");
+    let source = dir.join("serinfo.c");
+    let program = dir.join("serinfo");
+    fs::write(
+        &source,
+        br#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    Dl_serinfo info;
+    memset(&info, 0, sizeof(info));
+    void *handle = (void *) 1;
+
+    if (dlinfo(handle, RTLD_DI_SERINFOSIZE, &info) != 0) {
+        return 11;
+    }
+    if (info.dls_cnt == 0 || info.dls_size < sizeof(Dl_serinfo)) {
+        return 12;
+    }
+
+    Dl_serinfo *full = malloc(info.dls_size);
+    if (full == 0) {
+        return 13;
+    }
+    full->dls_size = info.dls_size;
+    full->dls_cnt = info.dls_cnt;
+    if (dlinfo(handle, RTLD_DI_SERINFO, full) != 0) {
+        return 14;
+    }
+
+    int found_default = 0;
+    for (unsigned int i = 0; i < full->dls_cnt; ++i) {
+        const char *name = full->dls_serpath[i].dls_name;
+        if (name != 0 && (strcmp(name, "/usr/lib") == 0
+                || strstr(name, "x86_64-linux-gnu") != 0)) {
+            found_default = 1;
+        }
+    }
+
+    printf("serinfo:%u:%zu:%s\n", full->dls_cnt, full->dls_size,
+           full->dls_serpath[0].dls_name);
+    free(full);
+    return found_default ? 0 : 15;
+}
+
+"#,
+    )
+    .unwrap();
+
+    assert!(
+        Command::new("cc")
+            .arg(&source)
+            .arg(format!("-Wl,--dynamic-linker={}", interp.display()))
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .expect("failed to compile dlinfo SERINFO test program")
+            .success(),
+        "failed to compile dlinfo SERINFO test program"
+    );
+
+    let output = Command::new(&program)
+        .output()
+        .expect("failed to execute dlinfo SERINFO test program");
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "dlinfo SERINFO test failed with {:?}\nstdout:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("serinfo:"),
+        "unexpected stdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn rtld_artifact_reports_dlinfo_origin() {
+    if !has_command("cc") {
+        eprintln!("skipping dlinfo ORIGIN PT_INTERP test because cc is unavailable");
+        return;
+    }
+
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+    let interp = rtld_interp_path();
+    assert!(interp.exists(), "missing {}", interp.display());
+
+    let dir = test_work_dir("pt-interp-dlinfo-origin");
+    let plugin_source = dir.join("plugin.c");
+    let plugin = dir.join("liborigin_plugin.so");
+    let source = dir.join("origin.c");
+    let program = dir.join("origin");
+    fs::write(
+        &plugin_source,
+        br#"
+int origin_plugin_value(void) {
+    return 7;
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .arg("-shared")
+            .arg("-fPIC")
+            .arg(&plugin_source)
+            .arg("-o")
+            .arg(&plugin)
+            .status()
+            .expect("failed to compile origin plugin")
+            .success(),
+        "failed to compile origin plugin"
+    );
+
+    let plugin_path = c_string_literal(plugin.to_str().unwrap());
+    let expected_origin = c_string_literal(dir.to_str().unwrap());
+    fs::write(
+        &source,
+        format!(
+            r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+
+#ifndef RTLD_DI_ORIGIN_PATH
+#define RTLD_DI_ORIGIN_PATH 12
+#endif
+
+int main(void) {{
+    void *handle = dlopen("{plugin_path}", RTLD_NOW | RTLD_LOCAL);
+    if (handle == 0) {{
+        return 10;
+    }}
+
+    char origin[4096];
+    memset(origin, 0, sizeof(origin));
+    if (dlinfo(handle, RTLD_DI_ORIGIN, origin) != 0) {{
+        const char *err = dlerror();
+        printf("origin-error:%s\n", err == 0 ? "" : err);
+        return 11;
+    }}
+
+    const char *origin_path = (const char *) 1;
+    if (dlinfo(handle, RTLD_DI_ORIGIN_PATH, &origin_path) != 0) {{
+        const char *err = dlerror();
+        printf("origin-path-error:%s\n", err == 0 ? "" : err);
+        return 12;
+    }}
+
+    int ok = strcmp(origin, "{expected_origin}") == 0
+        && origin_path != 0
+        && strcmp(origin_path, "{expected_origin}") == 0;
+    printf("origin:%s:%s\n", origin, origin_path == 0 ? "" : origin_path);
+    dlclose(handle);
+    return ok ? 0 : 13;
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    assert!(
+        Command::new("cc")
+            .arg(&source)
+            .arg(format!("-Wl,--dynamic-linker={}", interp.display()))
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .expect("failed to compile dlinfo ORIGIN test program")
+            .success(),
+        "failed to compile dlinfo ORIGIN test program"
+    );
+
+    let output = Command::new(&program)
+        .output()
+        .expect("failed to execute dlinfo ORIGIN test program");
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "dlinfo ORIGIN test failed with {:?}\nstdout:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("origin:{}:{}\n", dir.display(), dir.display())
+    );
+}
+
+#[test]
+fn rtld_artifact_supports_libc_dlfcn_hook() {
+    if !has_command("cc") {
+        eprintln!("skipping dlfcn PT_INTERP test because cc is unavailable");
+        return;
+    }
+
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+    let interp = rtld_interp_path();
+    assert!(interp.exists(), "missing {}", interp.display());
+
+    let dir = test_work_dir("pt-interp-dlfcn-hook");
+    let plugin_source = dir.join("plugin.c");
+    let plugin = dir.join("libplugin.so");
+    let source = dir.join("dlfcn_hook.c");
+    let program = dir.join("dlfcn_hook");
+    fs::write(
+        &plugin_source,
+        br#"
+int plugin_value(void) {
+    return 42;
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .arg("-shared")
+            .arg("-fPIC")
+            .arg(&plugin_source)
+            .arg("-o")
+            .arg(&plugin)
+            .status()
+            .expect("failed to compile plugin")
+            .success(),
+        "failed to compile plugin"
+    );
+
+    let plugin_path = c_string_literal(plugin.to_str().unwrap());
+    fs::write(
+        &source,
+        format!(
+            r#"
+#include <dlfcn.h>
+#include <stdio.h>
+
+typedef int (*plugin_value_fn)(void);
+
+int main(void) {{
+    void *handle = dlopen("{plugin_path}", RTLD_NOW | RTLD_LOCAL);
+    if (handle == 0) {{
+        const char *err = dlerror();
+        printf("dlopen-error:%s\n", err == 0 ? "" : err);
+        return 10;
+    }}
+
+    plugin_value_fn plugin_value = (plugin_value_fn) dlsym(handle, "plugin_value");
+    if (plugin_value == 0) {{
+        const char *err = dlerror();
+        printf("dlsym-error:%s\n", err == 0 ? "" : err);
+        return 11;
+    }}
+
+    int value = plugin_value();
+    int closed = dlclose(handle);
+    printf("dlfcn:%d:%d\n", value, closed);
+    return value == 42 && closed == 0 ? 0 : 12;
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    assert!(
+        Command::new("cc")
+            .arg(&source)
+            .arg(format!("-Wl,--dynamic-linker={}", interp.display()))
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .expect("failed to compile dlfcn test program")
+            .success(),
+        "failed to compile dlfcn test program"
+    );
+
+    let output = Command::new(&program)
+        .output()
+        .expect("failed to execute dlfcn test program");
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "dlfcn test failed with {:?}\nstdout:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "dlfcn:42:0\n");
 }
 
 #[test]

@@ -11,8 +11,7 @@ use self::{
 use crate::{
     OpenFlags, Result,
     core_impl::{
-        ActiveTlsResolver, AsFilename, DlopenObserver, DylibExt, ENVP, ElfLibrary, ExtraData,
-        MANAGER,
+        ActiveTlsResolver, AsFilename, DlopenObserver, ENVP, ElfLibrary, ExtraData, MANAGER,
     },
     error::find_lib_error,
     utils::ld_cache::LdCache,
@@ -89,6 +88,11 @@ pub(crate) fn link_root<'mgr, 'bytes>(
 ) -> Result<ElfLibrary> {
     #[cfg(not(feature = "std"))]
     ctx.reserve_root_if_needed(&root);
+    #[cfg(not(feature = "std"))]
+    let mapped_root_key = match &root {
+        LinkRoot::Mapped { key, .. } => Some(key.clone()),
+        _ => None,
+    };
 
     let key_resolver = LinkResolver::new(
         &ctx.shared,
@@ -117,7 +121,16 @@ pub(crate) fn link_root<'mgr, 'bytes>(
     };
     drop(linker);
 
-    let root_shortname = load_result.root().shortname().to_owned();
+    let root_shortname = {
+        #[cfg(not(feature = "std"))]
+        {
+            mapped_root_key.unwrap_or_else(|| load_result.root().name().to_owned())
+        }
+        #[cfg(feature = "std")]
+        {
+            load_result.root().name().to_owned()
+        }
+    };
     ctx.complete_relocation(&link_ctx, load_result.committed().iter().copied());
 
     drop(link_ctx);

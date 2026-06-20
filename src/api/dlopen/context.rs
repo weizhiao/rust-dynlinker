@@ -3,14 +3,17 @@ use super::get_env;
 use crate::core_impl::reserve_pending;
 use crate::{
     OpenFlags,
-    core_impl::{ElfLibrary, ExtraData, GlobalMeta, LibraryLookup, LoadedDylib, MANAGER, Manager},
+    core_impl::{
+        ActiveTlsResolver, ElfLibrary, ExtraData, GlobalMeta, LibraryLookup, LoadedDylib, MANAGER,
+        Manager,
+    },
 };
 #[cfg(not(feature = "std"))]
 use alloc::borrow::ToOwned;
 use alloc::{collections::BTreeSet, string::String, sync::Arc};
 use core::cell::RefCell;
-use elf_loader::image::ModuleScope;
 use elf_loader::linker::{LinkContext, ModuleId};
+use elf_loader::{arch::NativeArch, image::ModuleScope};
 use spin::RwLockWriteGuard;
 
 /// The context for a `dlopen` operation.
@@ -187,7 +190,10 @@ impl<'a> OpenShared<'a> {
         entry
     }
 
-    pub(super) fn prepare_relocation(&self, group_scope: &ModuleScope) -> ModuleScope {
+    pub(super) fn prepare_relocation(
+        &self,
+        group_scope: &ModuleScope<NativeArch, ActiveTlsResolver>,
+    ) -> ModuleScope<NativeArch, ActiveTlsResolver> {
         let relocation_scope =
             self.with_manager_mut(|manager| manager.relocation_scope(group_scope, self.flags));
         drop(self.take_lock());
@@ -198,7 +204,9 @@ impl<'a> OpenShared<'a> {
 impl<'a> OpenContext<'a> {
     fn remove_added_libraries(&self, manager: &mut Manager) {
         for name in self.added_names.iter() {
-            manager.remove(name);
+            if manager.lookup(name).is_some() {
+                manager.remove(name);
+            }
         }
     }
 
@@ -243,7 +251,7 @@ impl<'a> OpenContext<'a> {
 
     pub(super) fn complete_relocation(
         &mut self,
-        link_ctx: &LinkContext<String, ExtraData, GlobalMeta>,
+        link_ctx: &LinkContext<String, ExtraData, GlobalMeta, NativeArch, ActiveTlsResolver>,
         committed: impl IntoIterator<Item = ModuleId>,
     ) {
         let mut lock = self

@@ -3,10 +3,9 @@ use crate::api::dl_iterate_phdr::CDlPhdrInfo;
 use crate::utils::debug::GDBDebug;
 use crate::{
     OpenFlags, Result,
+    abi::link_map::LinkMap,
     api::dl_iterate_phdr::CallBack,
-    core_impl::{
-        ARGC, ARGV, DylibExt, ENVP, ExtraData, LinkMap, LoadedDylib, MANAGER, register_loaded,
-    },
+    core_impl::{ARGC, ARGV, ENVP, ExtraData, LoadedDylib, MANAGER, register_loaded},
 };
 use alloc::{borrow::ToOwned, boxed::Box, ffi::CString, vec::Vec};
 use core::{
@@ -295,7 +294,7 @@ unsafe fn from_raw(
     );
 
     let lib = unsafe {
-        LoadedDylib::new_unchecked::<DefaultTlsResolver>(
+        LoadedDylib::new_unchecked(
             name_str.clone(),
             use_phdrs,
             (base as *mut c_void, len),
@@ -489,7 +488,7 @@ unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut 
 
     log::info!(
         "Initialize lib: [{}] @ [{:#x}]",
-        lib.shortname(),
+        lib.name(),
         lib.base().get()
     );
     register_loaded(

@@ -23,7 +23,7 @@ pub unsafe extern "C" fn dlclose(handle: *const c_void) -> c_int {
         return 0;
     }
     let lib = unsafe { Box::from_raw(handle as *mut crate::ElfLibrary) };
-    let shortname = lib.shortname();
+    let shortname = lib.name();
     log::info!("dlclose: Closing [{}]", shortname);
     0
 }
