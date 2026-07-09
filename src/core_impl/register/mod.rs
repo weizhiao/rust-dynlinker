@@ -79,21 +79,21 @@ impl PendingDylib {
 
 #[derive(Clone)]
 pub(crate) struct LibraryLookup<'a> {
-    shortname: Cow<'a, str>,
+    name: Cow<'a, str>,
     relocated: bool,
 }
 
 impl<'a> LibraryLookup<'a> {
-    pub(crate) fn pending(shortname: Cow<'a, str>) -> Self {
+    pub(crate) fn pending(name: Cow<'a, str>) -> Self {
         Self {
-            shortname,
+            name,
             relocated: false,
         }
     }
 
-    pub(crate) fn relocated(shortname: Cow<'a, str>) -> Self {
+    pub(crate) fn relocated(name: Cow<'a, str>) -> Self {
         Self {
-            shortname,
+            name,
             relocated: true,
         }
     }
@@ -102,13 +102,13 @@ impl<'a> LibraryLookup<'a> {
         self.relocated
     }
 
-    pub(crate) fn shortname(&self) -> &str {
-        &self.shortname
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(crate) fn into_owned(self) -> LibraryLookup<'static> {
         LibraryLookup {
-            shortname: Cow::Owned(self.shortname.into_owned()),
+            name: Cow::Owned(self.name.into_owned()),
             relocated: self.relocated,
         }
     }

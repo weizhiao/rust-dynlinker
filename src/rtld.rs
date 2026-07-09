@@ -15,6 +15,7 @@ pub use crate::core_impl::{DlopenObserver, ElfDylib, ExtraData, RuntimeLoader};
 #[doc(hidden)]
 pub use elf_loader::{
     Loader as ElfLoader, Result as ElfResult, TlsError,
+    arch::NativeArch,
     image::RawExec,
     input::PathBuf,
     memory::VmAddr,
@@ -38,7 +39,6 @@ pub fn tls_get_addr_soft(mod_id: TlsModuleId) -> *mut u8 {
 pub fn new_loader() -> RuntimeLoader {
     ElfLoader::new()
         .with_data::<ExtraData>()
-        .with_observer(DlopenObserver)
         .with_tls_resolver::<ActiveTlsResolver>()
         .with_static_tls(true)
 }
@@ -167,6 +167,8 @@ pub unsafe fn find_loaded_symbol<T: Copy>(name: &str) -> Option<T> {
 mod tls {
     use elf_loader::{
         Result, TlsError,
+        arch::NativeArch,
+        memory::VmAddr,
         tls::{
             DefaultTlsResolver, TlsImageSource, TlsIndex, TlsInfo, TlsModuleId, TlsResolver,
             TlsTpOffset,
@@ -206,12 +208,14 @@ mod tls {
     #[derive(Debug)]
     pub struct RtldTlsResolver;
 
-    impl TlsResolver for RtldTlsResolver {
+    impl TlsResolver<NativeArch> for RtldTlsResolver {
+        const OVERRIDE_TLS_GET_ADDR: bool = true;
+
         fn register(tls_info: &TlsInfo) -> Result<TlsModuleId> {
             if let Some(ops) = RTLD_TLS_OPS.get() {
                 return (ops.register)(tls_info);
             }
-            <DefaultTlsResolver as TlsResolver>::register(tls_info)
+            <DefaultTlsResolver as TlsResolver<NativeArch>>::register(tls_info)
         }
 
         fn register_static(tls_info: &TlsInfo) -> Result<(TlsModuleId, TlsTpOffset)> {
@@ -225,7 +229,7 @@ mod tls {
             if let Some(ops) = RTLD_TLS_OPS.get() {
                 return (ops.add_static_tls)(tls_info, offset);
             }
-            <DefaultTlsResolver as TlsResolver>::add_static_tls(tls_info, offset)
+            <DefaultTlsResolver as TlsResolver<NativeArch>>::add_static_tls(tls_info, offset)
         }
 
         fn init_tls(
@@ -236,7 +240,7 @@ mod tls {
             if let Some(ops) = RTLD_TLS_OPS.get() {
                 return (ops.init_tls)(source, mod_id, offset);
             }
-            <DefaultTlsResolver as TlsResolver>::init_tls(source, mod_id, offset)
+            <DefaultTlsResolver as TlsResolver<NativeArch>>::init_tls(source, mod_id, offset)
         }
 
         fn unregister(mod_id: TlsModuleId) {
@@ -244,14 +248,21 @@ mod tls {
                 (ops.unregister)(mod_id);
                 return;
             }
-            <DefaultTlsResolver as TlsResolver>::unregister(mod_id);
+            <DefaultTlsResolver as TlsResolver<NativeArch>>::unregister(mod_id);
         }
 
-        extern "C" fn tls_get_addr(ti: *const TlsIndex) -> *mut u8 {
+        fn bind_tls_get_addr() -> Result<VmAddr> {
             if let Some(ops) = RTLD_TLS_OPS.get() {
-                return (ops.tls_get_addr)(ti);
+                return Ok(VmAddr::from_ptr(ops.tls_get_addr as *const ()));
             }
-            <DefaultTlsResolver as TlsResolver>::tls_get_addr(ti)
+            <DefaultTlsResolver as TlsResolver<NativeArch>>::bind_tls_get_addr()
+        }
+
+        fn resolve_tls_addr(ti: TlsIndex) -> Result<VmAddr> {
+            if let Some(ops) = RTLD_TLS_OPS.get() {
+                return Ok(VmAddr::from_ptr((ops.tls_get_addr)(&ti)));
+            }
+            <DefaultTlsResolver as TlsResolver<NativeArch>>::resolve_tls_addr(ti)
         }
     }
 }

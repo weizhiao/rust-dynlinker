@@ -17,15 +17,14 @@ impl Drop for ElfLibrary {
                 return;
             };
 
-            if flags.is_nodelete() {
+            if flags.is_nodelete() || flags.is_global() {
                 return;
             }
 
             let ref_count = unsafe { self.inner.core_ref().strong_count() };
-            let has_global = flags.is_global();
             // Dylib ref in committed link_ctx + dylib ref in this handle's deps list
-            // + global ref (if present) + handle's inner ref.
-            let threshold = 3 + has_global as usize;
+            // + handle's inner ref.
+            let threshold = 3;
 
             log::debug!(
                 "Drop ElfLibrary [{}], ref count: {}, threshold: {}",
@@ -49,9 +48,13 @@ impl Drop for ElfLibrary {
                     if dep_flags.is_nodelete() {
                         continue;
                     }
+                    if dep_flags.is_global() {
+                        continue;
+                    }
+
                     // Dylib ref in committed link_ctx + dylib ref in the owner deps list
-                    // + global ref (if present).
-                    let dep_threshold = 3 + dep_flags.is_global() as usize;
+                    // + current handle's dependency list.
+                    let dep_threshold = 3;
 
                     if unsafe { dep.core_ref().strong_count() } == dep_threshold {
                         log::info!("Destroying dylib [{}]", dep.name());

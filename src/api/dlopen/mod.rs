@@ -24,9 +24,22 @@ use alloc::{
     vec::Vec,
 };
 use core::ffi::{CStr, c_char, c_int, c_void};
-use elf_loader::input::PathBuf as ElfPath;
-use elf_loader::linker::{LinkContext, Linker};
+use elf_loader::{
+    Loader,
+    input::PathBuf as ElfPath,
+    lazy::native::NativeLazyBinder,
+    linker::{LinkContext, Linker},
+    relocation::Relocator,
+};
 use spin::Lazy;
+
+type DlopenLoader = Loader<ExtraData, ActiveTlsResolver>;
+type DlopenRelocator = Relocator<NativeLazyBinder>;
+
+const DLOPEN_LOADER: DlopenLoader = Loader::new()
+    .with_data::<ExtraData>()
+    .with_tls_resolver::<ActiveTlsResolver>();
+const DLOPEN_RELOCATOR: DlopenRelocator = Relocator::new().lazy_binder(NativeLazyBinder::new());
 
 fn get_env(name: &str) -> Option<&'static str> {
     unsafe {
@@ -103,22 +116,21 @@ pub(crate) fn link_root<'mgr, 'bytes>(
     let visible_modules = DlopenVisible::new(&ctx.shared);
     let mut link_ctx = LinkContext::new();
     let relocation_planner = DlopenPlanner::new(&ctx.shared);
-    let mut linker = Linker::<String>::new()
-        .map_loader(|loader| {
-            loader
-                .with_data::<ExtraData>()
-                .with_observer(DlopenObserver)
-                .with_tls_resolver::<ActiveTlsResolver>()
-        })
-        .map_relocator(|relocator| relocator.observer(DlopenObserver))
+    let linker = Linker::<String>::new()
+        .loader(DLOPEN_LOADER)
+        .relocator(DLOPEN_RELOCATOR)
         .visible_modules(visible_modules)
         .resolver(key_resolver)
         .planner(relocation_planner);
+    let mut linker_run = linker.run().with_observer(DlopenObserver);
     let load_result = match root {
-        LinkRoot::Load { key, .. } => linker.load(&mut link_ctx, key)?,
+        LinkRoot::Load { key, .. } => linker_run.load::<_, str>(&mut link_ctx, key)?,
         #[cfg(not(feature = "std"))]
-        LinkRoot::Mapped { key, raw } => linker.load_mapped_root(&mut link_ctx, key, raw)?,
+        LinkRoot::Mapped { key, raw } => {
+            linker_run.load_mapped_root::<_, str>(&mut link_ctx, key, raw)?
+        }
     };
+    drop(linker_run);
     drop(linker);
 
     let root_shortname = {

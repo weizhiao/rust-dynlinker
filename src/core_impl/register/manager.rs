@@ -29,12 +29,13 @@ impl Manager {
     fn loaded_by_module(&self, id: ModuleId) -> Option<LoadedDylib> {
         self.link_ctx
             .get(id)
+            .ok()
             .and_then(|module| module.downcast_ref::<LoadedDylib>().cloned())
     }
 
     fn committed_module(&self, key: &str) -> Option<ModuleId> {
         let id = self.link_ctx.key_id(key)?;
-        self.link_ctx.module_id(id)
+        self.link_ctx.module_id(id).ok().flatten()
     }
 
     fn pending_id(&self, key: &str) -> Option<PendingModuleId> {
@@ -181,8 +182,10 @@ impl Manager {
             self.add_pending_alias(id, alias);
         } else {
             let id = self
-                .link_ctx
-                .add_alias(target, alias.to_owned())
+                .committed_module(target)
+                .expect("Alias target library must be registered before adding aliases");
+            self.link_ctx
+                .add_alias(id, alias.to_owned())
                 .expect("library alias must not target a different committed module");
             self.link_ctx
                 .meta_mut(id)
@@ -206,6 +209,7 @@ impl Manager {
         } else if let Some(id) = self.committed_module(shortname) {
             self.link_ctx
                 .remove(id)
+                .ok()
                 .map(|(_, _, meta)| (Some(id), meta.flags))
         } else {
             None
@@ -239,7 +243,7 @@ impl Manager {
     pub(crate) fn flags(&self, name: &str) -> Option<OpenFlags> {
         if let Some(meta) = self
             .committed_module(name)
-            .and_then(|id| self.link_ctx.meta(id))
+            .and_then(|id| self.link_ctx.meta(id).ok())
         {
             return Some(meta.flags);
         }
@@ -298,12 +302,12 @@ impl Manager {
         let mut seen = BTreeSet::new();
 
         for needed in lib.needed_libs() {
-            let shortname = self
+            let name = self
                 .lookup(needed)
-                .map(|dep| dep.shortname().to_owned())
+                .map(|dep| dep.name().to_owned())
                 .unwrap_or_else(|| needed.clone());
-            if seen.insert(shortname.clone()) {
-                deps.push(shortname);
+            if seen.insert(name.clone()) {
+                deps.push(name);
             }
         }
 
@@ -359,17 +363,16 @@ impl Manager {
                 continue;
             }
 
-            let Some(module) = source.get(id).cloned() else {
+            let Ok(module) = source.get(id).cloned() else {
                 continue;
             };
             let loaded = module.downcast_ref::<LoadedDylib>().cloned();
             let direct_deps = source
                 .direct_deps(id)
-                .unwrap_or(&[])
-                .iter()
-                .map(|dep| {
+                .expect("committed module must resolve direct dependencies")
+                .map(|(dep_key, _)| {
                     source
-                        .key(*dep)
+                        .key(dep_key)
                         .expect("direct dependency id must resolve in source link context")
                         .clone()
                 })
@@ -404,7 +407,7 @@ impl Manager {
                 .expect("load merge must not insert duplicate keys");
             for alias in &meta.libnames {
                 self.link_ctx
-                    .add_alias(&key, alias.clone())
+                    .add_alias(module_id, alias.clone())
                     .expect("library alias must not target a different committed module");
             }
             if !was_pending {
@@ -430,7 +433,7 @@ impl Manager {
         debug_assert!(
             source.load_order().all(|id| source
                 .module_key(id)
-                .is_some_and(|key| self.link_ctx.contains_key(key))),
+                .is_ok_and(|key| self.link_ctx.contains_key(key))),
             "all source modules must be present in the global link context"
         );
     }
@@ -438,21 +441,21 @@ impl Manager {
     pub(crate) fn visible_key(&self, name: &str) -> Option<String> {
         let lookup = self.lookup(name)?;
         self.link_ctx
-            .contains_key(lookup.shortname())
-            .then(|| lookup.shortname().to_owned())
+            .contains_key(lookup.name())
+            .then(|| lookup.name().to_owned())
     }
 
     pub(crate) fn visible_direct_deps(&self, name: &str) -> Option<Box<[String]>> {
         let lookup = self.lookup(name)?;
-        let shortname = lookup.shortname();
+        let shortname = lookup.name();
         if let Some(id) = self.committed_module(shortname) {
             let direct_deps = self
                 .link_ctx
-                .direct_deps(id)?
-                .iter()
-                .map(|dep| {
+                .direct_deps(id)
+                .ok()?
+                .map(|(dep_key, _)| {
                     self.link_ctx
-                        .key(*dep)
+                        .key(dep_key)
                         .expect("direct dependency id must resolve in global link context")
                         .clone()
                 })
@@ -468,7 +471,7 @@ impl Manager {
 
     pub(crate) fn visible_loaded(&self, name: &str) -> Option<LoadedDylib> {
         let lookup = self.lookup(name)?;
-        let shortname = lookup.shortname();
+        let shortname = lookup.name();
         self.committed_module(shortname)
             .and_then(|id| self.loaded_by_module(id))
             .or_else(|| {
@@ -488,7 +491,7 @@ impl Manager {
 
     pub(crate) fn get_lib(&mut self, name: &str) -> Option<ElfLibrary> {
         let lookup = self.lookup(name)?;
-        let id = self.committed_module(lookup.shortname())?;
+        let id = self.committed_module(lookup.name())?;
         let deps = self.library_scope_by_module(id)?;
         let inner = self.loaded_by_module(id)?;
         Some(ElfLibrary { inner, deps })
@@ -518,7 +521,7 @@ impl Manager {
 
     pub(crate) fn library_scope(&self, name: &str) -> Option<Arc<[LoadedDylib]>> {
         let lookup = self.lookup(name)?;
-        let id = self.committed_module(lookup.shortname())?;
+        let id = self.committed_module(lookup.name())?;
         self.library_scope_by_module(id)
     }
 

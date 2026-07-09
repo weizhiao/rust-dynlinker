@@ -64,12 +64,6 @@ pub(super) enum CandidateSource<'bytes> {
     Bytes(&'bytes [u8]),
 }
 
-impl<'bytes> CandidateSource<'bytes> {
-    pub(super) fn take(&mut self) -> Self {
-        core::mem::replace(self, Self::File)
-    }
-}
-
 impl<'bytes> From<Option<&'bytes [u8]>> for CandidateSource<'bytes> {
     fn from(bytes: Option<&'bytes [u8]>) -> Self {
         match bytes {
@@ -165,7 +159,7 @@ impl<'a> OpenShared<'a> {
             match entry {
                 Some((lib, matched_identity))
                     if lib.is_relocated()
-                        || added_names.is_some_and(|names| names.contains(lib.shortname())) =>
+                        || added_names.is_some_and(|names| names.contains(lib.name())) =>
                 {
                     break (Some(lib), matched_identity);
                 }
@@ -178,12 +172,12 @@ impl<'a> OpenShared<'a> {
             log::info!(
                 "dlopen: Found existing library by inode match: requested [{}], existing [{}] (dev={}, ino={})",
                 shortname,
-                lib.shortname(),
+                lib.name(),
                 identity.dev,
                 identity.ino
             );
             self.with_manager_mut(|manager| {
-                manager.add_alias(lib.shortname(), shortname);
+                manager.add_alias(lib.name(), shortname);
             });
         }
 
@@ -225,7 +219,7 @@ impl<'a> OpenContext<'a> {
         path: &str,
         lib: LibraryLookup<'static>,
     ) -> ElfLibrary {
-        let shortname = lib.shortname();
+        let shortname = lib.name();
         log::info!(
             "dlopen: Found existing library [{}] (canonical name: {})",
             path,

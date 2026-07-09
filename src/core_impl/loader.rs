@@ -26,8 +26,7 @@ use elf_loader::{
 };
 
 #[cfg(not(feature = "std"))]
-pub type RuntimeLoader =
-    elf_loader::Loader<DlopenObserver, ExtraData, crate::rtld::ActiveTlsResolver>;
+pub type RuntimeLoader = elf_loader::Loader<ExtraData, crate::rtld::ActiveTlsResolver>;
 
 #[cfg(not(feature = "std"))]
 pub(crate) use crate::rtld::ActiveTlsResolver;
@@ -41,7 +40,7 @@ pub(crate) type LoadedDylib = LoadedCore<ExtraData, NativeArch, HostRegion, Acti
 pub struct DlopenObserver;
 
 impl LoadObserver<ExtraData> for DlopenObserver {
-    fn on_after_dynamic_load<R: RegionAccess, Tls: TlsResolver>(
+    fn on_after_dynamic_load<R: RegionAccess, Tls: TlsResolver<NativeArch>>(
         &mut self,
         mut event: AfterDynamicLoadEvent<'_, ExtraData, NativeArch, R, Tls>,
     ) -> elf_loader::Result<()> {
@@ -53,7 +52,7 @@ impl LoadObserver<ExtraData> for DlopenObserver {
 }
 
 impl RelocationObserver for DlopenObserver {
-    fn on_init<D: 'static, R: RegionAccess, Tls: TlsResolver>(
+    fn on_init<D: 'static, R: RegionAccess, Tls: TlsResolver<NativeArch>>(
         &mut self,
         event: &mut InitEvent<'_, D, NativeArch, R, Tls>,
     ) -> elf_loader::Result<()> {
@@ -84,7 +83,7 @@ pub(crate) fn find_symbol<'lib, T>(
         .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
 }
 
-pub(crate) fn finalize_raw_dylib<R: RegionAccess, Tls: TlsResolver>(
+pub(crate) fn finalize_raw_dylib<R: RegionAccess, Tls: TlsResolver<NativeArch>>(
     dylib: &mut RawDynamic<ExtraData, NativeArch, R, Tls>,
     file_path: Option<&str>,
 ) {
