@@ -1,13 +1,14 @@
+mod cxa;
 mod lifecycle;
 mod manager;
+mod scope;
 
 pub(crate) use lifecycle::{addr2dso, global_find, next_find, register_loaded, reserve_pending};
 
-use super::{
-    loader::ActiveTlsResolver,
-    types::{ExtraData, FileIdentity},
+use crate::{
+    OpenFlags,
+    image::{ActiveTlsResolver, ExtraData},
 };
-use crate::OpenFlags;
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use elf_loader::{
     arch::NativeArch,
@@ -19,6 +20,12 @@ use spin::{Lazy, RwLock};
 type IndexMap<K, V> = indexmap::IndexMap<K, V, DefaultHashBuilder>;
 type IndexSet<K> = indexmap::IndexSet<K, DefaultHashBuilder>;
 type GlobalLinkContext = LinkContext<String, ExtraData, GlobalMeta, NativeArch, ActiveTlsResolver>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FileIdentity {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
 
 #[macro_export]
 macro_rules! lock_write {

@@ -1,5 +1,8 @@
-use crate::core_impl::{find_symbol, global_find, next_find};
 use crate::{Result, Symbol, error::find_symbol_error};
+use crate::{
+    image::find_symbol,
+    registry::{global_find, next_find},
+};
 use core::{
     ffi::{CStr, c_char, c_void},
     ptr::null,

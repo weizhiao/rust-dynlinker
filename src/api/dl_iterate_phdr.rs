@@ -1,4 +1,8 @@
-use crate::{ElfLibrary, Error, Result, core_impl::MANAGER};
+use crate::{
+    ElfLibrary, Error, Result,
+    abi::phdr::{CDlPhdrInfo, DlIteratePhdrCallback},
+    registry::MANAGER,
+};
 use alloc::boxed::Box;
 use core::{
     ffi::{c_char, c_int, c_ulonglong, c_void},
@@ -7,19 +11,6 @@ use core::{
 #[cfg(feature = "std")]
 use elf_loader::tls::DefaultTlsResolver;
 use elf_loader::{elf::ElfPhdr, tls::TlsModuleId};
-
-/// same as dl_phdr_info in libc
-#[repr(C)]
-pub struct CDlPhdrInfo {
-    pub dlpi_addr: usize,
-    pub dlpi_name: *const c_char,
-    pub dlpi_phdr: *const ElfPhdr,
-    pub dlpi_phnum: u16,
-    pub dlpi_adds: c_ulonglong,
-    pub dlpi_subs: c_ulonglong,
-    pub dlpi_tls_modid: usize,
-    pub dlpi_tls_data: *mut c_void,
-}
 
 pub struct DlPhdrInfo<'lib> {
     lib_base: usize,
@@ -33,7 +24,7 @@ pub struct DlPhdrInfo<'lib> {
 
 #[cfg(not(feature = "std"))]
 fn tls_data_ptr(mod_id: TlsModuleId) -> *mut c_void {
-    crate::rtld::tls_get_addr_soft(mod_id).cast()
+    crate::runtime::rtld::tls_get_addr_soft(mod_id).cast()
 }
 
 #[cfg(feature = "std")]
@@ -113,13 +104,13 @@ impl ElfLibrary {
     }
 }
 
-pub(crate) type CallBack =
-    unsafe extern "C" fn(info: *mut CDlPhdrInfo, size: usize, data: *mut c_void) -> c_int;
-
 /// # Safety
 /// It is the same as `dl_iterate_phdr`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dl_iterate_phdr(callback: Option<CallBack>, data: *mut c_void) -> c_int {
+pub unsafe extern "C" fn dl_iterate_phdr(
+    callback: Option<DlIteratePhdrCallback>,
+    data: *mut c_void,
+) -> c_int {
     let Some(callback) = callback else {
         return 0;
     };

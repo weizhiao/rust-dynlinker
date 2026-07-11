@@ -1,7 +1,4 @@
-use crate::{
-    abi::link_map::LinkMap,
-    core_impl::{addr2dso, mapped_end},
-};
+use crate::{abi::link_map::LinkMap, image::mapped_end, registry::addr2dso};
 use core::{
     ffi::{c_int, c_void},
     ptr::null_mut,

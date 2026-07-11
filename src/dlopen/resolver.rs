@@ -1,13 +1,14 @@
 use super::context::{CandidateSource, OpenShared};
+use super::linker_script::get_linker_script_libs;
 use super::{
     DEFAULT_PATH, LD_CACHE, LD_LIBRARY_PATH, fixup_rpath, is_elf_input,
     should_continue_library_search,
 };
 use crate::{
     Result,
-    core_impl::{ActiveTlsResolver, reserve_pending},
     error::find_lib_error,
-    utils::linker_script::get_linker_script_libs,
+    image::ActiveTlsResolver,
+    registry::{FileIdentity, reserve_pending},
 };
 use alloc::{
     borrow::ToOwned,
@@ -69,7 +70,7 @@ impl VisibleModules<String, NativeArch, str, ActiveTlsResolver> for DlopenVisibl
 enum CandidateInput {
     Reader {
         reader: Box<dyn ElfReader + 'static>,
-        identity: Option<crate::core_impl::FileIdentity>,
+        identity: Option<FileIdentity>,
     },
     Script(Vec<String>),
 }
@@ -118,7 +119,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         }
     }
 
-    fn reserve_pending(&self, path: &ElfPath, identity: Option<crate::core_impl::FileIdentity>) {
+    fn reserve_pending(&self, path: &ElfPath, identity: Option<FileIdentity>) {
         let name = path.file_name();
         if self.added_names.borrow().contains(name) {
             return;
@@ -140,7 +141,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         &self,
         path: &ElfPath,
         env: ResolveEnv<'_>,
-        identity: Option<crate::core_impl::FileIdentity>,
+        identity: Option<FileIdentity>,
     ) -> Option<DlopenResolvedKey<'static>> {
         let name = path.file_name();
         if env.contains_visible(name) {

@@ -1,5 +1,37 @@
 #![allow(dead_code)]
 
+pub(crate) mod dladdr {
+    use core::ffi::{c_char, c_void};
+
+    #[repr(C)]
+    pub struct CDlInfo {
+        pub dli_fname: *const c_char,
+        pub dli_fbase: *mut c_void,
+        pub dli_sname: *const c_char,
+        pub dli_saddr: *mut c_void,
+    }
+}
+
+pub(crate) mod phdr {
+    use core::ffi::{c_char, c_int, c_ulonglong, c_void};
+    use elf_loader::elf::ElfPhdr;
+
+    #[repr(C)]
+    pub struct CDlPhdrInfo {
+        pub dlpi_addr: usize,
+        pub dlpi_name: *const c_char,
+        pub dlpi_phdr: *const ElfPhdr,
+        pub dlpi_phnum: u16,
+        pub dlpi_adds: c_ulonglong,
+        pub dlpi_subs: c_ulonglong,
+        pub dlpi_tls_modid: usize,
+        pub dlpi_tls_data: *mut c_void,
+    }
+
+    pub(crate) type DlIteratePhdrCallback =
+        unsafe extern "C" fn(info: *mut CDlPhdrInfo, size: usize, data: *mut c_void) -> c_int;
+}
+
 pub mod auxv {
     pub const AT_NULL: usize = 0;
     pub const AT_PHDR: usize = 3;

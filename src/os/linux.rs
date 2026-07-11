@@ -1,4 +1,4 @@
-use crate::core_impl::FileIdentity;
+use crate::registry::FileIdentity;
 use crate::{Error, Result};
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]

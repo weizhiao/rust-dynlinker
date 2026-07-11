@@ -1,11 +1,12 @@
 use crate::abi::auxv::{AT_BASE, AT_PHDR, AT_PHNUM};
-use crate::api::dl_iterate_phdr::CDlPhdrInfo;
-use crate::utils::debug::GDBDebug;
+use crate::runtime::debug::GDBDebug;
 use crate::{
     OpenFlags, Result,
     abi::link_map::LinkMap,
-    api::dl_iterate_phdr::CallBack,
-    core_impl::{ARGC, ARGV, ENVP, ExtraData, LoadedDylib, MANAGER, register_loaded},
+    abi::phdr::{CDlPhdrInfo, DlIteratePhdrCallback},
+    image::{ExtraData, LoadedDylib},
+    registry::{MANAGER, register_loaded},
+    runtime::{ARGC, ARGV, ENVP},
 };
 use alloc::{borrow::ToOwned, boxed::Box, ffi::CString, vec::Vec};
 use core::{
@@ -166,7 +167,7 @@ unsafe fn find_debug_in_dynamic(mut dynamic: *const ElfDyn) -> *mut GDBDebug {
 }
 
 fn init_host_debug(debug: &mut GDBDebug) {
-    let mut custom = crate::utils::debug::DEBUG.lock();
+    let mut custom = crate::runtime::debug::DEBUG.lock();
     custom.debug = debug;
     let mut cur = debug.map;
     if !cur.is_null() {
@@ -335,7 +336,7 @@ fn get_phdrs_and_len(base: usize, extra: Option<&[ElfPhdr]>) -> (Vec<ElfPhdr>, u
 }
 
 fn find_host_link_map(base: usize) -> *mut LinkMap {
-    let debug = crate::utils::debug::DEBUG.lock();
+    let debug = crate::runtime::debug::DEBUG.lock();
     let mut cur = if debug.debug.is_null() {
         null_mut()
     } else {
@@ -350,7 +351,7 @@ fn find_host_link_map(base: usize) -> *mut LinkMap {
     null_mut()
 }
 
-type IterPhdr = extern "C" fn(callback: Option<CallBack>, data: *mut c_void) -> c_int;
+type IterPhdr = extern "C" fn(callback: Option<DlIteratePhdrCallback>, data: *mut c_void) -> c_int;
 
 struct LinkMapIter {
     current: *mut LinkMap,

@@ -1,39 +1,31 @@
+use super::FileIdentity;
 use super::{
     GlobalMeta, LibraryLookup, Manager, PendingDylib, PendingModuleId, libc_compat_aliases,
     normalized_flags,
 };
 use crate::{
-    ElfLibrary, OpenFlags,
-    core_impl::{ActiveTlsResolver, DylibExt, ExtraData, FileIdentity, LoadedDylib},
+    OpenFlags,
+    image::{ActiveTlsResolver, DylibExt, ExtraData, LoadedDylib},
 };
 use alloc::{
     borrow::{Cow, ToOwned},
     boxed::Box,
     collections::btree_set::BTreeSet,
     string::String,
-    sync::Arc,
-    vec,
     vec::Vec,
 };
+use elf_loader::arch::NativeArch;
 use elf_loader::linker::{LinkContext, ModuleId};
-use elf_loader::{
-    arch::NativeArch,
-    image::{ModuleHandle, ModuleScope, ModuleScopeBuilder},
-};
-
-type DlopenModuleHandle = ModuleHandle<NativeArch, ActiveTlsResolver>;
-type DlopenModuleScope = ModuleScope<NativeArch, ActiveTlsResolver>;
-type DlopenModuleScopeBuilder = ModuleScopeBuilder<NativeArch, ActiveTlsResolver>;
 
 impl Manager {
-    fn loaded_by_module(&self, id: ModuleId) -> Option<LoadedDylib> {
+    pub(super) fn loaded_by_module(&self, id: ModuleId) -> Option<LoadedDylib> {
         self.link_ctx
             .get(id)
             .ok()
             .and_then(|module| module.downcast_ref::<LoadedDylib>().cloned())
     }
 
-    fn committed_module(&self, key: &str) -> Option<ModuleId> {
+    pub(super) fn committed_module(&self, key: &str) -> Option<ModuleId> {
         let id = self.link_ctx.key_id(key)?;
         self.link_ctx.module_id(id).ok().flatten()
     }
@@ -269,13 +261,6 @@ impl Manager {
             .filter_map(|id| self.loaded_by_module(id))
     }
 
-    #[inline]
-    pub(crate) fn global_values(&self) -> impl Iterator<Item = LoadedDylib> + '_ {
-        self.global
-            .iter()
-            .filter_map(|id| self.loaded_by_module(*id))
-    }
-
     pub(crate) fn adds(&self) -> u64 {
         self.adds
     }
@@ -294,14 +279,6 @@ impl Manager {
             .and_then(|name| self.lookup(name))
     }
 
-    #[inline]
-    pub(crate) fn main_library(&self) -> Option<ElfLibrary> {
-        let id = self.link_ctx.load_order().next()?;
-        let lib = self.loaded_by_module(id)?;
-        let deps = self.library_scope_by_module(id)?;
-        Some(ElfLibrary { inner: lib, deps })
-    }
-
     pub(crate) fn resolved_direct_deps(&self, lib: &LoadedDylib) -> Box<[String]> {
         let mut deps = Vec::with_capacity(lib.needed_libs().len());
         let mut seen = BTreeSet::new();
@@ -317,40 +294,6 @@ impl Manager {
         }
 
         deps.into_boxed_slice()
-    }
-
-    pub(crate) fn relocation_scope(
-        &self,
-        group_scope: &DlopenModuleScope,
-        flags: OpenFlags,
-    ) -> DlopenModuleScope {
-        let mut seen = BTreeSet::new();
-        let mut scope = Vec::with_capacity(group_scope.len() + self.global.len());
-        let mut push_unique = |module: DlopenModuleHandle| {
-            if seen.insert(module.name().to_owned()) {
-                scope.push(module);
-            }
-        };
-
-        if flags.is_deepbind() {
-            for module in group_scope.iter().cloned() {
-                push_unique(module);
-            }
-            for lib in self.global_values() {
-                push_unique(lib.into());
-            }
-        } else {
-            for lib in self.global_values() {
-                push_unique(lib.into());
-            }
-            for module in group_scope.iter().cloned() {
-                push_unique(module);
-            }
-        }
-
-        let mut builder = DlopenModuleScopeBuilder::new();
-        builder.extend(scope);
-        builder.into_scope()
     }
 
     pub(crate) fn merge_link_context(
@@ -443,59 +386,6 @@ impl Manager {
         );
     }
 
-    pub(crate) fn visible_key(&self, name: &str) -> Option<String> {
-        let lookup = self.lookup(name)?;
-        self.link_ctx
-            .contains_key(lookup.name())
-            .then(|| lookup.name().to_owned())
-    }
-
-    pub(crate) fn visible_direct_deps(&self, name: &str) -> Option<Box<[String]>> {
-        let lookup = self.lookup(name)?;
-        let shortname = lookup.name();
-        if let Some(id) = self.committed_module(shortname) {
-            let direct_deps = self
-                .link_ctx
-                .direct_deps(id)
-                .ok()?
-                .map(|(dep_key, _)| {
-                    self.link_ctx
-                        .key(dep_key)
-                        .expect("direct dependency id must resolve in global link context")
-                        .clone()
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            return Some(direct_deps);
-        }
-
-        None
-    }
-
-    pub(crate) fn visible_loaded(&self, name: &str) -> Option<LoadedDylib> {
-        let lookup = self.lookup(name)?;
-        let shortname = lookup.name();
-        self.committed_module(shortname)
-            .and_then(|id| self.loaded_by_module(id))
-    }
-
-    pub(crate) fn open_existing(
-        &mut self,
-        shortname: &str,
-        flags: OpenFlags,
-    ) -> Option<ElfLibrary> {
-        self.promote(shortname, flags);
-        self.get_lib(shortname)
-    }
-
-    pub(crate) fn get_lib(&mut self, name: &str) -> Option<ElfLibrary> {
-        let lookup = self.lookup(name)?;
-        let id = self.committed_module(lookup.name())?;
-        let deps = self.library_scope_by_module(id)?;
-        let inner = self.loaded_by_module(id)?;
-        Some(ElfLibrary { inner, deps })
-    }
-
     pub(crate) fn promote(&mut self, shortname: &str, flags: OpenFlags) {
         let id = self
             .committed_module(shortname)
@@ -516,27 +406,5 @@ impl Manager {
         if add_global {
             self.add_global(id);
         }
-    }
-
-    pub(crate) fn library_scope(&self, name: &str) -> Option<Arc<[LoadedDylib]>> {
-        let lookup = self.lookup(name)?;
-        let id = self.committed_module(lookup.name())?;
-        self.library_scope_by_module(id)
-    }
-
-    pub(crate) fn library_scope_by_module(&self, id: ModuleId) -> Option<Arc<[LoadedDylib]>> {
-        let deps = self
-            .link_ctx
-            .dependency_scope(id)
-            .ok()?
-            .into_iter()
-            .filter_map(|id| self.loaded_by_module(id))
-            .collect::<Vec<_>>();
-        if !deps.is_empty() {
-            return Some(Arc::from(deps));
-        }
-
-        self.loaded_by_module(id)
-            .map(|entry| Arc::from(vec![entry]))
     }
 }

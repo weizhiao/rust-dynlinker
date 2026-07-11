@@ -3,7 +3,7 @@
 mod dl_find_object;
 pub(crate) mod dl_iterate_phdr;
 pub(crate) mod dladdr;
-pub(crate) mod dlopen;
+mod dlopen;
 pub mod dlsym;
 
 use alloc::boxed::Box;

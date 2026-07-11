@@ -2,8 +2,10 @@ pub use crate::abi::{auxv, debug, elf, link_map, memory, relocation};
 
 use crate::{
     OpenFlags, Result,
-    api::dlopen::{LinkRoot, OpenContext, link_root},
-    core_impl::{ARGC, ARGV, ENVP, ElfLibrary, LoadedDylib, MANAGER, register_loaded},
+    dlopen::{LinkRoot, OpenContext, link_root},
+    image::{ElfLibrary, LoadedDylib},
+    registry::{MANAGER, register_loaded},
+    runtime::{ARGC, ARGV, ENVP},
 };
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 use core::ffi::{c_char, c_int, c_void};
@@ -11,7 +13,7 @@ use core::ffi::{c_char, c_int, c_void};
 #[doc(hidden)]
 pub use self::tls::{ActiveTlsResolver, RtldTlsOps};
 #[doc(hidden)]
-pub use crate::core_impl::{DlopenObserver, ElfDylib, ExtraData, RuntimeLoader};
+pub use crate::image::{DlopenObserver, ElfDylib, ExtraData, RuntimeLoader};
 #[doc(hidden)]
 pub use elf_loader::{
     Loader as ElfLoader, Result as ElfResult,
@@ -108,7 +110,7 @@ pub unsafe fn handle_link_map(handle: *mut c_void) -> *mut link_map::LinkMap {
 
 #[doc(hidden)]
 pub unsafe fn dladdr_raw(addr: *const c_void, info: *mut c_void) -> c_int {
-    unsafe { crate::api::dladdr(addr, info.cast()) }
+    unsafe { crate::image::dladdr_raw(addr, info.cast()) }
 }
 
 #[doc(hidden)]

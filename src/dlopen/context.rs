@@ -1,19 +1,19 @@
 use super::get_env;
 #[cfg(not(feature = "std"))]
-use crate::core_impl::reserve_pending;
+use crate::registry::reserve_pending;
 use crate::{
     OpenFlags,
-    core_impl::{
-        ActiveTlsResolver, ElfLibrary, ExtraData, FileIdentity, GlobalMeta, LibraryLookup,
-        LoadedDylib, MANAGER, Manager,
-    },
+    image::{ActiveTlsResolver, ElfLibrary, ExtraData, LoadedDylib},
+    registry::{FileIdentity, GlobalMeta, LibraryLookup, MANAGER, Manager},
 };
 #[cfg(not(feature = "std"))]
 use alloc::borrow::ToOwned;
 use alloc::{collections::BTreeSet, string::String, sync::Arc};
 use core::cell::RefCell;
-use elf_loader::linker::{LinkContext, ModuleId};
-use elf_loader::{arch::NativeArch, image::ModuleScope};
+use elf_loader::linker::{
+    LinkContext, ModuleId, RelocationInputs, RelocationPlanner, RelocationRequest,
+};
+use elf_loader::{arch::NativeArch, image::ModuleScope, memory::HostRegion};
 use spin::RwLockWriteGuard;
 
 /// The context for a `dlopen` operation.
@@ -26,6 +26,37 @@ pub(super) struct OpenShared<'a> {
     lock: RefCell<Option<RwLockWriteGuard<'a, Manager>>>,
     /// Loading flags for this operation.
     pub(super) flags: OpenFlags,
+}
+
+pub(super) struct DlopenPlanner<'ctx, 'mgr> {
+    shared: &'ctx OpenShared<'mgr>,
+}
+
+impl<'ctx, 'mgr> DlopenPlanner<'ctx, 'mgr> {
+    pub(super) fn new(shared: &'ctx OpenShared<'mgr>) -> Self {
+        Self { shared }
+    }
+}
+
+impl RelocationPlanner<String, ExtraData, NativeArch, HostRegion, ActiveTlsResolver>
+    for DlopenPlanner<'_, '_>
+{
+    fn plan(
+        &self,
+        req: &RelocationRequest<'_, String, ExtraData, NativeArch, HostRegion, ActiveTlsResolver>,
+    ) -> core::result::Result<RelocationInputs<NativeArch, ActiveTlsResolver>, elf_loader::Error>
+    {
+        log::debug!("Planning relocation for dylib [{}]", req.key());
+
+        let inputs = RelocationInputs::scope(self.shared.prepare_relocation(req.scope()));
+        if self.shared.flags.is_now() {
+            Ok(inputs.eager())
+        } else if self.shared.flags.is_lazy() {
+            Ok(inputs.lazy())
+        } else {
+            Ok(inputs)
+        }
+    }
 }
 
 pub(crate) struct OpenContext<'a> {
@@ -44,7 +75,7 @@ pub(crate) enum LinkRoot<'bytes> {
     #[cfg(not(feature = "std"))]
     Mapped {
         key: String,
-        raw: crate::core_impl::ElfDylib,
+        raw: crate::image::ElfDylib,
     },
 }
 

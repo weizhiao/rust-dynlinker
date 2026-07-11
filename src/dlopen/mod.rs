@@ -1,19 +1,20 @@
 mod context;
-mod planner;
+mod ld_cache;
+mod linker_script;
 mod resolver;
 
 pub(crate) use context::{LinkRoot, OpenContext};
 
 use self::{
-    planner::DlopenPlanner,
+    context::DlopenPlanner,
+    ld_cache::LdCache,
     resolver::{DlopenVisible, LinkResolver},
 };
 use crate::{
     OpenFlags, Result,
-    core_impl::{
-        ActiveTlsResolver, AsFilename, DlopenObserver, ENVP, ElfLibrary, ExtraData, MANAGER,
-    },
-    utils::ld_cache::LdCache,
+    image::{ActiveTlsResolver, AsFilename, DlopenObserver, ElfLibrary, ExtraData},
+    registry::MANAGER,
+    runtime::ENVP,
 };
 use alloc::{
     borrow::ToOwned,
@@ -21,7 +22,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::ffi::{CStr, c_char, c_int, c_void};
+use core::ffi::CStr;
 use elf_loader::{
     Loader,
     input::PathBuf as ElfPath,
@@ -260,25 +261,4 @@ fn should_continue_library_search(err: &crate::error::Error) -> bool {
 #[inline]
 fn is_elf_input(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x7fELF")
-}
-
-/// # Safety
-/// It is the same as `dlopen`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dlopen(filename: *const c_char, flags: c_int) -> *const c_void {
-    let lib = if filename.is_null() {
-        ElfLibrary::this()
-    } else {
-        let flags = OpenFlags::from_bits_retain(flags as _);
-        let filename = unsafe { CStr::from_ptr(filename) };
-        let Ok(path) = filename.to_str() else {
-            return core::ptr::null();
-        };
-        if let Ok(lib) = ElfLibrary::dlopen(path, flags) {
-            lib
-        } else {
-            return core::ptr::null();
-        }
-    };
-    Box::into_raw(Box::new(lib)) as _
 }

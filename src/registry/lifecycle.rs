@@ -1,11 +1,9 @@
-use super::{MANAGER, Manager, libc_compat_aliases, normalized_flags};
+use super::{FileIdentity, MANAGER, Manager, cxa::finalize, libc_compat_aliases, normalized_flags};
 use crate::{
     ElfLibrary, OpenFlags,
-    core_impl::{FileIdentity, LoadedDylib, contains_addr, mapped_end},
+    image::{LoadedDylib, contains_addr, mapped_end},
 };
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
-use core::ffi::{c_int, c_void};
-use spin::{Lazy, RwLock};
 
 impl Drop for ElfLibrary {
     fn drop(&mut self) {
@@ -144,21 +142,19 @@ pub(crate) unsafe fn global_find<'a, T>(name: &str) -> Option<crate::Symbol<'a, 
 /// Finds the next occurrence of a symbol after the specified address.
 pub(crate) unsafe fn next_find<'a, T>(addr: usize, name: &str) -> Option<crate::Symbol<'a, T>> {
     let lock = crate::lock_read!(MANAGER);
-    let libs = lock.all_values().collect::<Vec<_>>();
-    // Find the library containing the address
-    let idx = libs.iter().position(|v| contains_addr(v, addr))?;
-
-    // Search in all subsequent libraries
-    libs.into_iter().skip(idx + 1).find_map(|lib| unsafe {
-        lib.get::<T>(name).map(|sym| {
-            log::trace!(
-                "dlsym: find symbol [{}] from [{}] via RTLD_NEXT",
-                name,
-                lib.name()
-            );
-            core::mem::transmute(sym)
+    lock.all_values()
+        .skip_while(|lib| !contains_addr(lib, addr))
+        .skip(1)
+        .find_map(|lib| unsafe {
+            lib.get::<T>(name).map(|sym| {
+                log::trace!(
+                    "dlsym: find symbol [{}] from [{}] via RTLD_NEXT",
+                    name,
+                    lib.name()
+                );
+                core::mem::transmute(sym)
+            })
         })
-    })
 }
 
 pub(crate) fn addr2dso(addr: usize) -> Option<ElfLibrary> {
@@ -167,93 +163,4 @@ pub(crate) fn addr2dso(addr: usize) -> Option<ElfLibrary> {
     let entry = manager.all_values().find(|v| contains_addr(v, addr))?;
     let deps = manager.library_scope(entry.name())?;
     Some(ElfLibrary { inner: entry, deps })
-}
-
-fn register_atexit(
-    dso_handle: *mut c_void,
-    func: unsafe extern "C" fn(*mut c_void),
-    arg: *mut c_void,
-) -> c_int {
-    DESTRUCTORS.write().push(Destructor {
-        dso_handle,
-        func,
-        arg,
-    });
-    0
-}
-
-struct Destructor {
-    dso_handle: *mut c_void,
-    func: unsafe extern "C" fn(*mut c_void),
-    arg: *mut c_void,
-}
-
-unsafe impl Send for Destructor {}
-unsafe impl Sync for Destructor {}
-
-static DESTRUCTORS: Lazy<RwLock<Vec<Destructor>>> = Lazy::new(|| RwLock::new(Vec::new()));
-
-fn finalize(dso_handle: *mut c_void, range: Option<core::ops::Range<usize>>) {
-    let mut to_run = Vec::new();
-    {
-        let mut range = range;
-        if range.is_none() && !dso_handle.is_null() {
-            let manager = MANAGER.read();
-            for v in manager.all_values() {
-                if contains_addr(&v, dso_handle as usize) {
-                    range = Some(v.base().get()..mapped_end(&v));
-                    break;
-                }
-            }
-        }
-
-        let mut all_destructors = DESTRUCTORS.write();
-        let mut i = 0;
-        while i < all_destructors.len() {
-            let matches = match (dso_handle.is_null(), &range) {
-                (true, _) => true, // NULL matches all
-                (false, Some(r)) => r.contains(&(all_destructors[i].dso_handle as usize)),
-                (false, None) => all_destructors[i].dso_handle == dso_handle,
-            };
-
-            if matches {
-                to_run.push(all_destructors.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-    }
-    if !to_run.is_empty() {
-        log::debug!(
-            "Running {} destructors for handle {:p}",
-            to_run.len(),
-            dso_handle
-        );
-    }
-    for destructor in to_run.into_iter().rev() {
-        unsafe { (destructor.func)(destructor.arg) };
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __cxa_thread_atexit_impl(
-    func: unsafe extern "C" fn(*mut c_void),
-    arg: *mut c_void,
-    dso_handle: *mut c_void,
-) -> c_int {
-    register_atexit(dso_handle, func, arg)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __cxa_atexit(
-    func: unsafe extern "C" fn(*mut c_void),
-    arg: *mut c_void,
-    dso_handle: *mut c_void,
-) -> c_int {
-    register_atexit(dso_handle, func, arg)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __cxa_finalize(dso_handle: *mut c_void) {
-    finalize(dso_handle, None);
 }

@@ -42,21 +42,22 @@ extern crate alloc;
 
 mod abi;
 pub mod api;
-mod core_impl;
+mod dlopen;
 mod error;
-#[cfg(feature = "std")]
-mod host_init;
+mod image;
 mod os;
+mod registry;
+mod runtime;
+
 #[cfg(not(feature = "std"))]
-pub mod rtld;
-mod utils;
+pub use runtime::rtld;
 
 use bitflags::bitflags;
 
 pub use crate::abi::{elf, memory, relocation};
 pub use crate::api::dlsym::{dlsym_default, dlsym_next};
-pub use crate::core_impl::{AsFilename, ElfLibrary};
 pub use crate::error::Error;
+pub use crate::image::{AsFilename, DlInfo, ElfLibrary};
 pub use elf_loader::image::Symbol;
 
 #[cfg(not(any(
