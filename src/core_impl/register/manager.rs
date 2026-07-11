@@ -124,6 +124,7 @@ impl Manager {
                 lib,
                 direct_deps,
                 GlobalMeta {
+                    identity: None,
                     flags,
                     libnames: Vec::new(),
                 },
@@ -138,7 +139,12 @@ impl Manager {
         id
     }
 
-    pub(super) fn add_pending_reservation(&mut self, name: String, flags: OpenFlags) {
+    pub(super) fn add_pending_reservation(
+        &mut self,
+        name: String,
+        identity: Option<FileIdentity>,
+        flags: OpenFlags,
+    ) {
         debug_assert!(
             !self.contains_key(&name),
             "Library [{}] is already registered",
@@ -151,7 +157,10 @@ impl Manager {
             .expect("pending module id overflow");
         let previous = self.pending_keys.insert(name.clone(), id);
         debug_assert!(previous.is_none(), "Library [{}] is already pending", name);
-        let pending = PendingDylib::reserved(name, flags);
+        let pending = PendingDylib::reserved(name.clone(), identity, flags);
+        if let Some(identity) = identity {
+            self.identities.insert(identity, name);
+        }
         self.adds += 1;
         log::trace!(
             "Reserved pending library [{}] in global manager",
@@ -195,26 +204,21 @@ impl Manager {
         }
     }
 
-    pub(crate) fn add_identity(&mut self, identity: FileIdentity, name: &str) {
-        // Newest wins; identical inode implies same physical file.
-        self.identities.insert(identity, name.to_owned());
-    }
-
     pub(crate) fn remove(&mut self, shortname: &str) {
         let removed = if let Some(id) = self.pending_id(shortname) {
             let lib = self
                 .remove_pending(id)
                 .expect("pending name must resolve to a pending module");
-            Some((None, lib.flags))
+            Some((lib.identity, None, lib.flags))
         } else if let Some(id) = self.committed_module(shortname) {
             self.link_ctx
                 .remove(id)
                 .ok()
-                .map(|(_, _, meta)| (Some(id), meta.flags))
+                .map(|(_, _, meta)| (meta.identity, Some(id), meta.flags))
         } else {
             None
         };
-        let Some((module_id, flags)) = removed else {
+        let Some((identity, module_id, flags)) = removed else {
             panic!("Library is not registered");
         };
         self.subs += 1;
@@ -224,8 +228,9 @@ impl Manager {
             "Inconsistent global scope state when removing [{}]",
             shortname
         );
-        // Remove any identity aliases pointing to this shortname.
-        self.identities.retain(|_, v| v != shortname);
+        if let Some(identity) = identity {
+            self.identities.remove(&identity);
+        }
     }
 
     #[inline]
@@ -386,12 +391,15 @@ impl Manager {
                     .flatten()
             });
             let was_pending = pending.is_some();
+            let identity = pending.as_ref().and_then(|lib| lib.identity);
             let meta = pending
                 .map(|lib| GlobalMeta {
+                    identity,
                     flags: lib.flags,
                     libnames: lib.libnames,
                 })
                 .unwrap_or_else(|| GlobalMeta {
+                    identity,
                     flags: normalized_flags(
                         loaded
                             .as_ref()
@@ -413,11 +421,8 @@ impl Manager {
             if !was_pending {
                 self.adds += 1;
             }
-            if let Some(identity) = loaded
-                .as_ref()
-                .and_then(|lib| lib.user_data().file_identity)
-            {
-                self.add_identity(identity, &key);
+            if let Some(identity) = meta.identity {
+                self.identities.insert(identity, key.clone());
             }
             if let Some(lib) = loaded.as_ref() {
                 self.add_alias(&key, lib.name());
@@ -464,9 +469,7 @@ impl Manager {
             return Some(direct_deps);
         }
 
-        let id = self.pending_id(shortname)?;
-        let lib = self.pending.get(&id)?;
-        Some(self.resolved_direct_deps(lib.dylib_ref()?))
+        None
     }
 
     pub(crate) fn visible_loaded(&self, name: &str) -> Option<LoadedDylib> {
@@ -474,10 +477,6 @@ impl Manager {
         let shortname = lookup.name();
         self.committed_module(shortname)
             .and_then(|id| self.loaded_by_module(id))
-            .or_else(|| {
-                let id = self.pending_id(shortname)?;
-                self.pending.get(&id).and_then(PendingDylib::dylib)
-            })
     }
 
     pub(crate) fn open_existing(

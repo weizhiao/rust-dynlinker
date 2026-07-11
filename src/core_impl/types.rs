@@ -28,8 +28,6 @@ pub struct ExtraData {
     pub(crate) needed_libs: Vec<String>,
     /// The ELF dynamic table.
     pub(crate) dynamic_table: Option<Box<[ElfDyn]>>,
-    /// File identity (device + inode) for detecting duplicate loads.
-    pub(crate) file_identity: Option<FileIdentity>,
 }
 
 impl core::fmt::Debug for ExtraData {
@@ -39,7 +37,6 @@ impl core::fmt::Debug for ExtraData {
         d.field("link_map", &self.link_map);
         d.field("needed_libs", &self.needed_libs);
         d.field("dynamic_table", &self.dynamic_table);
-        d.field("file_identity", &self.file_identity);
         d.finish()
     }
 }

@@ -14,8 +14,9 @@ pub use self::tls::{ActiveTlsResolver, RtldTlsOps};
 pub use crate::core_impl::{DlopenObserver, ElfDylib, ExtraData, RuntimeLoader};
 #[doc(hidden)]
 pub use elf_loader::{
-    Loader as ElfLoader, Result as ElfResult, TlsError,
+    Loader as ElfLoader, Result as ElfResult,
     arch::NativeArch,
+    error::TlsError,
     image::RawExec,
     input::PathBuf,
     memory::VmAddr,
@@ -166,8 +167,9 @@ pub unsafe fn find_loaded_symbol<T: Copy>(name: &str) -> Option<T> {
 
 mod tls {
     use elf_loader::{
-        Result, TlsError,
+        Result,
         arch::NativeArch,
+        error::TlsError,
         memory::VmAddr,
         tls::{
             DefaultTlsResolver, TlsImageSource, TlsIndex, TlsInfo, TlsModuleId, TlsResolver,

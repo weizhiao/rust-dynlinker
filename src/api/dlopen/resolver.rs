@@ -29,7 +29,7 @@ type DlopenResolvedKey<'cfg> = ResolvedKey<'cfg, String, NativeArch, ActiveTlsRe
 fn into_linker_error(err: crate::error::Error) -> elf_loader::Error {
     match err {
         crate::error::Error::LoaderError { err } => err,
-        other => elf_loader::CustomError::Message(other.to_string().into()).into(),
+        other => elf_loader::error::CustomError::message(other.to_string()).into(),
     }
 }
 
@@ -67,7 +67,10 @@ impl VisibleModules<String, NativeArch, str, ActiveTlsResolver> for DlopenVisibl
 }
 
 enum CandidateInput {
-    Reader(Box<dyn ElfReader + 'static>),
+    Reader {
+        reader: Box<dyn ElfReader + 'static>,
+        identity: Option<crate::core_impl::FileIdentity>,
+    },
     Script(Vec<String>),
 }
 
@@ -115,13 +118,12 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         }
     }
 
-    fn reserve_pending(&self, path: &ElfPath) {
+    fn reserve_pending(&self, path: &ElfPath, identity: Option<crate::core_impl::FileIdentity>) {
         let name = path.file_name();
         if self.added_names.borrow().contains(name) {
             return;
         }
 
-        let identity = crate::os::get_file_inode(path).ok();
         let name = self.shared.with_manager_mut(|manager| {
             reserve_pending(
                 name.to_owned(),
@@ -138,6 +140,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         &self,
         path: &ElfPath,
         env: ResolveEnv<'_>,
+        identity: Option<crate::core_impl::FileIdentity>,
     ) -> Option<DlopenResolvedKey<'static>> {
         let name = path.file_name();
         if env.contains_visible(name) {
@@ -145,7 +148,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         }
 
         self.shared
-            .lookup(Some(&*self.added_names.borrow()), path.as_str(), name)
+            .lookup(Some(&*self.added_names.borrow()), name, identity)
             .map(|lib| ResolvedKey::existing(lib.name().to_owned()))
     }
 
@@ -167,13 +170,22 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         String: 'cfg,
     {
         let name = path.file_name();
-        if let Some(module) = self.resolve_existing(path, env) {
+        if let Some(module) = self.resolve_existing(path, env, None) {
             return Ok(module);
         }
 
         match self.load_candidate_file(path.as_str())? {
-            CandidateInput::Reader(reader) => {
-                self.reserve_pending(path);
+            CandidateInput::Reader { reader, identity } => {
+                if let Some(module) = self.resolve_existing(path, env, identity) {
+                    return Ok(module);
+                }
+                if self.shared.flags.is_noload() {
+                    return Err(find_lib_error(format!(
+                        "can not find file: {}",
+                        path.as_str()
+                    )));
+                }
+                self.reserve_pending(path, identity);
                 Ok(ResolvedKey::load(name.to_owned(), reader))
             }
             CandidateInput::Script(libs) => Ok(self.resolve_script(env, libs)?),
@@ -191,13 +203,16 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         let path = ElfPath::from(key);
         let env = ResolveEnv::empty();
         let name = path.file_name();
-        if let Some(module) = self.resolve_existing(&path, env) {
+        if let Some(module) = self.resolve_existing(&path, env, None) {
             return Ok(module);
         }
 
         match self.load_candidate_bytes(path.as_str(), bytes)? {
-            CandidateInput::Reader(reader) => {
-                self.reserve_pending(&path);
+            CandidateInput::Reader { reader, identity } => {
+                if self.shared.flags.is_noload() {
+                    return Err(find_lib_error(format!("can not find file: {}", key)));
+                }
+                self.reserve_pending(&path, identity);
                 Ok(ResolvedKey::load(name.to_owned(), reader))
             }
             CandidateInput::Script(libs) => Ok(self.resolve_script(env, libs)?),
@@ -206,10 +221,10 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
 
     fn load_candidate_bytes(&self, path: &str, bytes: &'bytes [u8]) -> Result<CandidateInput> {
         if is_elf_input(bytes) {
-            Ok(CandidateInput::Reader(Box::new(ElfBinary::owned(
-                path,
-                bytes.to_vec(),
-            ))))
+            Ok(CandidateInput::Reader {
+                reader: Box::new(ElfBinary::owned(path, bytes.to_vec())),
+                identity: None,
+            })
         } else {
             Ok(CandidateInput::Script(get_linker_script_libs(bytes)))
         }
@@ -218,7 +233,14 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
     fn load_candidate_file(&self, path: &str) -> Result<CandidateInput> {
         let header = crate::os::read_file_limit(path, 64)?;
         if is_elf_input(&header) {
-            Ok(CandidateInput::Reader(Box::new(ElfFile::from_path(path)?)))
+            let reader = ElfFile::from_path(path)?;
+            let identity = reader
+                .as_fd()
+                .and_then(|fd| crate::os::get_file_identity(fd).ok());
+            Ok(CandidateInput::Reader {
+                reader: Box::new(reader),
+                identity,
+            })
         } else {
             let content = crate::os::read_file(path)?;
             Ok(CandidateInput::Script(get_linker_script_libs(&content)))

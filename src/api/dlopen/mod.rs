@@ -13,13 +13,11 @@ use crate::{
     core_impl::{
         ActiveTlsResolver, AsFilename, DlopenObserver, ENVP, ElfLibrary, ExtraData, MANAGER,
     },
-    error::find_lib_error,
     utils::ld_cache::LdCache,
 };
 use alloc::{
     borrow::ToOwned,
     boxed::Box,
-    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -27,7 +25,7 @@ use core::ffi::{CStr, c_char, c_int, c_void};
 use elf_loader::{
     Loader,
     input::PathBuf as ElfPath,
-    lazy::native::NativeLazyBinder,
+    lazy::NativeLazyBinder,
     linker::{LinkContext, Linker},
     relocation::Relocator,
 };
@@ -162,10 +160,6 @@ fn dlopen_impl(path: &str, flags: OpenFlags, bytes: Option<&[u8]>) -> Result<Elf
 
     if let Some(lib) = ctx.try_existing(path) {
         return Ok(lib);
-    }
-
-    if ctx.shared.flags.is_noload() {
-        return Err(find_lib_error(format!("can not find file: {}", path)));
     }
 
     link_root(

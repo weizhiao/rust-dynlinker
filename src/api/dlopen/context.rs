@@ -4,8 +4,8 @@ use crate::core_impl::reserve_pending;
 use crate::{
     OpenFlags,
     core_impl::{
-        ActiveTlsResolver, ElfLibrary, ExtraData, GlobalMeta, LibraryLookup, LoadedDylib, MANAGER,
-        Manager,
+        ActiveTlsResolver, ElfLibrary, ExtraData, FileIdentity, GlobalMeta, LibraryLookup,
+        LoadedDylib, MANAGER, Manager,
     },
 };
 #[cfg(not(feature = "std"))]
@@ -136,22 +136,16 @@ impl<'a> OpenShared<'a> {
     pub(super) fn lookup(
         &self,
         added_names: Option<&BTreeSet<String>>,
-        path: impl AsRef<str>,
         shortname: &str,
+        identity: Option<FileIdentity>,
     ) -> Option<LibraryLookup<'static>> {
-        let path = path.as_ref();
-        let mut req_identity = None;
-
         let (entry, matched_identity) = loop {
             let entry = self.with_manager(|manager| {
                 if let Some(lib) = manager.lookup(shortname) {
                     return Some((lib.into_owned(), None));
                 }
 
-                if req_identity.is_none() {
-                    req_identity = crate::os::get_file_inode(path).ok();
-                }
-                let identity = req_identity.as_ref()?;
+                let identity = identity.as_ref()?;
                 let lib = manager.lookup_by_identity(identity)?;
                 Some((lib.into_owned(), Some(*identity)))
             });
@@ -237,9 +231,8 @@ impl<'a> OpenContext<'a> {
     pub(super) fn try_existing(&mut self, path: &str) -> Option<ElfLibrary> {
         let shortname = path.rsplit_once('/').map_or(path, |(_, name)| name);
         // Step 1: fast name/alias lookup — no stat.
-        // Step 2: on miss, stat once and fall back to inode lookup.
         self.shared
-            .lookup(None, path, shortname)
+            .lookup(None, shortname, None)
             .map(|lib| self.finish_existing(path, lib))
     }
 

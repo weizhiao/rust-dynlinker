@@ -17,12 +17,13 @@ pub(crate) fn read_file_limit(path: &str, limit: usize) -> Result<Box<[u8]>> {
     Ok(buf.into_boxed_slice())
 }
 
-pub(crate) fn get_file_inode(path: impl AsRef<str>) -> Result<FileIdentity> {
-    let path = path.as_ref();
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(path)?;
+pub(crate) fn get_file_identity(fd: isize) -> Result<FileIdentity> {
+    let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+    if unsafe { libc::fstat(fd as libc::c_int, &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(FileIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
+        dev: stat.st_dev,
+        ino: stat.st_ino,
     })
 }

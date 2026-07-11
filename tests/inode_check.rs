@@ -110,6 +110,10 @@ fn test_symlink_inode_detection() {
         "Libraries loaded via different paths should have same base address due to inode checking"
     );
 
+    let lib3 = ElfLibrary::dlopen(&symlink_path, OpenFlags::RTLD_NOLOAD)
+        .expect("RTLD_NOLOAD should find the library via symlink identity");
+    assert_eq!(lib1.base(), lib3.base());
+
     // Cleanup
     let _ = fs::remove_dir_all(&temp_dir);
 }

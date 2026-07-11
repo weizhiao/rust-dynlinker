@@ -19,11 +19,14 @@ use core::{
 use elf_loader::{
     arch::NativeArch,
     elf::{ElfDyn, ElfPhdr, ElfProgramType},
-    image::{LoadedCore, RawDynamic, Symbol},
+    image::{LoadedCore, Symbol},
     memory::{HostRegion, RegionAccess, VmAddr},
     observer::{AfterDynamicLoadEvent, InitEvent, LoadObserver, RelocationObserver},
     tls::TlsResolver,
 };
+
+#[cfg(not(feature = "std"))]
+use elf_loader::image::RawDynamic;
 
 #[cfg(not(feature = "std"))]
 pub type RuntimeLoader = elf_loader::Loader<ExtraData, crate::rtld::ActiveTlsResolver>;
@@ -44,9 +47,64 @@ impl LoadObserver<ExtraData> for DlopenObserver {
         &mut self,
         mut event: AfterDynamicLoadEvent<'_, ExtraData, NativeArch, R, Tls>,
     ) -> elf_loader::Result<()> {
-        let raw = event.raw_mut();
-        let file_path = raw.name().contains('/').then(|| raw.name().to_owned());
-        finalize_raw_dylib(raw, file_path.as_deref());
+        let dylib = event.raw_mut();
+        let needed_libs = dylib
+            .needed_libs()
+            .iter()
+            .map(|s: &&str| s.to_string())
+            .collect::<Vec<_>>();
+
+        let name = dylib.name().to_string();
+        let path = dylib.path().as_str().to_owned();
+        let link_name = if path.is_empty() {
+            name.as_str()
+        } else {
+            path.as_str()
+        };
+        let base = dylib.base();
+        let dynamic_ptr = dylib
+            .phdrs()
+            .iter()
+            .find(|p: &&ElfPhdr| p.program_type() == ElfProgramType::DYNAMIC)
+            .map(|p: &ElfPhdr| (base + p.p_vaddr()).as_mut_ptr::<ElfDyn>())
+            .unwrap_or(core::ptr::null_mut());
+
+        let phdrs = dylib.phdrs();
+        let phdr = if phdrs.is_empty() {
+            null()
+        } else {
+            phdrs.as_ptr().cast()
+        };
+        let phnum = phdrs.len().min(u16::MAX as usize) as u16;
+        let entry = dylib.entry();
+        let tls = dylib.tls();
+        let tls_mod_id = tls.mod_id().map(|id| id.get());
+        let tls_tp_offset = tls.tp_offset().map(|offset| offset.get());
+
+        let dynamic_table = (!dynamic_ptr.is_null())
+            .then(|| unsafe { copy_dynamic_table(dynamic_ptr) }.into_boxed_slice());
+        let c_name = CString::new(link_name).unwrap();
+
+        let mut link_map = Box::new(LinkMap {
+            l_addr: base.as_mut_ptr(),
+            l_name: c_name.as_ptr(),
+            l_ld: dynamic_ptr as *mut _,
+            l_next: core::ptr::null_mut(),
+            l_prev: core::ptr::null_mut(),
+            l_phdr: phdr,
+            l_entry: entry,
+            l_phnum: phnum,
+            ..LinkMap::zero()
+        });
+        populate_link_map_tls(&mut link_map, base, phdrs, tls_mod_id, tls_tp_offset);
+        link_map.l_real = link_map.as_mut() as *mut LinkMap;
+
+        unsafe { add_debug_link_map(link_map.as_mut()) };
+        let user_data = dylib.user_data_mut().unwrap();
+        user_data.needed_libs = needed_libs;
+        user_data.dynamic_table = dynamic_table;
+        user_data.link_map = Some(link_map);
+        user_data.c_name = Some(c_name);
         Ok(())
     }
 }
@@ -81,87 +139,6 @@ pub(crate) fn find_symbol<'lib, T>(
     libs.iter()
         .find_map(|lib| unsafe { lib.get::<T>(name) })
         .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
-}
-
-pub(crate) fn finalize_raw_dylib<R: RegionAccess, Tls: TlsResolver<NativeArch>>(
-    dylib: &mut RawDynamic<ExtraData, NativeArch, R, Tls>,
-    file_path: Option<&str>,
-) {
-    let needed_libs = dylib
-        .needed_libs()
-        .iter()
-        .map(|s: &&str| s.to_string())
-        .collect::<Vec<_>>();
-
-    let name = dylib.name().to_string();
-    let path = dylib.path().as_str().to_owned();
-    let link_name = if path.is_empty() {
-        name.as_str()
-    } else {
-        path.as_str()
-    };
-    let identity_path = file_path
-        .map(ToOwned::to_owned)
-        .or_else(|| path.contains('/').then(|| path.clone()));
-    let base = dylib.base();
-    let dynamic_ptr = dylib
-        .phdrs()
-        .iter()
-        .find(|p: &&ElfPhdr| p.program_type() == ElfProgramType::DYNAMIC)
-        .map(|p: &ElfPhdr| (base + p.p_vaddr()).as_mut_ptr::<ElfDyn>())
-        .unwrap_or(core::ptr::null_mut());
-
-    let phdrs = dylib.phdrs();
-    let phdr = if phdrs.is_empty() {
-        null()
-    } else {
-        phdrs.as_ptr().cast()
-    };
-    let phnum = phdrs.len().min(u16::MAX as usize) as u16;
-    let entry = dylib.entry();
-    let tls = dylib.tls();
-    let tls_mod_id = tls.mod_id().map(|id| id.get());
-    let tls_tp_offset = tls.tp_offset().map(|offset| offset.get());
-
-    let dynamic_table = (!dynamic_ptr.is_null())
-        .then(|| unsafe { copy_dynamic_table(dynamic_ptr) }.into_boxed_slice());
-    let c_name = CString::new(link_name).unwrap();
-
-    let mut link_map = Box::new(LinkMap {
-        l_addr: base.as_mut_ptr(),
-        l_name: c_name.as_ptr(),
-        l_ld: dynamic_ptr as *mut _,
-        l_next: core::ptr::null_mut(),
-        l_prev: core::ptr::null_mut(),
-        l_phdr: phdr,
-        l_entry: entry,
-        l_phnum: phnum,
-        ..LinkMap::zero()
-    });
-    populate_link_map_tls(&mut link_map, base, phdrs, tls_mod_id, tls_tp_offset);
-    link_map.l_real = link_map.as_mut() as *mut LinkMap;
-
-    unsafe { add_debug_link_map(link_map.as_mut()) };
-    let user_data = dylib.user_data_mut().unwrap();
-    user_data.needed_libs = needed_libs;
-    user_data.dynamic_table = dynamic_table;
-    user_data.link_map = Some(link_map);
-    user_data.c_name = Some(c_name);
-
-    // Get file identity (inode) if path is provided
-    if let Some(path) = identity_path.as_deref() {
-        if let Ok(identity) = crate::os::get_file_inode(path) {
-            user_data.file_identity = Some(identity);
-            log::debug!(
-                "Stored file identity for [{}]: dev={}, ino={}",
-                path,
-                identity.dev,
-                identity.ino
-            );
-        } else {
-            log::warn!("Failed to get file identity for [{}]", path);
-        }
-    }
 }
 
 fn populate_link_map_tls(

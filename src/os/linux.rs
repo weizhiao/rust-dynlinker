@@ -193,49 +193,17 @@ pub(crate) fn read_file_limit(path: &str, limit: usize) -> Result<Box<[u8]>> {
     read_result
 }
 
-pub(crate) fn get_file_inode(path: impl AsRef<str>) -> Result<FileIdentity> {
-    let path = path.as_ref();
-    let mut path_c = Vec::from(path.as_bytes());
-    path_c.push(0);
-
+pub(crate) fn get_file_identity(fd: isize) -> Result<FileIdentity> {
     let mut stat_buf: LinuxStat = unsafe { core::mem::zeroed() };
-
-    let result = unsafe {
-        #[cfg(target_arch = "aarch64")]
-        {
-            syscalls::syscall4(
-                syscalls::Sysno::fstatat,
-                -100isize as usize, // AT_FDCWD
-                path_c.as_ptr() as usize,
-                &mut stat_buf as *mut _ as usize,
-                0, // flags
-            )
-        }
-        #[cfg(any(target_arch = "riscv64", target_arch = "riscv32"))]
-        {
-            syscalls::syscall4(
-                syscalls::Sysno::newfstatat,
-                -100isize as usize, // AT_FDCWD
-                path_c.as_ptr() as usize,
-                &mut stat_buf as *mut _ as usize,
-                0, // flags
-            )
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            syscalls::syscall2(
-                syscalls::Sysno::stat,
-                path_c.as_ptr() as usize,
-                &mut stat_buf as *mut _ as usize,
-            )
-        }
-    };
-
-    match result {
-        Ok(_) => Ok(FileIdentity {
-            dev: stat_buf.st_dev as u64,
-            ino: stat_buf.st_ino as u64,
-        }),
-        Err(e) => Err(Error::from(e)),
+    unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::fstat,
+            fd as usize,
+            &mut stat_buf as *mut _ as usize,
+        )?;
     }
+    Ok(FileIdentity {
+        dev: stat_buf.st_dev as u64,
+        ino: stat_buf.st_ino as u64,
+    })
 }

@@ -4,7 +4,7 @@ mod manager;
 pub(crate) use lifecycle::{addr2dso, global_find, next_find, register_loaded, reserve_pending};
 
 use super::{
-    loader::{ActiveTlsResolver, LoadedDylib},
+    loader::ActiveTlsResolver,
     types::{ExtraData, FileIdentity},
 };
 use crate::OpenFlags;
@@ -33,7 +33,7 @@ macro_rules! lock_read {
 #[derive(Clone)]
 pub(crate) struct PendingDylib {
     shortname: String,
-    inner: Option<LoadedDylib>,
+    identity: Option<FileIdentity>,
     pub(crate) flags: OpenFlags,
     pub(crate) libnames: Vec<String>,
 }
@@ -52,10 +52,10 @@ unsafe impl Send for PendingDylib {}
 unsafe impl Sync for PendingDylib {}
 
 impl PendingDylib {
-    fn reserved(shortname: String, flags: OpenFlags) -> Self {
+    fn reserved(shortname: String, identity: Option<FileIdentity>, flags: OpenFlags) -> Self {
         Self {
             shortname,
-            inner: None,
+            identity,
             flags,
             libnames: Vec::new(),
         }
@@ -64,16 +64,6 @@ impl PendingDylib {
     #[inline]
     fn shortname(&self) -> &str {
         &self.shortname
-    }
-
-    #[inline]
-    fn dylib(&self) -> Option<LoadedDylib> {
-        self.inner.clone()
-    }
-
-    #[inline]
-    fn dylib_ref(&self) -> Option<&LoadedDylib> {
-        self.inner.as_ref()
     }
 }
 
@@ -116,6 +106,7 @@ impl<'a> LibraryLookup<'a> {
 
 #[derive(Clone)]
 pub(crate) struct GlobalMeta {
+    pub(crate) identity: Option<FileIdentity>,
     pub(crate) flags: OpenFlags,
     pub(crate) libnames: Vec<String>,
 }
@@ -124,6 +115,7 @@ impl Default for GlobalMeta {
     #[inline]
     fn default() -> Self {
         Self {
+            identity: None,
             flags: OpenFlags::empty(),
             libnames: Vec::new(),
         }
@@ -140,7 +132,7 @@ pub(crate) struct Manager {
     pending_next_id: usize,
     /// Libraries available in the global symbol scope (RTLD_GLOBAL).
     global: IndexSet<ModuleId>,
-    /// Maps file identities to the canonical short name for fast inode-based lookup.
+    /// Maps file identities to canonical names for fast inode-based lookup.
     identities: HashMap<FileIdentity, String>,
     /// Fully linked modules indexed by canonical key.
     link_ctx: GlobalLinkContext,

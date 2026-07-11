@@ -88,11 +88,7 @@ pub(crate) fn reserve_pending(
         flags
     );
 
-    manager.add_pending_reservation(shortname.clone(), flags);
-
-    if let Some(identity) = identity {
-        manager.add_identity(identity, &shortname);
-    }
+    manager.add_pending_reservation(shortname.clone(), identity, flags);
     for alias in libc_compat_aliases(&shortname) {
         manager.add_alias(&shortname, alias);
     }
@@ -118,9 +114,6 @@ pub(crate) fn register_loaded(lib: LoadedDylib, flags: OpenFlags, manager: &mut 
 
     let module_id = manager.add_loaded(shortname.clone(), lib.clone(), flags);
 
-    if let Some(identity) = lib.user_data().file_identity {
-        manager.add_identity(identity, &shortname);
-    }
     manager.add_alias(&shortname, lib.path().file_name());
     for alias in libc_compat_aliases(&shortname) {
         manager.add_alias(&shortname, alias);

@@ -13,7 +13,13 @@ description = "A dynamic linker fully implemented in Rust."
 exclude = [".gitignore", "/example-dylib", "/test-dylibs", "check.sh"]
 
 [workspace]
-members = ["example-dylib", "test-dylibs/promotion", "cdylib", "rtld", "rtld/impl"]
+members = [
+    "example-dylib",
+    "test-dylibs/promotion",
+    "cdylib",
+    "rtld",
+    "rtld/impl",
+]
 resolver = "2"
 
 [workspace.dependencies]
@@ -35,10 +41,9 @@ default-features = false
 features = ["default-hasher"]
 
 [dependencies.elf_loader]
-#version = "0.15.1"
-git = "https://github.com/weizhiao/Relink.git"
+version = "0.16.0"
 default-features = false
-features = ["log", "tls", "lazy-binding"]
+features = ["log", "full"]
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.171", default-features = false, optional = true }
