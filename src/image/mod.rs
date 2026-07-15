@@ -1,17 +1,16 @@
-mod address;
 mod library;
-mod observer;
 mod types;
 
 use elf_loader::{arch::NativeArch, image::LoadedCore, memory::HostRegion};
 
-pub use address::DlInfo;
 pub use library::{AsFilename, ElfLibrary};
-pub use observer::DlopenObserver;
 pub use types::ExtraData;
 
-pub(crate) use address::{contains_addr, dladdr_raw, mapped_end};
-pub(crate) use library::{DylibExt, find_symbol};
+pub(crate) use library::{
+    DylibExt, HandleLease, LibrarySnapshot, contains_addr, find_symbol, mapped_end,
+};
+#[cfg(feature = "std")]
+pub(crate) use types::ModuleState;
 
 #[cfg(not(feature = "std"))]
 pub type RuntimeLoader = elf_loader::Loader<ExtraData, crate::runtime::rtld::ActiveTlsResolver>;

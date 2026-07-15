@@ -2,30 +2,28 @@ pub use crate::abi::{auxv, debug, elf, link_map, memory, relocation};
 
 use crate::{
     OpenFlags, Result,
-    dlopen::{LinkRoot, OpenContext, link_root},
-    image::{ElfLibrary, LoadedDylib},
-    registry::{MANAGER, register_loaded},
+    dlopen::{LinkRoot, dlopen_impl},
+    image::{ElfLibrary, ExtraData, LoadedDylib},
+    registry::REGISTRY,
     runtime::{ARGC, ARGV, ENVP},
 };
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_void};
+use elf_loader::Loader as ElfLoader;
 
 #[doc(hidden)]
 pub use self::tls::{ActiveTlsResolver, RtldTlsOps};
 #[doc(hidden)]
-pub use crate::image::{DlopenObserver, ElfDylib, ExtraData, RuntimeLoader};
+pub use crate::image::{ElfDylib, RuntimeLoader};
 #[doc(hidden)]
 pub use elf_loader::{
-    Loader as ElfLoader, Result as ElfResult,
+    Result as ElfResult,
     arch::NativeArch,
     error::TlsError,
     image::RawExec,
     input::PathBuf,
     memory::VmAddr,
-    tls::{
-        DefaultTlsResolver, TlsImageSource, TlsIndex, TlsInfo, TlsModuleId, TlsResolver,
-        TlsTemplate, TlsTpOffset,
-    },
+    tls::{TlsImageSource, TlsIndex, TlsInfo, TlsModuleId, TlsTemplate, TlsTpOffset},
 };
 
 #[doc(hidden)]
@@ -61,38 +59,21 @@ pub unsafe fn set_initial_process_state(
 
 #[doc(hidden)]
 pub fn register_loaded_object(raw: &ElfDylib, flags: OpenFlags) {
+    let registry = REGISTRY.lock();
     let loaded = unsafe { LoadedDylib::from_core(raw.core()) };
-    register_loaded(loaded, flags, &mut *crate::lock_write!(MANAGER));
+    registry.borrow_mut().register_loaded(loaded, flags);
 }
 
 #[doc(hidden)]
 pub fn link_mapped_root(root_request: &str, raw: ElfDylib, flags: OpenFlags) -> Result<ElfLibrary> {
-    let root_key = mapped_root_key(raw.name()).to_owned();
-    log::info!(
-        "dlopen: Link mapped root [{}] as [{}] with [{:?}]",
-        root_request,
-        root_key,
-        flags
-    );
-    let ctx = OpenContext::new(flags);
-    link_root(
-        ctx,
-        &root_key,
-        LinkRoot::Mapped {
-            key: root_key.clone(),
-            raw,
-        },
-    )
-}
-
-fn mapped_root_key(name: &str) -> &str {
-    if name.is_empty() {
+    let name = raw.name();
+    let root_key = if name.is_empty() {
         "main"
     } else {
-        name.rsplit(|c| c == '/' || c == '\\')
-            .next()
-            .unwrap_or(name)
+        name.rsplit(['/', '\\']).next().unwrap_or(name)
     }
+    .to_owned();
+    dlopen_impl(root_request, flags, LinkRoot::Mapped { key: root_key, raw })
 }
 
 #[doc(hidden)]
@@ -109,11 +90,6 @@ pub unsafe fn handle_link_map(handle: *mut c_void) -> *mut link_map::LinkMap {
 }
 
 #[doc(hidden)]
-pub unsafe fn dladdr_raw(addr: *const c_void, info: *mut c_void) -> c_int {
-    unsafe { crate::image::dladdr_raw(addr, info.cast()) }
-}
-
-#[doc(hidden)]
 pub struct StartupLinkMaps {
     pub maps: Box<[*mut link_map::LinkMap]>,
     pub libc_map: *mut link_map::LinkMap,
@@ -123,7 +99,6 @@ pub struct StartupLinkMaps {
 pub fn startup_link_maps(library: &ElfLibrary, rtld: *mut link_map::LinkMap) -> StartupLinkMaps {
     let mut maps = Vec::with_capacity(library.deps.len() + 1);
     let mut libc_map = core::ptr::null_mut();
-    let mut has_rtld = false;
 
     for dep in library.deps.iter() {
         let link_map = extra_data_link_map(dep.user_data());
@@ -131,16 +106,13 @@ pub fn startup_link_maps(library: &ElfLibrary, rtld: *mut link_map::LinkMap) -> 
             continue;
         }
 
-        if link_map == rtld {
-            has_rtld = true;
-        }
         if dep.name() == "libc.so.6" {
             libc_map = link_map;
         }
         maps.push(link_map);
     }
 
-    if !rtld.is_null() && !has_rtld {
+    if !rtld.is_null() && !maps.contains(&rtld) {
         let insert_at = usize::from(!maps.is_empty());
         maps.insert(insert_at, rtld);
     }
@@ -161,7 +133,8 @@ fn extra_data_link_map(data: &ExtraData) -> *mut link_map::LinkMap {
 
 #[doc(hidden)]
 pub unsafe fn find_loaded_symbol<T: Copy>(name: &str) -> Option<T> {
-    let manager = crate::lock_read!(MANAGER);
+    let registry = REGISTRY.lock();
+    let manager = registry.borrow();
     manager
         .all_values()
         .find_map(|lib| unsafe { lib.get::<T>(name).map(|sym| *sym) })

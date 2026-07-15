@@ -1,70 +1,111 @@
-use super::get_env;
-#[cfg(not(feature = "std"))]
-use crate::registry::reserve_pending;
+use super::run::get_env;
 use crate::{
     OpenFlags,
-    image::{ActiveTlsResolver, ElfLibrary, ExtraData, LoadedDylib},
-    registry::{FileIdentity, GlobalMeta, LibraryLookup, MANAGER, Manager},
+    image::{ElfLibrary, LoadedDylib},
+    registry::{FileIdentity, GlobalLinkContext, GlobalMeta, RegistryGuard, libc_compat_aliases},
 };
-#[cfg(not(feature = "std"))]
-use alloc::borrow::ToOwned;
-use alloc::{collections::BTreeSet, string::String, sync::Arc};
+use alloc::{borrow::ToOwned, collections::BTreeMap, rc::Rc, string::String, vec::Vec};
 use core::cell::RefCell;
-use elf_loader::linker::{
-    LinkContext, ModuleId, RelocationInputs, RelocationPlanner, RelocationRequest,
-};
-use elf_loader::{arch::NativeArch, image::ModuleScope, memory::HostRegion};
-use spin::RwLockWriteGuard;
+use elf_loader::linker::ModuleId;
 
-/// The context for a `dlopen` operation.
-///
-/// Manages the acquisition of the global lock, tracking of newly loaded libraries,
-/// and handling resource cleanup if the operation fails.
-pub(super) struct OpenShared<'a> {
-    /// The write lock guard for the global library manager.
-    /// Can be temporarily dropped to avoid deadlocks during relocation.
-    lock: RefCell<Option<RwLockWriteGuard<'a, Manager>>>,
-    /// Loading flags for this operation.
+/// Metadata staged while one serialized `dlopen` transaction is prepared.
+pub(crate) struct OpenContext {
     pub(super) flags: OpenFlags,
+    pub(super) staged: Rc<RefCell<StagedModules>>,
 }
 
-pub(super) struct DlopenPlanner<'ctx, 'mgr> {
-    shared: &'ctx OpenShared<'mgr>,
+pub(super) struct StagedModules {
+    entries: BTreeMap<String, GlobalMeta>,
+    aliases: Vec<(String, String)>,
 }
 
-impl<'ctx, 'mgr> DlopenPlanner<'ctx, 'mgr> {
-    pub(super) fn new(shared: &'ctx OpenShared<'mgr>) -> Self {
-        Self { shared }
-    }
-}
-
-impl RelocationPlanner<String, ExtraData, NativeArch, HostRegion, ActiveTlsResolver>
-    for DlopenPlanner<'_, '_>
-{
-    fn plan(
-        &self,
-        req: &RelocationRequest<'_, String, ExtraData, NativeArch, HostRegion, ActiveTlsResolver>,
-    ) -> core::result::Result<RelocationInputs<NativeArch, ActiveTlsResolver>, elf_loader::Error>
-    {
-        log::debug!("Planning relocation for dylib [{}]", req.key());
-
-        let inputs = RelocationInputs::scope(self.shared.prepare_relocation(req.scope()));
-        if self.shared.flags.is_now() {
-            Ok(inputs.eager())
-        } else if self.shared.flags.is_lazy() {
-            Ok(inputs.lazy())
-        } else {
-            Ok(inputs)
+impl StagedModules {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            aliases: Vec::new(),
         }
     }
-}
 
-pub(crate) struct OpenContext<'a> {
-    pub(super) shared: OpenShared<'a>,
-    /// Names of libraries that were added to the global registry in this operation.
-    pub(super) added_names: BTreeSet<String>,
-    /// Indicates if the operation was successfully committed.
-    committed: bool,
+    pub(super) fn lookup(&self, name: &str, identity: Option<FileIdentity>) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(key, meta)| meta.matches(key, name, identity))
+            .map(|(key, _)| key.as_str())
+    }
+
+    pub(super) fn reserve(
+        &mut self,
+        name: String,
+        full_name: &str,
+        identity: Option<FileIdentity>,
+        flags: OpenFlags,
+    ) {
+        if self.lookup(&name, identity).is_some() {
+            return;
+        }
+
+        let metadata = GlobalMeta::loading(full_name, identity, flags);
+        let previous = self.entries.insert(name, metadata);
+        debug_assert!(previous.is_none(), "staged module inserted twice");
+    }
+
+    pub(super) fn add_alias(&mut self, target: String, alias: String) {
+        if target != alias
+            && !self
+                .aliases
+                .iter()
+                .any(|(existing_target, existing_alias)| {
+                    existing_target == &target && existing_alias == &alias
+                })
+        {
+            self.aliases.push((target, alias));
+        }
+    }
+
+    fn apply(&self, link_ctx: &mut GlobalLinkContext, committed: &[ModuleId]) {
+        for &id in committed {
+            let Ok(key) = link_ctx.module_key(id).cloned() else {
+                continue;
+            };
+            let Some(metadata) = self.entries.get(&key).cloned() else {
+                continue;
+            };
+            let loaded = link_ctx
+                .get(id)
+                .ok()
+                .and_then(|module| module.downcast_ref::<LoadedDylib>())
+                .cloned();
+            *link_ctx
+                .meta_mut(id)
+                .expect("staged module must have metadata") = metadata;
+
+            let mut add_alias = |alias: &str| {
+                if !alias.is_empty() && alias != key {
+                    link_ctx
+                        .add_alias(id, alias.to_owned())
+                        .expect("staged alias must target its module");
+                }
+            };
+            if let Some(lib) = loaded.as_ref() {
+                add_alias(lib.name());
+                add_alias(lib.path().file_name());
+            }
+            for alias in libc_compat_aliases(&key) {
+                add_alias(alias);
+            }
+        }
+
+        for (target, alias) in &self.aliases {
+            let target = link_ctx
+                .key_id(target)
+                .and_then(|id| link_ctx.module_id(id).ok().flatten())
+                .expect("staged alias target must remain committed");
+            link_ctx
+                .add_alias(target, alias.clone())
+                .expect("staged alias must target its committed module");
+        }
+    }
 }
 
 pub(crate) enum LinkRoot<'bytes> {
@@ -80,6 +121,18 @@ pub(crate) enum LinkRoot<'bytes> {
 }
 
 impl<'bytes> LinkRoot<'bytes> {
+    pub(super) fn key(&self) -> &str {
+        match self {
+            Self::Load { key, .. } => key,
+            #[cfg(not(feature = "std"))]
+            Self::Mapped { key, .. } => key,
+        }
+    }
+
+    pub(super) fn reuse_existing(&self) -> bool {
+        matches!(self, Self::Load { .. })
+    }
+
     pub(super) fn source(&self) -> CandidateSource<'bytes> {
         match self {
             Self::Load { bytes, .. } => CandidateSource::from(*bytes),
@@ -104,194 +157,90 @@ impl<'bytes> From<Option<&'bytes [u8]>> for CandidateSource<'bytes> {
     }
 }
 
-impl<'a> Drop for OpenContext<'a> {
-    fn drop(&mut self) {
-        // If not committed, roll back changes to the global registry.
-        if !self.committed {
-            log::debug!("Destroying newly added dynamic libraries from the global");
-            let mut lock = self
-                .shared
-                .lock
-                .borrow_mut()
-                .take()
-                .unwrap_or_else(|| crate::lock_write!(MANAGER));
-            self.remove_added_libraries(&mut lock);
-        }
-    }
-}
-
-impl<'a> OpenContext<'a> {
+impl OpenContext {
     pub(crate) fn new(mut flags: OpenFlags) -> Self {
         if get_env("LD_BIND_NOW").is_some() {
             flags |= OpenFlags::RTLD_NOW;
         }
-        let lock = crate::lock_write!(MANAGER);
         Self {
-            shared: OpenShared {
-                lock: RefCell::new(Some(lock)),
-                flags,
-            },
-            added_names: BTreeSet::new(),
-            committed: false,
-        }
-    }
-}
-
-impl<'a> OpenShared<'a> {
-    pub(super) fn with_manager<T>(&self, f: impl FnOnce(&Manager) -> T) -> T {
-        let lock = self.lock.borrow();
-        let manager = lock.as_ref().expect("Lock must be held");
-        f(manager)
-    }
-
-    pub(super) fn with_manager_mut<T>(&self, f: impl FnOnce(&mut Manager) -> T) -> T {
-        let mut lock = self.lock.borrow_mut();
-        let manager = lock.as_mut().expect("Lock must be held");
-        f(manager)
-    }
-
-    fn take_lock(&self) -> Option<RwLockWriteGuard<'a, Manager>> {
-        self.lock.borrow_mut().take()
-    }
-
-    fn replace_lock(&self, lock: RwLockWriteGuard<'a, Manager>) {
-        *self.lock.borrow_mut() = Some(lock);
-    }
-
-    fn wait_for_other_thread(&self) {
-        drop(self.take_lock());
-        core::hint::spin_loop();
-        self.replace_lock(crate::lock_write!(MANAGER));
-    }
-
-    pub(super) fn lookup(
-        &self,
-        added_names: Option<&BTreeSet<String>>,
-        shortname: &str,
-        identity: Option<FileIdentity>,
-    ) -> Option<LibraryLookup<'static>> {
-        let (entry, matched_identity) = loop {
-            let entry = self.with_manager(|manager| {
-                if let Some(lib) = manager.lookup(shortname) {
-                    return Some((lib.into_owned(), None));
-                }
-
-                let identity = identity.as_ref()?;
-                let lib = manager.lookup_by_identity(identity)?;
-                Some((lib.into_owned(), Some(*identity)))
-            });
-
-            match entry {
-                Some((lib, matched_identity))
-                    if lib.is_relocated()
-                        || added_names.is_some_and(|names| names.contains(lib.name())) =>
-                {
-                    break (Some(lib), matched_identity);
-                }
-                Some(_) => self.wait_for_other_thread(),
-                None => break (None, None),
-            }
-        };
-
-        if let (Some(lib), Some(identity)) = (entry.as_ref(), matched_identity.as_ref()) {
-            log::info!(
-                "dlopen: Found existing library by inode match: requested [{}], existing [{}] (dev={}, ino={})",
-                shortname,
-                lib.name(),
-                identity.dev,
-                identity.ino
-            );
-            self.with_manager_mut(|manager| {
-                manager.add_alias(lib.name(), shortname);
-            });
-        }
-
-        entry
-    }
-
-    pub(super) fn prepare_relocation(
-        &self,
-        group_scope: &ModuleScope<NativeArch, ActiveTlsResolver>,
-    ) -> ModuleScope<NativeArch, ActiveTlsResolver> {
-        let relocation_scope =
-            self.with_manager_mut(|manager| manager.relocation_scope(group_scope, self.flags));
-        drop(self.take_lock());
-        relocation_scope
-    }
-}
-
-impl<'a> OpenContext<'a> {
-    fn remove_added_libraries(&self, manager: &mut Manager) {
-        for name in self.added_names.iter() {
-            if manager.lookup(name).is_some() {
-                manager.remove(name);
-            }
+            flags,
+            staged: Rc::new(RefCell::new(StagedModules::new())),
         }
     }
 
     #[cfg(not(feature = "std"))]
-    pub(super) fn reserve_root_if_needed(&mut self, root: &LinkRoot<'_>) {
+    pub(super) fn reserve_root_if_needed(&self, root: &LinkRoot<'_>) {
         if let LinkRoot::Mapped { key, raw } = root {
-            let shortname = self.shared.with_manager_mut(|manager| {
-                reserve_pending(key.to_owned(), raw.name(), None, self.shared.flags, manager)
-            });
-            self.added_names.insert(shortname);
+            self.staged
+                .borrow_mut()
+                .reserve(key.to_owned(), raw.name(), None, self.flags);
         }
     }
 
-    pub(super) fn finish_existing(
-        &mut self,
+    pub(super) fn try_existing(
+        &self,
+        registry: &RegistryGuard<'_>,
         path: &str,
-        lib: LibraryLookup<'static>,
-    ) -> ElfLibrary {
-        let shortname = lib.name();
+    ) -> Option<ElfLibrary> {
+        let name = path.rsplit_once('/').map_or(path, |(_, name)| name);
+        // Step 1: fast name/alias lookup — no stat.
+        let name = registry.borrow().lookup(name).map(ToOwned::to_owned)?;
         log::info!(
             "dlopen: Found existing library [{}] (canonical name: {})",
             path,
-            shortname
+            name
         );
-        let elf_lib = self.shared.with_manager_mut(|manager| {
-            manager
-                .open_existing(shortname, self.shared.flags)
-                .expect("Existing library must be retrievable")
-        });
-        self.committed = true;
-        elf_lib
+        let lib = registry
+            .borrow_mut()
+            .open_existing(&name, self.flags)
+            .expect("Existing library must be retrievable");
+        Some(lib)
     }
 
-    pub(super) fn try_existing(&mut self, path: &str) -> Option<ElfLibrary> {
-        let shortname = path.rsplit_once('/').map_or(path, |(_, name)| name);
-        // Step 1: fast name/alias lookup — no stat.
-        self.shared
-            .lookup(None, shortname, None)
-            .map(|lib| self.finish_existing(path, lib))
+    pub(super) fn register(
+        self,
+        registry: &RegistryGuard<'_>,
+        committed: &[ModuleId],
+        root: ModuleId,
+    ) -> ElfLibrary {
+        {
+            let mut manager = registry.borrow_mut();
+            self.staged.borrow().apply(manager.context_mut(), committed);
+        }
+        registry.register_committed(committed);
+        registry
+            .borrow_mut()
+            .open_module(root)
+            .expect("linked root module must be registered")
     }
+}
 
-    pub(super) fn complete_relocation(
-        &mut self,
-        link_ctx: &LinkContext<String, ExtraData, GlobalMeta, NativeArch, ActiveTlsResolver>,
-        committed: impl IntoIterator<Item = ModuleId>,
-    ) {
-        let mut lock = self
-            .shared
-            .take_lock()
-            .unwrap_or_else(|| crate::lock_write!(MANAGER));
-        lock.merge_link_context(link_ctx, committed, self.shared.flags);
-        self.shared.replace_lock(lock);
-    }
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::StagedModules;
+    use crate::{OpenFlags, registry::FileIdentity};
 
-    pub(super) fn library_scope(&self, root: &str) -> Arc<[LoadedDylib]> {
-        self.shared.with_manager(|manager| {
-            manager
-                .library_scope(root)
-                .expect("root library must have a dependency scope after linking")
-        })
-    }
+    #[test]
+    fn staged_modules_deduplicate_file_identity() {
+        let identity = Some(FileIdentity { dev: 1, ino: 2 });
+        let mut staged = StagedModules::new();
+        staged.reserve(
+            "liboriginal.so".into(),
+            "/tmp/liboriginal.so",
+            identity,
+            OpenFlags::RTLD_NOW,
+        );
+        staged.reserve(
+            "libalias.so".into(),
+            "/tmp/libalias.so",
+            identity,
+            OpenFlags::RTLD_NOW,
+        );
 
-    /// Finalizes the operation and returns the `ElfLibrary`.
-    pub(super) fn finish(mut self, deps: Arc<[LoadedDylib]>) -> ElfLibrary {
-        self.committed = true;
-        let core = deps[0].clone();
-        ElfLibrary { inner: core, deps }
+        assert_eq!(staged.entries.len(), 1);
+        assert_eq!(
+            staged.lookup("libalias.so", identity),
+            Some("liboriginal.so")
+        );
     }
 }

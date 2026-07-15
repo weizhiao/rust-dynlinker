@@ -1,29 +1,29 @@
-use super::context::{CandidateSource, OpenShared};
-use super::linker_script::get_linker_script_libs;
 use super::{
-    DEFAULT_PATH, LD_CACHE, LD_LIBRARY_PATH, fixup_rpath, is_elf_input,
-    should_continue_library_search,
+    context::{CandidateSource, StagedModules},
+    linker_script::get_linker_script_libs,
+    run::{
+        DEFAULT_PATH, LD_CACHE, LD_LIBRARY_PATH, fixup_rpath, is_elf_input,
+        should_continue_library_search,
+    },
 };
 use crate::{
-    Result,
+    OpenFlags, Result,
     error::find_lib_error,
     image::ActiveTlsResolver,
-    registry::{FileIdentity, reserve_pending},
+    registry::{FileIdentity, IdentityLookup},
 };
 use alloc::{
     borrow::ToOwned,
     boxed::Box,
-    collections::BTreeSet,
     format,
+    rc::Rc,
     string::{String, ToString},
     vec::Vec,
 };
 use core::cell::{Cell, RefCell};
 use elf_loader::arch::NativeArch;
 use elf_loader::input::{ElfBinary, ElfFile, ElfReader, PathBuf as ElfPath};
-use elf_loader::linker::{
-    DependencyRequest, KeyResolver, ResolvedKey, RootRequest, VisibleModule, VisibleModules,
-};
+use elf_loader::linker::{DependencyRequest, KeyResolver, ResolvedKey, RootRequest};
 
 type DlopenResolvedKey<'cfg> = ResolvedKey<'cfg, String, NativeArch, ActiveTlsResolver>;
 
@@ -34,37 +34,12 @@ fn into_linker_error(err: crate::error::Error) -> elf_loader::Error {
     }
 }
 
-pub(super) struct LinkResolver<'ctx, 'mgr, 'bytes> {
-    shared: &'ctx OpenShared<'mgr>,
-    added_names: RefCell<&'ctx mut BTreeSet<String>>,
+pub(super) struct LinkResolver<'registry, 'bytes> {
+    flags: OpenFlags,
+    identities: IdentityLookup<'registry>,
+    staged: Rc<RefCell<StagedModules>>,
     root_request: String,
     root_source: Cell<CandidateSource<'bytes>>,
-}
-
-pub(super) struct DlopenVisible<'ctx, 'mgr> {
-    shared: &'ctx OpenShared<'mgr>,
-}
-
-impl<'ctx, 'mgr> DlopenVisible<'ctx, 'mgr> {
-    pub(super) fn new(shared: &'ctx OpenShared<'mgr>) -> Self {
-        Self { shared }
-    }
-}
-
-impl VisibleModules<String, NativeArch, str, ActiveTlsResolver> for DlopenVisible<'_, '_> {
-    fn contains(&self, key: &str) -> bool {
-        self.shared
-            .with_manager(|manager| manager.visible_key(key).is_some())
-    }
-
-    fn module(&self, key: &str) -> Option<VisibleModule<String, NativeArch, ActiveTlsResolver>> {
-        self.shared.with_manager(|manager| {
-            let key = manager.visible_key(key)?;
-            let module = manager.visible_loaded(&key)?;
-            let direct_deps = manager.visible_direct_deps(&key)?;
-            Some(VisibleModule::new(module, direct_deps))
-        })
-    }
 }
 
 enum CandidateInput {
@@ -95,46 +70,38 @@ impl<'req> ResolveEnv<'req> {
         }
     }
 
-    fn empty() -> Self {
-        Self::new(None, &[], &[])
-    }
-
     fn contains_visible(self, name: &str) -> bool {
         self.visible.is_some_and(|is_visible| is_visible(name))
     }
 }
 
-impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
+impl<'registry, 'bytes> LinkResolver<'registry, 'bytes> {
     pub(super) fn new(
-        shared: &'ctx OpenShared<'mgr>,
-        added_names: &'ctx mut BTreeSet<String>,
+        flags: OpenFlags,
+        identities: IdentityLookup<'registry>,
+        staged: Rc<RefCell<StagedModules>>,
         root_request: &str,
         root_source: CandidateSource<'bytes>,
     ) -> Self {
         Self {
-            shared,
-            added_names: RefCell::new(added_names),
+            flags,
+            identities,
+            staged,
             root_request: root_request.to_owned(),
             root_source: Cell::new(root_source),
         }
     }
 
-    fn reserve_pending(&self, path: &ElfPath, identity: Option<FileIdentity>) {
+    fn stage(&self, path: &ElfPath, identity: Option<FileIdentity>) -> Result<()> {
         let name = path.file_name();
-        if self.added_names.borrow().contains(name) {
-            return;
+        if self.staged.borrow().lookup(name, identity).is_some() {
+            return Ok(());
         }
 
-        let name = self.shared.with_manager_mut(|manager| {
-            reserve_pending(
-                name.to_owned(),
-                path.as_str(),
-                identity,
-                self.shared.flags,
-                manager,
-            )
-        });
-        self.added_names.borrow_mut().insert(name);
+        self.staged
+            .borrow_mut()
+            .reserve(name.to_owned(), path.as_str(), identity, self.flags);
+        Ok(())
     }
 
     fn resolve_existing(
@@ -142,15 +109,32 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         path: &ElfPath,
         env: ResolveEnv<'_>,
         identity: Option<FileIdentity>,
-    ) -> Option<DlopenResolvedKey<'static>> {
+    ) -> Result<Option<DlopenResolvedKey<'static>>> {
         let name = path.file_name();
         if env.contains_visible(name) {
-            return Some(ResolvedKey::existing(name.to_owned()));
+            return Ok(Some(ResolvedKey::existing(name.to_owned())));
         }
 
-        self.shared
-            .lookup(Some(&*self.added_names.borrow()), name, identity)
-            .map(|lib| ResolvedKey::existing(lib.name().to_owned()))
+        if let Some(key) = self.staged.borrow().lookup(name, identity) {
+            return Ok(Some(ResolvedKey::existing(key.to_owned())));
+        }
+        let identity_name = identity.and_then(|identity| self.identities.find(identity));
+        if let Some(identity) = identity
+            && let Some(key) = identity_name
+        {
+            log::info!(
+                "dlopen: Found existing library by inode match: requested [{}], existing [{}] (dev={}, ino={})",
+                name,
+                key,
+                identity.dev,
+                identity.ino
+            );
+            self.staged
+                .borrow_mut()
+                .add_alias(key.clone(), name.to_owned());
+            return Ok(Some(ResolvedKey::existing(key)));
+        }
+        Ok(None)
     }
 
     fn resolve_script(
@@ -171,22 +155,22 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         String: 'cfg,
     {
         let name = path.file_name();
-        if let Some(module) = self.resolve_existing(path, env, None) {
+        if let Some(module) = self.resolve_existing(path, env, None)? {
             return Ok(module);
         }
 
         match self.load_candidate_file(path.as_str())? {
             CandidateInput::Reader { reader, identity } => {
-                if let Some(module) = self.resolve_existing(path, env, identity) {
+                if let Some(module) = self.resolve_existing(path, env, identity)? {
                     return Ok(module);
                 }
-                if self.shared.flags.is_noload() {
+                if self.flags.is_noload() {
                     return Err(find_lib_error(format!(
                         "can not find file: {}",
                         path.as_str()
                     )));
                 }
-                self.reserve_pending(path, identity);
+                self.stage(path, identity)?;
                 Ok(ResolvedKey::load(name.to_owned(), reader))
             }
             CandidateInput::Script(libs) => Ok(self.resolve_script(env, libs)?),
@@ -195,6 +179,7 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
 
     fn resolve_root_bytes<'cfg>(
         &self,
+        env: ResolveEnv<'_>,
         key: &str,
         bytes: &'bytes [u8],
     ) -> Result<DlopenResolvedKey<'cfg>>
@@ -202,18 +187,17 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
         String: 'cfg,
     {
         let path = ElfPath::from(key);
-        let env = ResolveEnv::empty();
         let name = path.file_name();
-        if let Some(module) = self.resolve_existing(&path, env, None) {
+        if let Some(module) = self.resolve_existing(&path, env, None)? {
             return Ok(module);
         }
 
         match self.load_candidate_bytes(path.as_str(), bytes)? {
             CandidateInput::Reader { reader, identity } => {
-                if self.shared.flags.is_noload() {
+                if self.flags.is_noload() {
                     return Err(find_lib_error(format!("can not find file: {}", key)));
                 }
-                self.reserve_pending(&path, identity);
+                self.stage(&path, identity)?;
                 Ok(ResolvedKey::load(name.to_owned(), reader))
             }
             CandidateInput::Script(libs) => Ok(self.resolve_script(env, libs)?),
@@ -329,8 +313,8 @@ impl<'ctx, 'mgr, 'bytes> LinkResolver<'ctx, 'mgr, 'bytes> {
     }
 }
 
-impl<'ctx, 'mgr, 'bytes> KeyResolver<String, NativeArch, str, ActiveTlsResolver>
-    for LinkResolver<'ctx, 'mgr, 'bytes>
+impl<'registry, 'bytes> KeyResolver<String, NativeArch, str, ActiveTlsResolver>
+    for LinkResolver<'registry, 'bytes>
 {
     fn load_root<'cfg>(
         &self,
@@ -347,9 +331,11 @@ impl<'ctx, 'mgr, 'bytes> KeyResolver<String, NativeArch, str, ActiveTlsResolver>
         } else {
             CandidateSource::File
         };
+        let is_visible = |key: &str| req.contains_key(key);
+        let env = ResolveEnv::new(Some(&is_visible), &[], &[]);
         match source {
-            CandidateSource::File => self.resolve_request(ResolveEnv::empty(), key),
-            CandidateSource::Bytes(bytes) => self.resolve_root_bytes(key, bytes),
+            CandidateSource::File => self.resolve_request(env, key),
+            CandidateSource::Bytes(bytes) => self.resolve_root_bytes(env, key, bytes),
         }
         .map_err(into_linker_error)
     }

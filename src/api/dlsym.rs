@@ -28,10 +28,9 @@ pub unsafe extern "C" fn dlsym(handle: *const c_void, symbol_name: *const c_char
         unsafe { dlsym_next::<()>(name).ok().map(|s| s.into_raw()) }
     } else {
         let lib = unsafe { &*(handle as *const crate::ElfLibrary) };
-        let symbol = find_symbol::<()>(&lib.deps, name)
+        find_symbol::<()>(&lib.deps, name)
             .ok()
-            .map(|sym| sym.into_raw());
-        symbol
+            .map(|sym| sym.into_raw())
     };
     sym.unwrap_or(null()).cast()
 }

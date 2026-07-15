@@ -41,7 +41,7 @@ default-features = false
 features = ["default-hasher"]
 
 [dependencies.elf_loader]
-version = "0.16.0"
+git = "https://github.com/weizhiao/Relink.git"
 default-features = false
 features = ["log", "full"]
 

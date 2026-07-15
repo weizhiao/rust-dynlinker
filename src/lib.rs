@@ -55,9 +55,10 @@ pub use runtime::rtld;
 use bitflags::bitflags;
 
 pub use crate::abi::{elf, memory, relocation};
+pub use crate::api::DlInfo;
 pub use crate::api::dlsym::{dlsym_default, dlsym_next};
 pub use crate::error::Error;
-pub use crate::image::{AsFilename, DlInfo, ElfLibrary};
+pub use crate::image::{AsFilename, ElfLibrary};
 pub use elf_loader::image::Symbol;
 
 #[cfg(not(any(

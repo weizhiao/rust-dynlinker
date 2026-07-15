@@ -351,8 +351,7 @@ checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
 [[package]]
 name = "elf_loader"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f206cef932cfeb7687bc993d4e0df612cb30fe60545457d8d3bbc578696e68"
+source = "git+https://github.com/weizhiao/Relink.git#c44cb5a25d36a988c59c34157c0ef56b0703dc11"
 dependencies = [
  "bitflags 2.13.0",
  "cfg-if",

@@ -5,7 +5,7 @@ use crate::{
     abi::link_map::LinkMap,
     abi::phdr::{CDlPhdrInfo, DlIteratePhdrCallback},
     image::{ExtraData, LoadedDylib},
-    registry::{MANAGER, register_loaded},
+    registry::{DestructorFn, REGISTRY, ThreadAtexitFn, register_thread_destructor},
     runtime::{ARGC, ARGV, ENVP},
 };
 use alloc::{borrow::ToOwned, boxed::Box, ffi::CString, vec::Vec};
@@ -57,7 +57,30 @@ const DT_ADDR_TAGS: &[ElfDynamicTag] = &[
 ];
 
 static ONCE: Once = Once::new();
+static LIBC_THREAD_ATEXIT: Once<ThreadAtexitFn> = Once::new();
 static IS_MUSL: AtomicBool = AtomicBool::new(false);
+
+fn init_libc_thread_atexit(lib: &LoadedDylib) {
+    if LIBC_THREAD_ATEXIT.get().is_some() {
+        return;
+    }
+    if let Some(func) = unsafe { lib.get::<ThreadAtexitFn>("__cxa_thread_atexit_impl") } {
+        LIBC_THREAD_ATEXIT.call_once(|| *func);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __cxa_thread_atexit_impl(
+    func: DestructorFn,
+    arg: *mut c_void,
+    dso_handle: *mut c_void,
+) -> c_int {
+    let Some(thread_atexit) = LIBC_THREAD_ATEXIT.get().copied() else {
+        log::error!("unable to find libc __cxa_thread_atexit_impl");
+        return -1;
+    };
+    unsafe { register_thread_destructor(thread_atexit, func, arg, dso_handle) }
+}
 
 unsafe fn get_r_debug() -> *mut GDBDebug {
     let phdr_addr = get_auxv(AT_PHDR);
@@ -440,6 +463,9 @@ fn iterate_phdr(start: *mut LinkMap, mut f: impl FnMut(IterPhdr)) {
             .flatten();
 
             if let Some(lib) = lib {
+                if is_libc {
+                    init_libc_thread_atexit(&lib);
+                }
                 update_libc_globals(&lib);
 
                 if is_libc && iter_phdr.is_none() {
@@ -492,11 +518,10 @@ unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut 
         lib.name(),
         lib.base().get()
     );
-    register_loaded(
-        lib,
-        OpenFlags::RTLD_NODELETE | OpenFlags::RTLD_GLOBAL,
-        &mut *crate::lock_write!(MANAGER),
-    );
+    let registry = REGISTRY.lock();
+    registry
+        .borrow_mut()
+        .register_loaded(lib, OpenFlags::RTLD_NODELETE | OpenFlags::RTLD_GLOBAL);
     0
 }
 

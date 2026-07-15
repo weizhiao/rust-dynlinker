@@ -1,8 +1,40 @@
 use super::LoadedDylib;
-use crate::{OpenFlags, Result, error::find_symbol_error, registry::MANAGER};
+use crate::{OpenFlags, Result, error::find_symbol_error, registry::REGISTRY};
 use alloc::{format, string::String, sync::Arc};
 use core::{ffi::c_char, fmt::Debug};
-use elf_loader::{elf::ElfPhdr, image::Symbol, memory::VmAddr};
+use elf_loader::{elf::ElfPhdr, image::Symbol, linker::ModuleId, memory::VmAddr};
+
+pub(crate) struct HandleLease {
+    module: ModuleId,
+}
+
+impl HandleLease {
+    #[inline]
+    pub(crate) const fn new(module: ModuleId) -> Self {
+        Self { module }
+    }
+}
+
+impl Drop for HandleLease {
+    fn drop(&mut self) {
+        crate::registry::release_handle(self.module);
+    }
+}
+
+pub(crate) struct LibrarySnapshot {
+    pub(crate) inner: LoadedDylib,
+    _lease: HandleLease,
+}
+
+impl LibrarySnapshot {
+    #[inline]
+    pub(crate) const fn new(inner: LoadedDylib, lease: HandleLease) -> Self {
+        Self {
+            inner,
+            _lease: lease,
+        }
+    }
+}
 
 /// Represents a successfully loaded and relocated dynamic library.
 ///
@@ -12,6 +44,8 @@ pub struct ElfLibrary {
     pub(crate) inner: LoadedDylib,
     /// The flattened dependency scope used by this library.
     pub(crate) deps: Arc<[LoadedDylib]>,
+    // Kept last so image references are released before the lease triggers unloading.
+    _lease: Arc<HandleLease>,
 }
 
 impl Debug for ElfLibrary {
@@ -32,6 +66,28 @@ impl DylibExt for LoadedDylib {
 }
 
 #[inline]
+pub(crate) fn contains_addr(lib: &LoadedDylib, addr: usize) -> bool {
+    lib.segments().contains_addr(VmAddr::new(addr))
+}
+
+#[inline]
+pub(crate) fn mapped_end(lib: &LoadedDylib) -> usize {
+    let base = lib.base().get();
+    lib.segments()
+        .ranges()
+        .iter()
+        .filter_map(|range| {
+            range
+                .offset
+                .get()
+                .checked_add(range.len)
+                .and_then(|end| base.checked_add(end))
+        })
+        .max()
+        .unwrap_or(base)
+}
+
+#[inline]
 pub(crate) fn find_symbol<'lib, T>(
     libs: &'lib [LoadedDylib],
     name: &str,
@@ -43,6 +99,15 @@ pub(crate) fn find_symbol<'lib, T>(
 }
 
 impl ElfLibrary {
+    #[inline]
+    pub(crate) fn new(inner: LoadedDylib, deps: Arc<[LoadedDylib]>, lease: HandleLease) -> Self {
+        Self {
+            inner,
+            deps,
+            _lease: Arc::new(lease),
+        }
+    }
+
     /// Get the name of the dynamic library.
     #[inline]
     pub fn name(&self) -> &str {
@@ -62,7 +127,9 @@ impl ElfLibrary {
 
     /// Get the current flags from the global registry.
     pub fn flags(&self) -> OpenFlags {
-        crate::lock_read!(MANAGER)
+        let registry = REGISTRY.lock();
+        registry
+            .borrow()
             .flags(self.name())
             .unwrap_or(OpenFlags::empty())
     }

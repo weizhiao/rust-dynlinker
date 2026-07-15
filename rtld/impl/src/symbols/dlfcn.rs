@@ -104,7 +104,7 @@ extern "C" fn dlfcn_dlerror() -> *mut c_char {
 }
 
 extern "C" fn dlfcn_dladdr(addr: *const c_void, info: *mut c_void) -> c_int {
-    unsafe { dlopen_rs::rtld::dladdr_raw(addr, info) }
+    unsafe { dlopen_rs::api::dladdr(addr, info.cast()) }
 }
 
 extern "C" fn dlfcn_dladdr1(

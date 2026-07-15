@@ -73,6 +73,9 @@ pub(crate) unsafe fn add_debug_link_map(link_map: *mut LinkMap) {
 
 impl Drop for ExtraData {
     fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        crate::registry::unregister_module_state(&self.state);
+
         if let Some(link_map) = self.link_map.as_ref() {
             let link_map_ptr = core::ptr::addr_of!(**link_map) as *mut LinkMap;
             unsafe {

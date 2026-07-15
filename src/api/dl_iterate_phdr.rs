@@ -1,7 +1,7 @@
 use crate::{
     ElfLibrary, Error, Result,
     abi::phdr::{CDlPhdrInfo, DlIteratePhdrCallback},
-    registry::MANAGER,
+    registry::REGISTRY,
 };
 use alloc::boxed::Box;
 use core::{
@@ -74,24 +74,26 @@ impl ElfLibrary {
     where
         F: FnMut(&DlPhdrInfo) -> Result<()>,
     {
-        let reader = crate::lock_read!(MANAGER);
-        let dlpi_adds = reader.adds();
-        let dlpi_subs = reader.subs();
-        for lib in reader.all_values() {
-            let extra_data = lib.user_data();
-            let phdrs = lib.phdrs().unwrap_or(&[]);
+        let registry = REGISTRY.lock();
+        let (dlpi_adds, dlpi_subs, libraries) = {
+            let mut manager = registry.borrow_mut();
+            (manager.adds(), manager.subs(), manager.library_snapshot())
+        };
+        for lib in &libraries {
+            let extra_data = lib.inner.user_data();
+            let phdrs = lib.inner.phdrs().unwrap_or(&[]);
             if phdrs.is_empty() {
                 continue;
             }
-            let tls_modid = lib.tls().mod_id();
+            let tls_modid = lib.inner.tls().mod_id();
             let tls_data = tls_modid.map(tls_data_ptr).unwrap_or(null_mut());
             let info = DlPhdrInfo {
-                lib_base: lib.base().get(),
+                lib_base: lib.inner.base().get(),
                 lib_name: extra_data
                     .c_name
                     .as_ref()
                     .map(|n| n.as_ptr())
-                    .unwrap_or(b"\0".as_ptr() as _),
+                    .unwrap_or(c"".as_ptr()),
                 phdrs,
                 dlpi_adds,
                 dlpi_subs,
@@ -133,10 +135,8 @@ pub unsafe extern "C" fn dl_iterate_phdr(
         };
         Ok(())
     };
-    if let Err(err) = ElfLibrary::dl_iterate_phdr(f) {
-        if let Error::IteratorPhdrError { err } = err {
-            return *err.downcast::<i32>().unwrap();
-        }
+    if let Err(Error::IteratorPhdrError { err }) = ElfLibrary::dl_iterate_phdr(f) {
+        return *err.downcast::<i32>().unwrap();
     }
     0
 }

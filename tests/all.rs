@@ -3,7 +3,11 @@ mod support;
 use dlopen_rs::{ElfLibrary, OpenFlags};
 use std::env::consts;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{
+    Arc, Barrier, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
 
 const TARGET_DIR: Option<&'static str> = option_env!("CARGO_TARGET_DIR");
 static TARGET_TRIPLE: OnceLock<String> = OnceLock::new();
@@ -66,6 +70,13 @@ fn compile() {
         let libexample = lib_path("libexample.so");
         let _ = std::fs::copy(&libexample, lib_path("libnodelete.so"));
         let _ = std::fs::copy(&libexample, lib_path("libexample_noload.so"));
+        let _ = std::fs::copy(&libexample, lib_path("libunload_handles.so"));
+        let _ = std::fs::copy(&libexample, lib_path("libunload_clone.so"));
+        let _ = std::fs::copy(&libexample, lib_path("libunload_global.so"));
+        let _ = std::fs::copy(&libexample, lib_path("libaddress_lease.so"));
+        let _ = std::fs::copy(&libexample, lib_path("libthread_dtor.so"));
+        let _ = std::fs::copy(&libexample, lib_path("libmulti_open.so"));
+        let _ = std::fs::copy(&libexample, lib_path("libnested_outer.so"));
     });
 }
 
@@ -81,11 +92,17 @@ fn dl_iterate_phdr() {
     compile();
     let path = lib_path("libexample.so");
     let _lib = ElfLibrary::dlopen(path, OpenFlags::RTLD_NOW).unwrap();
+    let mut reentered = false;
     ElfLibrary::dl_iterate_phdr(|info| {
         println!("iterate dynamic library: {}", info.name());
+        if !reentered {
+            let _nested = ElfLibrary::dlopen(lib_path("libexample.so"), OpenFlags::RTLD_NOLOAD)?;
+            reentered = true;
+        }
         Ok(())
     })
     .unwrap();
+    assert!(reentered);
 }
 
 #[test]
@@ -115,6 +132,101 @@ fn rtld_noload() {
     let lib_global =
         ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD | OpenFlags::RTLD_GLOBAL).unwrap();
     assert!(lib_global.flags().contains(OpenFlags::RTLD_GLOBAL));
+}
+
+#[test]
+fn unloads_after_last_dlopen_handle() {
+    compile();
+    let path = lib_path("libunload_handles.so");
+    let first = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
+    let second = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
+
+    drop(first);
+    let probe = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD)
+        .expect("the second handle must keep the object loaded");
+    drop(probe);
+    drop(second);
+
+    assert!(ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD).is_err());
+}
+
+#[test]
+fn concurrent_first_open_shares_one_mapping() {
+    compile();
+    const THREADS: usize = 8;
+    let path = lib_path("libmulti_open.so");
+    let start = Arc::new(Barrier::new(THREADS));
+    let opened = Arc::new(Barrier::new(THREADS + 1));
+    let threads = (0..THREADS)
+        .map(|_| {
+            let path = path.clone();
+            let start = start.clone();
+            let opened = opened.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                let lib = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
+                let base = lib.base();
+                opened.wait();
+                base
+            })
+        })
+        .collect::<Vec<_>>();
+
+    opened.wait();
+    let bases = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(bases.iter().all(|base| *base == bases[0]));
+    assert!(ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD).is_err());
+}
+
+#[test]
+fn constructor_can_recursively_dlopen() {
+    compile();
+    let outer = ElfLibrary::dlopen(lib_path("libnested_outer.so"), OpenFlags::RTLD_NOW).unwrap();
+    let nested_loaded = unsafe {
+        outer
+            .get::<extern "C" fn() -> bool>("nested_init_loaded")
+            .unwrap()
+    };
+    assert!(
+        nested_loaded(),
+        "constructor must see its committed module and recursively load the target"
+    );
+
+    let close_nested = unsafe {
+        outer
+            .get::<unsafe extern "C" fn()>("close_nested_init_handle")
+            .unwrap()
+    };
+    unsafe { close_nested() };
+}
+
+#[test]
+fn cloned_handle_shares_one_dlopen_lease() {
+    compile();
+    let path = lib_path("libunload_clone.so");
+    let handle = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
+    let cloned = handle.clone();
+
+    drop(handle);
+    let probe = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD)
+        .expect("a Rust clone must retain its shared dlopen lease");
+    drop(probe);
+    drop(cloned);
+
+    assert!(ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD).is_err());
+}
+
+#[test]
+fn rtld_global_does_not_prevent_unloading() {
+    compile();
+    let path = lib_path("libunload_global.so");
+    let handle = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW | OpenFlags::RTLD_GLOBAL).unwrap();
+    drop(handle);
+
+    assert!(ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD).is_err());
 }
 
 #[test]
@@ -168,16 +280,27 @@ fn nodelete() {
     let lib_nodelete =
         ElfLibrary::dlopen(&path, OpenFlags::RTLD_LAZY | OpenFlags::RTLD_NODELETE).unwrap();
     assert!(lib_nodelete.flags().contains(OpenFlags::RTLD_NODELETE));
+
+    drop(lib);
+    drop(lib_nodelete);
+    assert!(ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD).is_ok());
 }
 
 #[test]
 fn dladdr() {
     compile();
-    let path = lib_path("libexample.so");
+    let path = lib_path("libaddress_lease.so");
     let lib = ElfLibrary::dlopen(path, OpenFlags::RTLD_NOW).unwrap();
-    let print = unsafe { lib.get::<fn(&str)>("print").unwrap() };
-    let find = ElfLibrary::dladdr(print.into_raw() as usize).unwrap();
+    let print = unsafe { lib.get::<fn(&str)>("print").unwrap() }.into_raw() as usize;
+    let find = ElfLibrary::dladdr(print).unwrap();
     assert!(find.dylib().name() == lib.name());
+
+    drop(lib);
+    let probe = ElfLibrary::dlopen("libaddress_lease.so", OpenFlags::RTLD_NOLOAD)
+        .expect("DlInfo must retain its library lease");
+    drop(probe);
+    drop(find);
+    assert!(ElfLibrary::dlopen("libaddress_lease.so", OpenFlags::RTLD_NOLOAD).is_err());
 }
 
 #[test]
@@ -187,6 +310,51 @@ fn thread_local() {
     let lib = ElfLibrary::dlopen(path, OpenFlags::RTLD_NOW).unwrap();
     let thread_local = unsafe { lib.get::<fn()>("thread_local").unwrap() };
     thread_local();
+}
+
+#[test]
+fn thread_destructor_keeps_library_loaded() {
+    compile();
+    let path = lib_path("libthread_dtor.so");
+    let lib = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
+    let start = unsafe {
+        lib.get::<unsafe extern "C" fn(*const AtomicUsize)>("start_tls_destructor_thread")
+            .unwrap()
+    };
+    let state = AtomicUsize::new(0);
+
+    unsafe { start(&state) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.load(Ordering::Acquire) != 1 {
+        assert!(Instant::now() < deadline, "TLS worker did not start");
+        std::thread::yield_now();
+    }
+
+    drop(lib);
+    let probe = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD)
+        .expect("pending TLS destructor must keep its library loaded");
+    drop(probe);
+
+    state.store(2, Ordering::Release);
+    while state.load(Ordering::Acquire) != 3 {
+        assert!(
+            Instant::now() < deadline,
+            "TLS destructor did not run at thread exit"
+        );
+        std::thread::yield_now();
+    }
+
+    loop {
+        match ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD) {
+            Err(_) => break,
+            Ok(probe) => drop(probe),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "library remained loaded after its TLS destructor"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]

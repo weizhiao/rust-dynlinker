@@ -1,4 +1,4 @@
-use crate::{abi::link_map::LinkMap, image::mapped_end, registry::addr2dso};
+use crate::{abi::link_map::LinkMap, image::mapped_end, registry::loaded_by_addr};
 use core::{
     ffi::{c_int, c_void},
     ptr::null_mut,
@@ -21,14 +21,14 @@ struct DlFindObject {
 /// layout.
 pub unsafe fn dl_find_object(pc: *const c_void, dlfo: *mut c_void) -> c_int {
     let address = pc as usize;
-    let dso = if let Some(dso) = addr2dso(address) {
+    let dso = if let Some(dso) = loaded_by_addr(address) {
         dso
     } else {
         return -1;
     };
 
-    let user_data = dso.inner.user_data();
-    let phdrs = dso.inner.phdrs().unwrap_or(&[]);
+    let user_data = dso.user_data();
+    let phdrs = dso.phdrs().unwrap_or(&[]);
 
     let eh_frame = phdrs
         .iter()
@@ -39,7 +39,7 @@ pub unsafe fn dl_find_object(pc: *const c_void, dlfo: *mut c_void) -> c_int {
     let info = unsafe { &mut *dlfo.cast::<DlFindObject>() };
     info.dlfo_flags = 0;
     info.dlfo_map_start = dso.base().as_mut_ptr();
-    info.dlfo_map_end = mapped_end(&dso.inner) as *mut c_void;
+    info.dlfo_map_end = mapped_end(&dso) as *mut c_void;
     info.dlfo_link_map = user_data
         .link_map
         .as_ref()
@@ -63,12 +63,11 @@ pub unsafe fn dl_find_object(pc: *const c_void, dlfo: *mut c_void) -> c_int {
 }
 
 pub fn dl_find_dso_for_object(addr: *const c_void) -> *mut c_void {
-    let Some(dso) = addr2dso(addr as usize) else {
+    let Some(dso) = loaded_by_addr(addr as usize) else {
         return null_mut();
     };
 
-    dso.inner
-        .user_data()
+    dso.user_data()
         .link_map
         .as_ref()
         .map(|link_map| link_map.as_ref() as *const LinkMap as *mut c_void)
