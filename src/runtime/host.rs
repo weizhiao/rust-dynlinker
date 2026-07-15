@@ -4,7 +4,7 @@ use crate::{
     OpenFlags, Result,
     abi::link_map::LinkMap,
     abi::phdr::{CDlPhdrInfo, DlIteratePhdrCallback},
-    image::{ExtraData, LoadedDylib},
+    library::{ExtraData, LoadedDylib},
     registry::{DestructorFn, REGISTRY, ThreadAtexitFn, register_thread_destructor},
     runtime::{ARGC, ARGV, ENVP},
 };

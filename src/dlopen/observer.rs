@@ -1,7 +1,7 @@
 use crate::{
     OpenFlags,
     abi::link_map::LinkMap,
-    image::{ActiveTlsResolver, ExtraData},
+    library::{ActiveTlsResolver, ExtraData},
     registry::REGISTRY,
     runtime::{ARGC, ARGV, ENVP, debug::add_debug_link_map},
 };

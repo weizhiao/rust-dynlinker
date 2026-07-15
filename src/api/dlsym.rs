@@ -1,6 +1,6 @@
-use crate::{Result, Symbol, error::find_symbol_error};
 use crate::{
-    image::find_symbol,
+    Result, Symbol,
+    error::find_symbol_error,
     registry::{global_find, next_find},
 };
 use core::{
@@ -28,7 +28,7 @@ pub unsafe extern "C" fn dlsym(handle: *const c_void, symbol_name: *const c_char
         unsafe { dlsym_next::<()>(name).ok().map(|s| s.into_raw()) }
     } else {
         let lib = unsafe { &*(handle as *const crate::ElfLibrary) };
-        find_symbol::<()>(&lib.deps, name)
+        unsafe { lib.get::<()>(name) }
             .ok()
             .map(|sym| sym.into_raw())
     };

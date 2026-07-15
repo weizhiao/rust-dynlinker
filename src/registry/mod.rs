@@ -10,6 +10,6 @@ pub(crate) use cxa::{
 };
 pub(crate) use loader_lock::{IdentityLookup, RegistryGuard};
 pub(crate) use manager::{
-    FileIdentity, GlobalLinkContext, GlobalMeta, REGISTRY, destroy_libraries, global_find,
-    libc_compat_aliases, library_by_addr, loaded_by_addr, next_find, release_handle,
+    FileIdentity, GlobalLinkContext, GlobalMeta, ModuleLease, REGISTRY, destroy_libraries,
+    global_find, libc_compat_aliases, library_by_addr, loaded_by_addr, next_find,
 };

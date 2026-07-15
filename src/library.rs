@@ -1,38 +1,106 @@
-use super::LoadedDylib;
-use crate::{OpenFlags, Result, error::find_symbol_error, registry::REGISTRY};
-use alloc::{format, string::String, sync::Arc};
-use core::{ffi::c_char, fmt::Debug};
-use elf_loader::{elf::ElfPhdr, image::Symbol, linker::ModuleId, memory::VmAddr};
+use crate::{
+    OpenFlags, Result,
+    abi::link_map::LinkMap,
+    error::find_symbol_error,
+    registry::{ModuleLease, REGISTRY},
+};
+use alloc::{boxed::Box, ffi::CString, format, string::String, sync::Arc, vec::Vec};
+use core::{
+    ffi::c_char,
+    fmt::Debug,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use elf_loader::{
+    arch::NativeArch,
+    elf::{ElfDyn, ElfPhdr},
+    image::{LoadedCore, Symbol},
+    memory::{HostRegion, VmAddr},
+};
+use spin::Once;
 
-pub(crate) struct HandleLease {
-    module: ModuleId,
+#[cfg(not(feature = "std"))]
+pub type RuntimeLoader = elf_loader::Loader<ExtraData, crate::runtime::rtld::ActiveTlsResolver>;
+
+#[cfg(not(feature = "std"))]
+pub(crate) use crate::runtime::rtld::ActiveTlsResolver;
+#[cfg(feature = "std")]
+pub(crate) use elf_loader::tls::DefaultTlsResolver as ActiveTlsResolver;
+
+#[cfg(not(feature = "std"))]
+pub type ElfDylib =
+    elf_loader::image::RawDynamic<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
+
+pub(crate) type LoadedDylib = LoadedCore<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
+
+const UNLOADING: usize = 1 << (usize::BITS - 1);
+
+#[derive(Default)]
+pub(crate) struct ModuleState {
+    tls_dtors: AtomicUsize,
 }
 
-impl HandleLease {
+impl ModuleState {
+    #[cfg(feature = "std")]
+    pub(crate) fn register_tls_dtor(&self) -> bool {
+        self.tls_dtors
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if state & UNLOADING != 0 || state == UNLOADING - 1 {
+                    None
+                } else {
+                    Some(state + 1)
+                }
+            })
+            .is_ok()
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn unregister_tls_dtor(&self) {
+        let previous = self.tls_dtors.fetch_sub(1, Ordering::Release);
+        debug_assert!(
+            previous > 0 && previous & UNLOADING == 0,
+            "TLS destructor count must have a matching registration"
+        );
+    }
+
     #[inline]
-    pub(crate) const fn new(module: ModuleId) -> Self {
-        Self { module }
+    pub(crate) fn has_tls_dtors(&self) -> bool {
+        self.tls_dtors.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn begin_unload(&self) -> bool {
+        self.tls_dtors
+            .compare_exchange(0, UNLOADING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn cancel_unload(&self) {
+        let result =
+            self.tls_dtors
+                .compare_exchange(UNLOADING, 0, Ordering::Release, Ordering::Relaxed);
+        debug_assert!(result.is_ok(), "only a planned unload can be cancelled");
     }
 }
 
-impl Drop for HandleLease {
-    fn drop(&mut self) {
-        crate::registry::release_handle(self.module);
-    }
+#[derive(Default)]
+pub struct ExtraData {
+    pub(crate) c_name: Option<CString>,
+    pub(crate) link_map: Option<Box<LinkMap>>,
+    pub(crate) needed_libs: Vec<String>,
+    pub(crate) dynamic_table: Option<Box<[ElfDyn]>>,
+    pub(crate) fini: Once<Box<[VmAddr]>>,
+    pub(crate) fini_ran: Arc<AtomicBool>,
+    pub(crate) state: Arc<ModuleState>,
 }
 
-pub(crate) struct LibrarySnapshot {
-    pub(crate) inner: LoadedDylib,
-    _lease: HandleLease,
-}
-
-impl LibrarySnapshot {
-    #[inline]
-    pub(crate) const fn new(inner: LoadedDylib, lease: HandleLease) -> Self {
-        Self {
-            inner,
-            _lease: lease,
-        }
+impl Debug for ExtraData {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("UserData");
+        d.field("c_name", &self.c_name);
+        d.field("link_map", &self.link_map);
+        d.field("needed_libs", &self.needed_libs);
+        d.field("dynamic_table", &self.dynamic_table);
+        d.field("fini", &self.fini.get());
+        d.finish()
     }
 }
 
@@ -44,8 +112,8 @@ pub struct ElfLibrary {
     pub(crate) inner: LoadedDylib,
     /// The flattened dependency scope used by this library.
     pub(crate) deps: Arc<[LoadedDylib]>,
-    // Kept last so image references are released before the lease triggers unloading.
-    _lease: Arc<HandleLease>,
+    // Kept last so loaded library data is released before the lease triggers unloading.
+    _lease: Arc<ModuleLease>,
 }
 
 impl Debug for ElfLibrary {
@@ -56,6 +124,8 @@ impl Debug for ElfLibrary {
 
 pub(crate) trait DylibExt {
     fn needed_libs(&self) -> &[String];
+    fn contains_addr(&self, addr: usize) -> bool;
+    fn mapped_end(&self) -> usize;
 }
 
 impl DylibExt for LoadedDylib {
@@ -63,44 +133,33 @@ impl DylibExt for LoadedDylib {
     fn needed_libs(&self) -> &[String] {
         &self.user_data().needed_libs
     }
-}
 
-#[inline]
-pub(crate) fn contains_addr(lib: &LoadedDylib, addr: usize) -> bool {
-    lib.segments().contains_addr(VmAddr::new(addr))
-}
+    #[inline]
+    fn contains_addr(&self, addr: usize) -> bool {
+        self.segments().contains_addr(VmAddr::new(addr))
+    }
 
-#[inline]
-pub(crate) fn mapped_end(lib: &LoadedDylib) -> usize {
-    let base = lib.base().get();
-    lib.segments()
-        .ranges()
-        .iter()
-        .filter_map(|range| {
-            range
-                .offset
-                .get()
-                .checked_add(range.len)
-                .and_then(|end| base.checked_add(end))
-        })
-        .max()
-        .unwrap_or(base)
-}
-
-#[inline]
-pub(crate) fn find_symbol<'lib, T>(
-    libs: &'lib [LoadedDylib],
-    name: &str,
-) -> Result<Symbol<'lib, T>> {
-    log::info!("Get the symbol [{}] in [{}]", name, libs[0].name());
-    libs.iter()
-        .find_map(|lib| unsafe { lib.get::<T>(name) })
-        .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
+    #[inline]
+    fn mapped_end(&self) -> usize {
+        let base = self.base().get();
+        self.segments()
+            .ranges()
+            .iter()
+            .filter_map(|range| {
+                range
+                    .offset
+                    .get()
+                    .checked_add(range.len)
+                    .and_then(|end| base.checked_add(end))
+            })
+            .max()
+            .unwrap_or(base)
+    }
 }
 
 impl ElfLibrary {
     #[inline]
-    pub(crate) fn new(inner: LoadedDylib, deps: Arc<[LoadedDylib]>, lease: HandleLease) -> Self {
+    pub(crate) fn new(inner: LoadedDylib, deps: Arc<[LoadedDylib]>, lease: ModuleLease) -> Self {
         Self {
             inner,
             deps,
@@ -178,7 +237,11 @@ impl ElfLibrary {
     /// ```
     #[inline]
     pub unsafe fn get<'lib, T>(&'lib self, name: &str) -> Result<Symbol<'lib, T>> {
-        find_symbol(&self.deps, name)
+        log::info!("Get the symbol [{}] in [{}]", name, self.deps[0].name());
+        self.deps
+            .iter()
+            .find_map(|lib| unsafe { lib.get::<T>(name) })
+            .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
     }
 
     /// Load a versioned symbol from the dynamic library.

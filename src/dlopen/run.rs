@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     OpenFlags, Result,
-    image::{ActiveTlsResolver, AsFilename, ElfLibrary, ExtraData},
+    library::{ActiveTlsResolver, AsFilename, ElfLibrary, ExtraData},
     registry::REGISTRY,
     runtime::ENVP,
 };

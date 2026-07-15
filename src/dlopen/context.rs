@@ -1,7 +1,7 @@
 use super::run::get_env;
 use crate::{
     OpenFlags,
-    image::{ElfLibrary, LoadedDylib},
+    library::{ElfLibrary, LoadedDylib},
     registry::{FileIdentity, GlobalLinkContext, GlobalMeta, RegistryGuard, libc_compat_aliases},
 };
 use alloc::{borrow::ToOwned, collections::BTreeMap, rc::Rc, string::String, vec::Vec};
@@ -116,7 +116,7 @@ pub(crate) enum LinkRoot<'bytes> {
     #[cfg(not(feature = "std"))]
     Mapped {
         key: String,
-        raw: crate::image::ElfDylib,
+        raw: crate::library::ElfDylib,
     },
 }
 

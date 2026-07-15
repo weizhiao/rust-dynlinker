@@ -1,5 +1,5 @@
 use crate::abi::debug::{RT_ADD, RT_CONSISTENT, RT_DELETE};
-use crate::{abi::link_map::LinkMap, image::ExtraData};
+use crate::{abi::link_map::LinkMap, library::ExtraData};
 use spin::Mutex;
 
 use core::{

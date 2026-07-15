@@ -1,5 +1,5 @@
 use super::REGISTRY;
-use crate::image::ModuleState;
+use crate::library::ModuleState;
 use alloc::{boxed::Box, sync::Arc, sync::Weak, vec::Vec};
 use core::{
     ffi::{c_int, c_void},

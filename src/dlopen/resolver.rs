@@ -9,7 +9,7 @@ use super::{
 use crate::{
     OpenFlags, Result,
     error::find_lib_error,
-    image::ActiveTlsResolver,
+    library::ActiveTlsResolver,
     registry::{FileIdentity, IdentityLookup},
 };
 use alloc::{

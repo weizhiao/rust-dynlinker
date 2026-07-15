@@ -3,7 +3,7 @@ pub use crate::abi::{auxv, debug, elf, link_map, memory, relocation};
 use crate::{
     OpenFlags, Result,
     dlopen::{LinkRoot, dlopen_impl},
-    image::{ElfLibrary, ExtraData, LoadedDylib},
+    library::{ElfLibrary, ExtraData, LoadedDylib},
     registry::REGISTRY,
     runtime::{ARGC, ARGV, ENVP},
 };
@@ -14,7 +14,7 @@ use elf_loader::Loader as ElfLoader;
 #[doc(hidden)]
 pub use self::tls::{ActiveTlsResolver, RtldTlsOps};
 #[doc(hidden)]
-pub use crate::image::{ElfDylib, RuntimeLoader};
+pub use crate::library::{ElfDylib, RuntimeLoader};
 #[doc(hidden)]
 pub use elf_loader::{
     Result as ElfResult,

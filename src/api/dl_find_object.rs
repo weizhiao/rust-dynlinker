@@ -1,4 +1,4 @@
-use crate::{abi::link_map::LinkMap, image::mapped_end, registry::loaded_by_addr};
+use crate::{abi::link_map::LinkMap, library::DylibExt, registry::loaded_by_addr};
 use core::{
     ffi::{c_int, c_void},
     ptr::null_mut,
@@ -39,7 +39,7 @@ pub unsafe fn dl_find_object(pc: *const c_void, dlfo: *mut c_void) -> c_int {
     let info = unsafe { &mut *dlfo.cast::<DlFindObject>() };
     info.dlfo_flags = 0;
     info.dlfo_map_start = dso.base().as_mut_ptr();
-    info.dlfo_map_end = mapped_end(&dso) as *mut c_void;
+    info.dlfo_map_end = dso.mapped_end() as *mut c_void;
     info.dlfo_link_map = user_data
         .link_map
         .as_ref()

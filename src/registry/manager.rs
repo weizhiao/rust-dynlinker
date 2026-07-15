@@ -1,10 +1,7 @@
 use super::loader_lock::{IdentityIndex, Registry, RegistryGuard};
 use crate::{
     ElfLibrary, OpenFlags,
-    image::{
-        ActiveTlsResolver, DylibExt, ExtraData, HandleLease, LibrarySnapshot, LoadedDylib,
-        contains_addr,
-    },
+    library::{ActiveTlsResolver, DylibExt, ExtraData, LoadedDylib},
 };
 use alloc::{
     borrow::ToOwned, boxed::Box, collections::btree_set::BTreeSet, string::String, sync::Arc, vec,
@@ -34,6 +31,40 @@ pub(crate) struct GlobalMeta {
     pub(crate) flags: OpenFlags,
     pub(crate) direct_open_count: usize,
     pub(crate) pinned: bool,
+}
+
+pub(crate) struct ModuleLease {
+    module: ModuleId,
+}
+
+impl ModuleLease {
+    #[inline]
+    const fn new(module: ModuleId) -> Self {
+        Self { module }
+    }
+}
+
+impl Drop for ModuleLease {
+    fn drop(&mut self) {
+        let registry = REGISTRY.lock();
+        let libraries = registry.release_handle(self.module);
+        destroy_libraries(libraries);
+    }
+}
+
+pub(crate) struct LibrarySnapshot {
+    pub(crate) inner: LoadedDylib,
+    _lease: ModuleLease,
+}
+
+impl LibrarySnapshot {
+    #[inline]
+    const fn new(inner: LoadedDylib, lease: ModuleLease) -> Self {
+        Self {
+            inner,
+            _lease: lease,
+        }
+    }
 }
 
 impl Default for GlobalMeta {
@@ -108,7 +139,7 @@ pub(crate) unsafe fn next_find<'a, T>(addr: usize, name: &str) -> Option<crate::
     registry
         .borrow()
         .all_values()
-        .skip_while(|lib| !contains_addr(lib, addr))
+        .skip_while(|lib| !lib.contains_addr(addr))
         .skip(1)
         .find_map(|lib| unsafe {
             lib.get::<T>(name).map(|sym| {
@@ -325,14 +356,14 @@ impl Manager {
         let id = {
             self.link_ctx.load_order().find(|id| {
                 self.committed(*id)
-                    .is_some_and(|lib| contains_addr(&lib, addr))
+                    .is_some_and(|lib| lib.contains_addr(addr))
             })
         }?;
         self.open_module(id)
     }
 
     pub(crate) fn loaded_by_addr(&self, addr: usize) -> Option<LoadedDylib> {
-        self.all_values().find(|lib| contains_addr(lib, addr))
+        self.all_values().find(|lib| lib.contains_addr(addr))
     }
 
     pub(crate) fn library_snapshot(&mut self) -> Vec<LibrarySnapshot> {
@@ -448,13 +479,13 @@ impl Manager {
         }
     }
 
-    fn acquire_module(&mut self, id: ModuleId) -> Option<HandleLease> {
+    fn acquire_module(&mut self, id: ModuleId) -> Option<ModuleLease> {
         let meta = self.link_ctx.meta_mut(id).ok()?;
         meta.direct_open_count = meta
             .direct_open_count
             .checked_add(1)
             .expect("direct dlopen count overflow");
-        Some(HandleLease::new(id))
+        Some(ModuleLease::new(id))
     }
 
     fn release_handle(&mut self, id: ModuleId, identities: &mut IdentityIndex) -> Vec<LoadedDylib> {
@@ -583,10 +614,4 @@ pub(crate) fn destroy_libraries(libraries: Vec<LoadedDylib>) {
         log::info!("Destroying dylib [{}]", lib.name());
         run_fini(lib);
     }
-}
-
-pub(crate) fn release_handle(module: ModuleId) {
-    let registry = REGISTRY.lock();
-    let libraries = registry.release_handle(module);
-    destroy_libraries(libraries);
 }
