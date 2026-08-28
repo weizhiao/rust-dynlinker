@@ -4,6 +4,7 @@ use core::{
     fmt::Debug,
     ptr::null,
 };
+use elf_loader::image::Module;
 
 pub struct DlInfo {
     dylib: ElfLibrary,
@@ -57,17 +58,12 @@ impl ElfLibrary {
 
 fn find_best_symbol(dylib: &ElfLibrary, addr: usize) -> Option<(Option<&'static str>, usize)> {
     let base = dylib.base().get();
-    let core = unsafe { dylib.inner.core_ref() };
-    let exports = core.exports();
+    let exports = dylib.module().exports();
     let mut best_match = None;
 
-    for symbol in exports.symbols() {
-        if symbol.is_undef()
-            || symbol.st_value() == 0
-            || !symbol.is_ok_bind()
-            || !symbol.is_ok_type()
-        {
-            continue;
+    exports.for_each(&mut |symbol| {
+        if !symbol.is_exported() || symbol.st_value() == 0 {
+            return;
         }
         let start = base + symbol.st_value();
         let end = start + symbol.st_size();
@@ -80,7 +76,7 @@ fn find_best_symbol(dylib: &ElfLibrary, addr: usize) -> Option<(Option<&'static 
                 .map(|name| unsafe { core::mem::transmute(name) });
             best_match = Some((name, start));
         }
-    }
+    });
     best_match
 }
 

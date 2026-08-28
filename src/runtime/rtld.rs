@@ -23,7 +23,7 @@ pub use elf_loader::{
     image::RawExec,
     input::PathBuf,
     memory::VmAddr,
-    tls::{TlsImageSource, TlsIndex, TlsInfo, TlsModuleId, TlsTemplate, TlsTpOffset},
+    tls::{TlsImageSource, TlsIndex, TlsInfo, TlsModuleId, TlsRequest, TlsTpOffset},
 };
 
 #[doc(hidden)]
@@ -40,7 +40,7 @@ pub fn tls_get_addr_soft(mod_id: TlsModuleId) -> *mut u8 {
 pub fn new_loader() -> RuntimeLoader {
     ElfLoader::new()
         .with_data::<ExtraData>()
-        .with_tls_resolver::<ActiveTlsResolver>()
+        .with_tls_resolver(ActiveTlsResolver::default())
         .with_static_tls(true)
 }
 
@@ -60,7 +60,7 @@ pub unsafe fn set_initial_process_state(
 #[doc(hidden)]
 pub fn register_loaded_object(raw: &ElfDylib, flags: OpenFlags) {
     let registry = REGISTRY.lock();
-    let loaded = unsafe { LoadedDylib::from_core(raw.core()) };
+    let loaded = unsafe { LoadedDylib::from_core((**raw).clone()) };
     registry.borrow_mut().register_loaded(loaded, flags);
 }
 
@@ -73,7 +73,9 @@ pub fn link_mapped_root(root_request: &str, raw: ElfDylib, flags: OpenFlags) -> 
         name.rsplit(['/', '\\']).next().unwrap_or(name)
     }
     .to_owned();
-    dlopen_impl(root_request, flags, LinkRoot::Mapped { key: root_key, raw })
+    let library = dlopen_impl(root_request, flags, LinkRoot::Mapped { key: root_key, raw })?;
+    REGISTRY.lock().borrow_mut().register_initial_aliases();
+    Ok(library)
 }
 
 #[doc(hidden)]
@@ -86,7 +88,7 @@ pub unsafe fn handle_link_map(handle: *mut c_void) -> *mut link_map::LinkMap {
     let Some(library) = (unsafe { handle.cast::<ElfLibrary>().as_ref() }) else {
         return core::ptr::null_mut();
     };
-    extra_data_link_map(library.inner.user_data())
+    extra_data_link_map(library.module().user_data())
 }
 
 #[doc(hidden)]
@@ -97,10 +99,13 @@ pub struct StartupLinkMaps {
 
 #[doc(hidden)]
 pub fn startup_link_maps(library: &ElfLibrary, rtld: *mut link_map::LinkMap) -> StartupLinkMaps {
-    let mut maps = Vec::with_capacity(library.deps.len() + 1);
+    let mut maps = Vec::with_capacity(library.scope.len() + 1);
     let mut libc_map = core::ptr::null_mut();
 
-    for dep in library.deps.iter() {
+    for dep in library.scope.iter() {
+        let Some(dep) = dep.downcast_ref::<crate::library::NativeElfModule>() else {
+            continue;
+        };
         let link_map = extra_data_link_map(dep.user_data());
         if link_map.is_null() {
             continue;
@@ -141,17 +146,17 @@ pub unsafe fn find_loaded_symbol<T: Copy>(name: &str) -> Option<T> {
 }
 
 mod tls {
+    use alloc::vec::Vec;
     use elf_loader::{
         Result,
         arch::NativeArch,
-        error::TlsError,
         memory::VmAddr,
         tls::{
-            DefaultTlsResolver, TlsImageSource, TlsIndex, TlsInfo, TlsModuleId, TlsResolver,
-            TlsTpOffset,
+            DefaultTlsResolver, ModuleTls, TlsImageSource, TlsIndex, TlsInfo, TlsModuleId,
+            TlsRequest, TlsResolver, TlsTpOffset,
         },
     };
-    use spin::Once;
+    use spin::{Mutex, Once};
 
     pub type ActiveTlsResolver = RtldTlsResolver;
 
@@ -167,6 +172,7 @@ mod tls {
     }
 
     static RTLD_TLS_OPS: Once<RtldTlsOps> = Once::new();
+    static TLS_MODULES: Mutex<Vec<(TlsModuleId, Option<TlsTpOffset>)>> = Mutex::new(Vec::new());
 
     pub(crate) fn register_ops(ops: RtldTlsOps) {
         RTLD_TLS_OPS.call_once(|| ops);
@@ -182,64 +188,67 @@ mod tls {
         DefaultTlsResolver::get_ptr(mod_id).unwrap_or(core::ptr::null_mut())
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Copy, Debug, Default)]
     pub struct RtldTlsResolver;
+
+    impl RtldTlsResolver {
+        pub const fn new() -> Self {
+            Self
+        }
+    }
 
     impl TlsResolver<NativeArch> for RtldTlsResolver {
         const OVERRIDE_TLS_GET_ADDR: bool = true;
 
-        fn register(tls_info: &TlsInfo) -> Result<TlsModuleId> {
-            if let Some(ops) = RTLD_TLS_OPS.get() {
-                return (ops.register)(tls_info);
-            }
-            <DefaultTlsResolver as TlsResolver<NativeArch>>::register(tls_info)
+        fn register(&self, info: TlsInfo, request: TlsRequest) -> Result<ModuleTls> {
+            let Some(ops) = RTLD_TLS_OPS.get() else {
+                return DefaultTlsResolver::new().register(info, request);
+            };
+            let module = match request {
+                TlsRequest::Dynamic => ModuleTls::Dynamic {
+                    mod_id: (ops.register)(&info)?,
+                },
+                TlsRequest::Static(None) => {
+                    let (mod_id, tp_offset) = (ops.register_static)(&info)?;
+                    ModuleTls::Static { mod_id, tp_offset }
+                }
+                TlsRequest::Static(Some(tp_offset)) => ModuleTls::Static {
+                    mod_id: (ops.add_static_tls)(&info, tp_offset)?,
+                    tp_offset,
+                },
+            };
+            TLS_MODULES
+                .lock()
+                .push((module.mod_id(), module.tp_offset()));
+            Ok(module)
         }
 
-        fn register_static(tls_info: &TlsInfo) -> Result<(TlsModuleId, TlsTpOffset)> {
-            if let Some(ops) = RTLD_TLS_OPS.get() {
-                return (ops.register_static)(tls_info);
-            }
-            Err(TlsError::StaticResolverUnsupported.into())
+        fn publish(&self, source: TlsImageSource, mod_id: TlsModuleId) -> Result<()> {
+            let Some(ops) = RTLD_TLS_OPS.get() else {
+                return DefaultTlsResolver::new().publish(source, mod_id);
+            };
+            let offset = TLS_MODULES
+                .lock()
+                .iter()
+                .find(|(id, _)| *id == mod_id)
+                .and_then(|(_, offset)| *offset);
+            (ops.init_tls)(source, mod_id, offset)
         }
 
-        fn add_static_tls(tls_info: &TlsInfo, offset: TlsTpOffset) -> Result<TlsModuleId> {
+        fn unregister(&self, mod_id: TlsModuleId) {
             if let Some(ops) = RTLD_TLS_OPS.get() {
-                return (ops.add_static_tls)(tls_info, offset);
-            }
-            <DefaultTlsResolver as TlsResolver<NativeArch>>::add_static_tls(tls_info, offset)
-        }
-
-        fn init_tls(
-            source: TlsImageSource,
-            mod_id: TlsModuleId,
-            offset: Option<TlsTpOffset>,
-        ) -> Result<()> {
-            if let Some(ops) = RTLD_TLS_OPS.get() {
-                return (ops.init_tls)(source, mod_id, offset);
-            }
-            <DefaultTlsResolver as TlsResolver<NativeArch>>::init_tls(source, mod_id, offset)
-        }
-
-        fn unregister(mod_id: TlsModuleId) {
-            if let Some(ops) = RTLD_TLS_OPS.get() {
+                TLS_MODULES.lock().retain(|(id, _)| *id != mod_id);
                 (ops.unregister)(mod_id);
                 return;
             }
-            <DefaultTlsResolver as TlsResolver<NativeArch>>::unregister(mod_id);
+            DefaultTlsResolver::new().unregister(mod_id);
         }
 
-        fn bind_tls_get_addr() -> Result<VmAddr> {
+        fn bind_tls_get_addr(&self) -> Result<VmAddr> {
             if let Some(ops) = RTLD_TLS_OPS.get() {
                 return Ok(VmAddr::from_ptr(ops.tls_get_addr as *const ()));
             }
-            <DefaultTlsResolver as TlsResolver<NativeArch>>::bind_tls_get_addr()
-        }
-
-        fn resolve_tls_addr(ti: TlsIndex) -> Result<VmAddr> {
-            if let Some(ops) = RTLD_TLS_OPS.get() {
-                return Ok(VmAddr::from_ptr((ops.tls_get_addr)(&ti)));
-            }
-            <DefaultTlsResolver as TlsResolver<NativeArch>>::resolve_tls_addr(ti)
+            DefaultTlsResolver::new().bind_tls_get_addr()
         }
     }
 }

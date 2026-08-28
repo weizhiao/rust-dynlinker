@@ -1,8 +1,5 @@
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-};
-use core::{any::Any, fmt::Display};
+use alloc::string::{String, ToString};
+use core::fmt::Display;
 
 /// Errors that can occur during dynamic library loading or symbol resolution.
 #[derive(Debug)]
@@ -13,8 +10,6 @@ pub enum Error {
     FindLibError { msg: String },
     /// Failed to find the specified symbol.
     FindSymbolError { msg: String },
-    /// Failed to iterate over program headers.
-    IteratorPhdrError { err: Box<dyn Any> },
     /// Failed to parse the `ld.so.cache`.
     ParseLdCacheError { msg: String },
     /// The provided path is invalid.
@@ -35,7 +30,6 @@ impl Display for Error {
             Error::LoaderError { err } => write!(f, "{err}"),
             Error::FindLibError { msg } => write!(f, "{msg}"),
             Error::FindSymbolError { msg } => write!(f, "{msg}"),
-            Error::IteratorPhdrError { err } => write!(f, "iterator phdr error: {err:?}"),
             Error::ParseLdCacheError { msg } => write!(f, "{msg}"),
             Error::InvalidPath => write!(f, "invalid path"),
             Error::Unsupported => write!(f, "unsupported"),

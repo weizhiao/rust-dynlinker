@@ -8,25 +8,26 @@ pub(crate) struct LdCache {
     data: Box<[u8]>,
     header_offset: usize,
     nlibs: usize,
-    entry_size: usize,
     string_table_offset: usize,
 }
 
-const FLAG_TYPE_MASK: i32 = 0x00ff;
-const FLAG_LIBC6: i32 = 0x0003;
+const HEADER_SIZE: usize = 48;
+const ENTRY_SIZE: usize = 24;
+const FLAG_TYPE_MASK: u32 = 0x00ff;
+const FLAG_LIBC6: u32 = 0x0003;
 
 #[cfg(target_arch = "x86_64")]
-const FLAG_ARCH_CURRENT: i32 = 0x0300;
+const FLAG_ARCH_CURRENT: u32 = 0x0300;
 #[cfg(target_arch = "aarch64")]
-const FLAG_ARCH_CURRENT: i32 = 0x0200;
+const FLAG_ARCH_CURRENT: u32 = 0x0200;
 #[cfg(target_arch = "riscv64")]
-const FLAG_ARCH_CURRENT: i32 = 0x0500;
+const FLAG_ARCH_CURRENT: u32 = 0x0500;
 #[cfg(not(any(
     target_arch = "x86_64",
     target_arch = "aarch64",
     target_arch = "riscv64"
 )))]
-const FLAG_ARCH_CURRENT: i32 = 0x0000;
+const FLAG_ARCH_CURRENT: u32 = 0x0000;
 
 impl LdCache {
     pub fn new() -> Result<Self> {
@@ -41,41 +42,19 @@ impl LdCache {
             ))?;
 
         let header = &buffer[start_offset..];
-        if header.len() < 48 {
+        if header.len() < HEADER_SIZE {
             return Err(parse_ld_cache_error("Cache file too small for header"));
         }
 
         let nlibs = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
-
-        // Try to detect entry size (standard is 24, but can be 32, 64)
-        let mut entry_size = 24;
-        for &e_size in &[24, 32, 64] {
-            let entry_start = 48; // relative to start_offset
-            if entry_start + 12 > header.len() {
-                continue;
-            }
-            let val_idx = u32::from_le_bytes(
-                header[entry_start + 8..entry_start + 12]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let string_table_start = 48 + nlibs * e_size;
-            if string_table_start + val_idx < header.len() {
-                if let Some(s) = extract_str(&header[string_table_start..], val_idx) {
-                    if s.starts_with('/') {
-                        entry_size = e_size;
-                        break;
-                    }
-                }
-            }
+        let string_table_offset = start_offset + HEADER_SIZE + nlibs * ENTRY_SIZE;
+        if string_table_offset > buffer.len() {
+            return Err(parse_ld_cache_error("Cache entries exceed file size"));
         }
-
-        let string_table_offset = start_offset + 48 + nlibs * entry_size;
         let cache = LdCache {
             data: buffer,
             header_offset: start_offset,
             nlibs,
-            entry_size,
             string_table_offset,
         };
         if nlibs > 0 {
@@ -130,11 +109,11 @@ impl LdCache {
                     // Scan forward from the first match
                     let mut i = start;
                     while i < self.nlibs && self.get_name(i) == Some(name) {
-                        if self.check_flags(i) {
-                            if let Some(path) = self.get_path(i) {
-                                log::debug!("LD_CACHE match: {} -> {}", lib_name, path);
-                                return Some(path);
-                            }
+                        if self.check_flags(i)
+                            && let Some(path) = self.get_path(i)
+                        {
+                            log::debug!("LD_CACHE match: {} -> {}", lib_name, path);
+                            return Some(path);
                         }
                         i += 1;
                     }
@@ -150,7 +129,7 @@ impl LdCache {
     }
 
     fn get_name(&self, idx: usize) -> Option<&str> {
-        let entry_offset = self.header_offset + 48 + idx * self.entry_size;
+        let entry_offset = self.header_offset + HEADER_SIZE + idx * ENTRY_SIZE;
         if entry_offset + 8 > self.data.len() {
             return None;
         }
@@ -161,16 +140,17 @@ impl LdCache {
         ) as usize;
 
         // Try relative to header first, then relative to string table
-        if let Some(s) = extract_str(&self.data[self.header_offset..], key_idx) {
-            if !s.is_empty() && !s.starts_with('/') {
-                return Some(s);
-            }
+        if let Some(s) = extract_str(&self.data[self.header_offset..], key_idx)
+            && !s.is_empty()
+            && !s.starts_with('/')
+        {
+            return Some(s);
         }
         extract_str(&self.data[self.string_table_offset..], key_idx)
     }
 
     fn get_path(&self, idx: usize) -> Option<String> {
-        let entry_offset = self.header_offset + 48 + idx * self.entry_size;
+        let entry_offset = self.header_offset + HEADER_SIZE + idx * ENTRY_SIZE;
         if entry_offset + 12 > self.data.len() {
             return None;
         }
@@ -180,31 +160,31 @@ impl LdCache {
                 .unwrap(),
         ) as usize;
 
-        if let Some(s) = extract_str(&self.data[self.header_offset..], val_idx) {
-            if s.starts_with('/') {
-                return Some(String::from(s));
-            }
+        if let Some(s) = extract_str(&self.data[self.header_offset..], val_idx)
+            && s.starts_with('/')
+        {
+            return Some(String::from(s));
         }
         extract_str(&self.data[self.string_table_offset..], val_idx).map(String::from)
     }
 
     fn check_flags(&self, idx: usize) -> bool {
-        let entry_offset = self.header_offset + 48 + idx * self.entry_size;
+        let entry_offset = self.header_offset + HEADER_SIZE + idx * ENTRY_SIZE;
         if entry_offset + 4 > self.data.len() {
             return false;
         }
-        let flags = i32::from_le_bytes(
+        let flags = u32::from_le_bytes(
             self.data[entry_offset..entry_offset + 4]
                 .try_into()
                 .unwrap(),
-        ) as u32;
+        );
 
         // Basic arch and type check
-        if (flags & FLAG_TYPE_MASK as u32) != FLAG_LIBC6 as u32 {
+        if (flags & FLAG_TYPE_MASK) != FLAG_LIBC6 {
             return false;
         }
 
-        if FLAG_ARCH_CURRENT != 0 && (flags & FLAG_ARCH_CURRENT as u32) == 0 {
+        if FLAG_ARCH_CURRENT != 0 && (flags & FLAG_ARCH_CURRENT) == 0 {
             return false;
         }
 

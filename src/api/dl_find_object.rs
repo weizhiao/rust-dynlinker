@@ -1,9 +1,12 @@
-use crate::{abi::link_map::LinkMap, library::DylibExt, registry::loaded_by_addr};
+use crate::{abi::link_map::LinkMap, library::NativeElfModule, registry::loaded_by_addr};
 use core::{
     ffi::{c_int, c_void},
     ptr::null_mut,
 };
-use elf_loader::elf::ElfProgramType;
+use elf_loader::{
+    elf::ElfProgramType,
+    memory::{ImageMemory, VmAddr},
+};
 
 #[repr(C)]
 struct DlFindObject {
@@ -21,25 +24,32 @@ struct DlFindObject {
 /// layout.
 pub unsafe fn dl_find_object(pc: *const c_void, dlfo: *mut c_void) -> c_int {
     let address = pc as usize;
-    let dso = if let Some(dso) = loaded_by_addr(address) {
-        dso
+    let module = if let Some(module) = loaded_by_addr(address) {
+        module
     } else {
         return -1;
     };
+    let dso = module
+        .downcast_ref::<NativeElfModule>()
+        .expect("loaded_by_addr must return an ELF module");
 
     let user_data = dso.user_data();
     let phdrs = dso.phdrs().unwrap_or(&[]);
+    let mapped_range = dso
+        .segments()
+        .range_at(VmAddr::new(address))
+        .expect("loaded_by_addr must return an image containing the address");
 
     let eh_frame = phdrs
         .iter()
         .find(|p| p.program_type() == ElfProgramType::GNU_EH_FRAME)
-        .map(|p| (dso.base() + p.p_vaddr()).get())
+        .map(|p| (dso.segments().base() + p.p_vaddr()).get())
         .unwrap_or(0);
 
     let info = unsafe { &mut *dlfo.cast::<DlFindObject>() };
     info.dlfo_flags = 0;
-    info.dlfo_map_start = dso.base().as_mut_ptr();
-    info.dlfo_map_end = dso.mapped_end() as *mut c_void;
+    info.dlfo_map_start = dso.segments().base().as_mut_ptr();
+    info.dlfo_map_end = mapped_range.end.as_mut_ptr::<c_void>();
     info.dlfo_link_map = user_data
         .link_map
         .as_ref()
@@ -63,9 +73,12 @@ pub unsafe fn dl_find_object(pc: *const c_void, dlfo: *mut c_void) -> c_int {
 }
 
 pub fn dl_find_dso_for_object(addr: *const c_void) -> *mut c_void {
-    let Some(dso) = loaded_by_addr(addr as usize) else {
+    let Some(module) = loaded_by_addr(addr as usize) else {
         return null_mut();
     };
+    let dso = module
+        .downcast_ref::<NativeElfModule>()
+        .expect("loaded_by_addr must return an ELF module");
 
     dso.user_data()
         .link_map

@@ -70,7 +70,7 @@ compile_error!("unsupport arch");
 
 bitflags! {
     /// Flags that control how dynamic libraries are loaded and resolved.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, Default)]
     pub struct OpenFlags:u32{
         /// Symbols in this library are not made available to resolve references in subsequently loaded libraries.
         const RTLD_LOCAL = 0;
@@ -104,10 +104,6 @@ impl OpenFlags {
 
     pub(crate) fn is_noload(&self) -> bool {
         self.contains(OpenFlags::RTLD_NOLOAD)
-    }
-
-    pub(crate) fn is_lazy(&self) -> bool {
-        self.contains(OpenFlags::RTLD_LAZY)
     }
 
     pub(crate) fn is_deepbind(&self) -> bool {

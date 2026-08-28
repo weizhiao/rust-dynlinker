@@ -1,9 +1,8 @@
 use crate::{
-    ElfLibrary, Error, Result,
+    ElfLibrary, Result,
     abi::phdr::{CDlPhdrInfo, DlIteratePhdrCallback},
     registry::REGISTRY,
 };
-use alloc::boxed::Box;
 use core::{
     ffi::{c_char, c_int, c_ulonglong, c_void},
     ptr::null_mut,
@@ -74,36 +73,43 @@ impl ElfLibrary {
     where
         F: FnMut(&DlPhdrInfo) -> Result<()>,
     {
-        let registry = REGISTRY.lock();
-        let (dlpi_adds, dlpi_subs, libraries) = {
-            let mut manager = registry.borrow_mut();
-            (manager.adds(), manager.subs(), manager.library_snapshot())
-        };
-        for lib in &libraries {
-            let extra_data = lib.inner.user_data();
-            let phdrs = lib.inner.phdrs().unwrap_or(&[]);
-            if phdrs.is_empty() {
-                continue;
-            }
-            let tls_modid = lib.inner.tls().mod_id();
-            let tls_data = tls_modid.map(tls_data_ptr).unwrap_or(null_mut());
-            let info = DlPhdrInfo {
-                lib_base: lib.inner.base().get(),
-                lib_name: extra_data
-                    .c_name
-                    .as_ref()
-                    .map(|n| n.as_ptr())
-                    .unwrap_or(c"".as_ptr()),
-                phdrs,
-                dlpi_adds,
-                dlpi_subs,
-                tls_modid: tls_modid.unwrap_or(TlsModuleId::RESERVED).get(),
-                tls_data,
-            };
-            callback(&info)?;
-        }
-        Ok(())
+        for_each_phdr(&mut callback)
     }
+}
+
+fn for_each_phdr<E>(
+    mut callback: impl FnMut(&DlPhdrInfo) -> core::result::Result<(), E>,
+) -> core::result::Result<(), E> {
+    let registry = REGISTRY.lock();
+    let (dlpi_adds, dlpi_subs, libraries) = {
+        let mut manager = registry.borrow_mut();
+        (manager.adds(), manager.subs(), manager.library_snapshot())
+    };
+    for lib in &libraries {
+        let module = lib.module();
+        let extra_data = module.user_data();
+        let phdrs = module.phdrs().unwrap_or(&[]);
+        if phdrs.is_empty() {
+            continue;
+        }
+        let tls_modid = module.tls().map(|tls| tls.mod_id());
+        let tls_data = tls_modid.map(tls_data_ptr).unwrap_or(null_mut());
+        let info = DlPhdrInfo {
+            lib_base: module.segments().base().get(),
+            lib_name: extra_data
+                .c_name
+                .as_ref()
+                .map(|n| n.as_ptr())
+                .unwrap_or(c"".as_ptr()),
+            phdrs,
+            dlpi_adds,
+            dlpi_subs,
+            tls_modid: tls_modid.unwrap_or(TlsModuleId::RESERVED).get(),
+            tls_data,
+        };
+        callback(&info)?;
+    }
+    Ok(())
 }
 
 /// # Safety
@@ -116,7 +122,7 @@ pub unsafe extern "C" fn dl_iterate_phdr(
     let Some(callback) = callback else {
         return 0;
     };
-    let f = |info: &DlPhdrInfo| {
+    let result = for_each_phdr(|info| {
         let mut c_info = CDlPhdrInfo {
             dlpi_addr: info.lib_base,
             dlpi_name: info.lib_name,
@@ -130,13 +136,10 @@ pub unsafe extern "C" fn dl_iterate_phdr(
         unsafe {
             let ret = callback(&mut c_info, size_of::<CDlPhdrInfo>(), data);
             if ret != 0 {
-                return Err(Error::IteratorPhdrError { err: Box::new(ret) });
+                return Err(ret);
             }
         };
         Ok(())
-    };
-    if let Err(Error::IteratorPhdrError { err }) = ElfLibrary::dl_iterate_phdr(f) {
-        return *err.downcast::<i32>().unwrap();
-    }
-    0
+    });
+    result.err().unwrap_or(0)
 }

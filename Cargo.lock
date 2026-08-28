@@ -307,13 +307,10 @@ name = "dlopen-rs"
 version = "0.8.0"
 dependencies = [
  "bitflags 2.13.0",
- "cfg-if",
  "criterion",
  "ctor",
  "elf_loader",
  "env_logger",
- "hashbrown 0.16.1",
- "indexmap",
  "libc",
  "libloading",
  "log",
@@ -351,13 +348,11 @@ checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
 [[package]]
 name = "elf_loader"
 version = "0.16.0"
-source = "git+https://github.com/weizhiao/Relink.git#c44cb5a25d36a988c59c34157c0ef56b0703dc11"
+source = "git+https://github.com/weizhiao/Relink.git#3d2d75358cc98a45ea76be86fa77073f7b84c11c"
 dependencies = [
  "bitflags 2.13.0",
  "cfg-if",
  "elf",
- "foldhash",
- "hashbrown 0.16.1",
  "libc",
  "log",
  "spin",
@@ -389,12 +384,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "equivalent"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
 name = "example_dylib"
 version = "0.1.0"
 
@@ -403,12 +392,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "futures-core"
@@ -443,31 +426,6 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "zerocopy",
-]
-
-[[package]]
-name = "hashbrown"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-dependencies = [
- "foldhash",
-]
-
-[[package]]
-name = "hashbrown"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-
-[[package]]
-name = "indexmap"
-version = "2.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
-dependencies = [
- "equivalent",
- "hashbrown 0.17.1",
 ]
 
 [[package]]

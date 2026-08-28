@@ -16,7 +16,8 @@ use core::{
 };
 use elf_loader::{
     elf::{ElfDyn, ElfDynamicTag, ElfHeader, ElfPhdr, ElfProgramType},
-    memory::VmOffset,
+    image::ElfSegments,
+    memory::{MappedRegion, VmAddr, VmOffset},
     tls::{DefaultTlsResolver, TlsTpOffset},
 };
 use spin::Once;
@@ -56,7 +57,6 @@ const DT_ADDR_TAGS: &[ElfDynamicTag] = &[
     ElfDynamicTag::VERNEED,
 ];
 
-static ONCE: Once = Once::new();
 static LIBC_THREAD_ATEXIT: Once<ThreadAtexitFn> = Once::new();
 static IS_MUSL: AtomicBool = AtomicBool::new(false);
 
@@ -217,7 +217,7 @@ unsafe fn recover_dynamic_table(dynamic_ptr: *const ElfDyn, base: usize) -> Vec<
         })
         .collect::<Vec<_>>();
 
-    for entry in table.iter_mut() {
+    for entry in &mut table {
         if DT_ADDR_TAGS.contains(&entry.tag()) && entry.value() > base {
             let old = entry.value();
             entry.set_value(entry.value() - base);
@@ -285,18 +285,17 @@ unsafe fn from_raw(
     let (phdrs, mut len) = get_phdrs_and_len(base, extra.map(|e| e.0));
     let mut use_phdrs = phdrs;
 
-    if let Some(table) = &user_data.dynamic_table {
-        if let Some(p) = use_phdrs
+    if let Some(table) = &user_data.dynamic_table
+        && let Some(p) = use_phdrs
             .iter_mut()
             .find(|p| p.program_type() == ElfProgramType::DYNAMIC)
-        {
-            let offset = (table.as_ptr() as usize).wrapping_sub(base);
-            p.set_p_vaddr(VmOffset::new(offset));
-        }
+    {
+        let offset = (table.as_ptr() as usize).wrapping_sub(base);
+        p.set_p_vaddr(VmOffset::new(offset));
     }
 
     // Filter out PT_TLS if we don't have tls_data (e.g. from host dl_iterate_phdr with null dlpi_tls_data)
-    if extra.as_ref().map_or(true, |e| e.1.is_none()) {
+    if extra.as_ref().is_none_or(|e| e.1.is_none()) {
         use_phdrs.retain(|p| p.program_type() != ElfProgramType::TLS);
     }
 
@@ -317,12 +316,17 @@ unsafe fn from_raw(
         len
     );
 
+    let segments = ElfSegments::new(
+        unsafe { MappedRegion::local_alias_no_unmap(base as *mut c_void, len) },
+        VmAddr::new(base),
+        VmOffset::new(0),
+    );
     let lib = unsafe {
         LoadedDylib::new_unchecked(
             name_str.clone(),
             use_phdrs,
-            (base as *mut c_void, len),
-            |_ptr, _len| Ok(()),
+            segments,
+            DefaultTlsResolver::new(),
             extra
                 .and_then(|e| e.2)
                 .map(|o| TlsTpOffset::new(-(o as isize))),
@@ -396,46 +400,42 @@ impl Iterator for LinkMapIter {
 
 /// Initializes global variables (ARGC, ARGV, ENVP) from a given library's symbols.
 fn update_libc_globals(lib: &LoadedDylib) {
-    let inner = lib;
     unsafe {
-        if ARGC == 0 {
-            if let Some(s) = inner
+        if ARGC == 0
+            && let Some(s) = lib
                 .get::<*const c_int>("__libc_argc")
-                .or_else(|| inner.get::<*const c_int>("__argc"))
-            {
-                *core::ptr::addr_of_mut!(ARGC) = (**s) as usize;
-            }
+                .or_else(|| lib.get::<*const c_int>("__argc"))
+        {
+            *core::ptr::addr_of_mut!(ARGC) = (**s) as usize;
         }
-        if ARGV.is_null() {
-            if let Some(s) = inner
+        if ARGV.is_null()
+            && let Some(s) = lib
                 .get::<*const *mut c_char>("__libc_argv")
-                .or_else(|| inner.get::<*const *mut c_char>("__argv"))
-            {
-                *core::ptr::addr_of_mut!(ARGV) = *s;
-            }
+                .or_else(|| lib.get::<*const *mut c_char>("__argv"))
+        {
+            *core::ptr::addr_of_mut!(ARGV) = *s;
         }
-        if ENVP.is_null() {
-            if let Some(s) = inner
+        if ENVP.is_null()
+            && let Some(s) = lib
                 .get::<*const *const *const c_char>("environ")
-                .or_else(|| inner.get::<*const *const *const c_char>("__environ"))
-            {
-                *core::ptr::addr_of_mut!(ENVP) = **s;
-            }
+                .or_else(|| lib.get::<*const *const *const c_char>("__environ"))
+        {
+            *core::ptr::addr_of_mut!(ENVP) = **s;
         }
     }
 }
 
-fn iterate_phdr(start: *mut LinkMap, mut f: impl FnMut(IterPhdr)) {
+fn find_iterate_phdr(start: *mut LinkMap) -> Option<IterPhdr> {
     log::info!("iterate_phdr: start={:?}", start);
     if start.is_null() {
         log::warn!("iterate_phdr: start is NULL, skipping initialization");
-        return;
+        return None;
     }
 
     let mut iter_phdr = None;
     for cur_map in (LinkMapIter { current: start }) {
         let name_ptr = if cur_map.l_name.is_null() {
-            b"\0".as_ptr() as *const c_char
+            c"".as_ptr()
         } else {
             cur_map.l_name
         };
@@ -468,17 +468,18 @@ fn iterate_phdr(start: *mut LinkMap, mut f: impl FnMut(IterPhdr)) {
                 }
                 update_libc_globals(&lib);
 
-                if is_libc && iter_phdr.is_none() {
-                    if let Some(iter) = unsafe { lib.get::<IterPhdr>("dl_iterate_phdr") } {
-                        log::info!("iterate_phdr: found [{}] and its dl_iterate_phdr", ns);
-                        iter_phdr = Some(*iter);
-                    }
+                if is_libc
+                    && iter_phdr.is_none()
+                    && let Some(iter) = unsafe { lib.get::<IterPhdr>("dl_iterate_phdr") }
+                {
+                    log::info!("iterate_phdr: found [{}] and its dl_iterate_phdr", ns);
+                    iter_phdr = Some(*iter);
                 }
             }
         }
     }
 
-    f(iter_phdr.expect("iterate_phdr: could not find libc with dl_iterate_phdr"));
+    Some(iter_phdr.expect("iterate_phdr: could not find libc with dl_iterate_phdr"))
 }
 
 unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut c_void) -> c_int {
@@ -516,7 +517,7 @@ unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut 
     log::info!(
         "Initialize lib: [{}] @ [{:#x}]",
         lib.name(),
-        lib.base().get()
+        lib.segments().base().get()
     );
     let registry = REGISTRY.lock();
     registry
@@ -528,13 +529,12 @@ unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut 
 #[ctor::ctor]
 fn init() {
     log::info!("init: starting initialization");
-    ONCE.call_once(|| {
-        if let Some(debug) = get_debug_struct() {
-            init_host_debug(debug);
-            iterate_phdr(debug.map, |iter| {
-                iter(Some(callback), null_mut());
-            });
+    if let Some(debug) = get_debug_struct() {
+        init_host_debug(debug);
+        if let Some(iter) = find_iterate_phdr(debug.map) {
+            iter(Some(callback), null_mut());
         }
-        log::info!("init: initialization complete");
-    });
+        REGISTRY.lock().borrow_mut().register_initial_aliases();
+    }
+    log::info!("init: initialization complete");
 }

@@ -5,7 +5,7 @@ use alloc::{
 use core::{alloc::Layout, ffi::c_void, ptr};
 use dlopen_rs::rtld::{
     self, ElfResult, RtldTlsOps, TlsError, TlsImageSource, TlsIndex, TlsInfo, TlsModuleId,
-    TlsTemplate, TlsTpOffset,
+    TlsTpOffset,
 };
 use spin::Mutex;
 
@@ -405,15 +405,14 @@ fn allocate_dynamic_block(
     }
 
     let source = source?;
-    let mut init = |tls: TlsTemplate<'_>| {
-        let image = tls.image;
+    let mut init = |image: &[u8]| {
         unsafe {
             ptr::copy_nonoverlapping(image.as_ptr(), ptr, image.len());
             ptr::write_bytes(ptr.add(image.len()), 0, info.memsz - image.len());
         }
         Ok(())
     };
-    if source.with_template(&mut init).is_err() {
+    if source.with_image(&mut init).is_err() {
         unsafe { dealloc(ptr, layout) };
         return None;
     }
@@ -517,15 +516,14 @@ unsafe fn init_static_tls_module(tp: *mut u8, module: &StaticTlsModule) {
     let Some(source) = module.source.as_ref() else {
         return;
     };
-    let mut init = |tls: TlsTemplate<'_>| {
-        let image = tls.image;
+    let mut init = |image: &[u8]| {
         unsafe {
             ptr::copy_nonoverlapping(image.as_ptr(), dst, image.len());
             ptr::write_bytes(dst.add(image.len()), 0, module.info.memsz - image.len());
         }
         Ok(())
     };
-    if source.with_template(&mut init).is_err() {
+    if source.with_image(&mut init).is_err() {
         return;
     };
     unsafe { crate::glibc::set_dtv_value(tp, module.id.get(), dst, ptr::null_mut()) };

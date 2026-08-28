@@ -29,21 +29,12 @@ env_logger = "0.11.10"
 [dependencies.spin]
 version = "0.10.0"
 default-features = false
-features = ["rwlock", "lazy", "mutex", "spin_mutex"]
-
-[dependencies.indexmap]
-version = '2.9.0'
-default-features = false
-
-[dependencies.hashbrown]
-version = "0.16.1"
-default-features = false
-features = ["default-hasher"]
+features = ["lazy", "mutex", "spin_mutex"]
 
 [dependencies.elf_loader]
 git = "https://github.com/weizhiao/Relink.git"
 default-features = false
-features = ["log", "full"]
+features = ["log", "lazy-binding"]
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.171", default-features = false, optional = true }
@@ -52,7 +43,6 @@ libc = { version = "0.2.171", default-features = false, optional = true }
 bitflags = "2.6.0"
 log = { version = "0.4.22", default-features = false }
 syscalls = { version = "0.8.1", default-features = false }
-cfg-if = "1.0.0"
 ctor = { workspace = true, optional = true }
 
 [features]

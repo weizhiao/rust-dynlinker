@@ -88,6 +88,16 @@ fn dlopen() {
 }
 
 #[test]
+fn dlopen_from_binary() {
+    compile();
+    let bytes = std::fs::read(lib_path("libexample.so")).unwrap();
+    let lib =
+        ElfLibrary::dlopen_from_binary(&bytes, "libbinary_input.so", OpenFlags::RTLD_NOW).unwrap();
+
+    assert!(unsafe { lib.get::<fn()>("panic") }.is_ok());
+}
+
+#[test]
 fn dl_iterate_phdr() {
     compile();
     let path = lib_path("libexample.so");
@@ -258,7 +268,7 @@ fn soname_alias() {
     let path = lib_path("libpromotion.so");
 
     let lib = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
-    assert_eq!(lib.name(), "libpromotion_soname.so.1");
+    assert_eq!(lib.name(), "libpromotion.so");
 
     let by_soname = ElfLibrary::dlopen(
         "libpromotion_soname.so.1",
@@ -358,25 +368,12 @@ fn thread_destructor_keeps_library_loaded() {
 }
 
 #[test]
-fn linker_script() {
+fn linker_script_is_not_a_runtime_input() {
     compile();
-    let path = lib_path("libexample.so");
-    let lib_dir = PathBuf::from(&path).parent().unwrap().to_path_buf();
-    let script_path = lib_dir.join("test_script.so");
-    std::fs::write(&script_path, format!("GROUP ( {path} )")).unwrap();
+    let path = lib_path("runtime_linker_script.so");
+    std::fs::write(&path, format!("GROUP ( {} )", lib_path("libexample.so"))).unwrap();
 
-    let lib = ElfLibrary::dlopen(script_path.to_str().unwrap(), OpenFlags::RTLD_NOW).unwrap();
-    assert!(lib.name().contains("libexample.so"));
-}
-
-#[test]
-fn linker_script_as_needed() {
-    compile();
-    let path = lib_path("libexample.so");
-    let lib_dir = PathBuf::from(&path).parent().unwrap().to_path_buf();
-    let script_path = lib_dir.join("test_script_as_needed.so");
-    std::fs::write(&script_path, format!("GROUP ( AS_NEEDED ( {path} ) )")).unwrap();
-
-    let lib = ElfLibrary::dlopen(script_path.to_str().unwrap(), OpenFlags::RTLD_NOW).unwrap();
-    assert!(lib.name().contains("libexample.so"));
+    let result = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW);
+    let _ = std::fs::remove_file(path);
+    assert!(result.is_err());
 }

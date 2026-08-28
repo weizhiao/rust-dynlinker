@@ -1,42 +1,7 @@
 //! Serializes registry access while allowing same-thread reentry.
 
-use super::manager::{FileIdentity, Manager};
-use alloc::{collections::BTreeMap, string::String};
+use super::manager::Manager;
 use core::cell::{Ref, RefCell, RefMut};
-
-#[derive(Default)]
-pub(super) struct IdentityIndex {
-    committed: BTreeMap<FileIdentity, String>,
-}
-
-impl IdentityIndex {
-    #[inline]
-    pub(super) fn find(&self, identity: FileIdentity) -> Option<String> {
-        self.committed.get(&identity).cloned()
-    }
-
-    #[inline]
-    pub(super) fn insert(&mut self, identity: FileIdentity, name: String) {
-        self.committed.insert(identity, name);
-    }
-
-    #[inline]
-    pub(super) fn remove(&mut self, identity: FileIdentity) {
-        self.committed.remove(&identity);
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct IdentityLookup<'a> {
-    index: &'a RefCell<IdentityIndex>,
-}
-
-impl IdentityLookup<'_> {
-    #[inline]
-    pub(crate) fn find(self, identity: FileIdentity) -> Option<String> {
-        self.index.borrow().find(identity)
-    }
-}
 
 #[cfg(feature = "std")]
 mod imp {
@@ -214,7 +179,6 @@ use imp::{LoaderGuard, LoaderLock};
 pub(crate) struct Registry {
     loader: LoaderLock,
     manager: RefCell<Manager>,
-    identities: RefCell<IdentityIndex>,
 }
 
 // SAFETY: `loader` serializes access to the registry state across threads on both std and no_std
@@ -225,7 +189,6 @@ unsafe impl Sync for Registry {}
 pub(crate) struct RegistryGuard<'a> {
     _loader: LoaderGuard<'a>,
     manager: &'a RefCell<Manager>,
-    identities: &'a RefCell<IdentityIndex>,
 }
 
 impl Registry {
@@ -233,7 +196,6 @@ impl Registry {
         Self {
             loader: LoaderLock::new(),
             manager: RefCell::new(manager),
-            identities: RefCell::new(IdentityIndex::default()),
         }
     }
 
@@ -242,7 +204,6 @@ impl Registry {
         RegistryGuard {
             _loader: self.loader.lock(),
             manager: &self.manager,
-            identities: &self.identities,
         }
     }
 }
@@ -259,19 +220,6 @@ impl RegistryGuard<'_> {
     pub(crate) fn borrow_mut(&self) -> RefMut<'_, Manager> {
         self.manager.borrow_mut()
     }
-
-    #[inline]
-    pub(crate) fn identity_lookup(&self) -> IdentityLookup<'_> {
-        IdentityLookup {
-            index: self.identities,
-        }
-    }
-
-    #[inline]
-    #[track_caller]
-    pub(super) fn identities_mut(&self) -> RefMut<'_, IdentityIndex> {
-        self.identities.borrow_mut()
-    }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -285,18 +233,24 @@ mod tests {
 
     #[test]
     fn loader_lock_is_reentrant_and_serializes_threads() {
-        let outer = REGISTRY.lock();
-        let inner = REGISTRY.lock();
-        drop(inner);
-
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
         let (started_tx, started_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            start_rx.recv().unwrap();
             started_tx.send(()).unwrap();
             let _guard = REGISTRY.lock();
             acquired_tx.send(Instant::now()).unwrap();
         });
+        ready_rx.recv().unwrap();
 
+        let outer = REGISTRY.lock();
+        let inner = REGISTRY.lock();
+        drop(inner);
+
+        start_tx.send(()).unwrap();
         started_rx.recv().unwrap();
         assert!(
             acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),

@@ -1,21 +1,16 @@
-cfg_if::cfg_if! {
-    if #[cfg(feature = "use-syscall")] {
-        mod linux;
-        pub(crate) use linux::*;
-    } else if #[cfg(all(unix, feature = "std"))] {
-        mod unix;
-        pub(crate) use unix::*;
-    } else {
-        use crate::registry::FileIdentity;
+#[cfg(feature = "use-syscall")]
+mod linux;
+#[cfg(feature = "use-syscall")]
+pub(crate) use linux::read_file;
 
-        pub(crate) fn read_file(_path: &str) -> crate::Result<alloc::boxed::Box<[u8]>> {
-            Err(crate::Error::Unsupported)
-        }
-        pub(crate) fn read_file_limit(_path: &str, _limit: usize) -> crate::Result<alloc::boxed::Box<[u8]>> {
-            Err(crate::Error::Unsupported)
-        }
-        pub(crate) fn get_file_identity(_fd: isize) -> crate::Result<FileIdentity> {
-            Err(crate::Error::Unsupported)
-        }
-    }
+#[cfg(all(not(feature = "use-syscall"), unix, feature = "std"))]
+pub(crate) fn read_file(path: &str) -> crate::Result<alloc::boxed::Box<[u8]>> {
+    std::fs::read(path)
+        .map(Vec::into_boxed_slice)
+        .map_err(crate::Error::from)
+}
+
+#[cfg(not(any(feature = "use-syscall", all(unix, feature = "std"))))]
+pub(crate) fn read_file(_path: &str) -> crate::Result<alloc::boxed::Box<[u8]>> {
+    Err(crate::Error::Unsupported)
 }

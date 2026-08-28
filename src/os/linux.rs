@@ -1,80 +1,8 @@
-use crate::registry::FileIdentity;
 use crate::{Error, Result};
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::string::ToString;
 use alloc::vec::Vec;
-
-#[cfg(target_arch = "x86_64")]
-#[repr(C)]
-struct LinuxStat {
-    st_dev: u64,
-    st_ino: u64,
-    st_nlink: u64,
-    st_mode: u32,
-    st_uid: u32,
-    st_gid: u32,
-    __pad0: u32,
-    st_rdev: u64,
-    st_size: i64,
-    st_blksize: i64,
-    st_blocks: i64,
-    st_atime: i64,
-    st_atime_nsec: i64,
-    st_mtime: i64,
-    st_mtime_nsec: i64,
-    st_ctime: i64,
-    st_ctime_nsec: i64,
-    __unused: [i64; 3],
-}
-
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-#[repr(C)]
-struct LinuxStat {
-    st_dev: u64,
-    st_ino: u64,
-    st_mode: u32,
-    st_nlink: u32,
-    st_uid: u32,
-    st_gid: u32,
-    st_rdev: u64,
-    __pad1: u64,
-    st_size: i64,
-    st_blksize: i32,
-    __pad2: i32,
-    st_blocks: i64,
-    st_atime: i64,
-    st_atime_nsec: u64,
-    st_mtime: i64,
-    st_mtime_nsec: u64,
-    st_ctime: i64,
-    st_ctime_nsec: u64,
-    __unused: [u32; 2],
-}
-
-#[cfg(target_arch = "riscv32")]
-#[repr(C)]
-struct LinuxStat {
-    st_dev: u64,
-    st_ino: u64,
-    st_mode: u32,
-    st_nlink: u32,
-    st_uid: u32,
-    st_gid: u32,
-    st_rdev: u64,
-    __pad1: u64,
-    st_size: i64,
-    st_blksize: i32,
-    __pad2: i32,
-    st_blocks: i64,
-    st_atime: i64,
-    st_atime_nsec: u64,
-    st_mtime: i64,
-    st_mtime_nsec: u64,
-    st_ctime: i64,
-    st_ctime_nsec: u64,
-    __unused: [u32; 2],
-}
 
 impl From<syscalls::Errno> for Error {
     fn from(value: syscalls::Errno) -> Self {
@@ -92,7 +20,7 @@ impl From<syscalls::Errno> for Error {
 fn io_error(message: &'static str) -> Error {
     #[cfg(feature = "std")]
     {
-        Error::IO(std::io::Error::new(std::io::ErrorKind::Other, message))
+        Error::IO(std::io::Error::other(message))
     }
     #[cfg(not(feature = "std"))]
     {
@@ -101,10 +29,6 @@ fn io_error(message: &'static str) -> Error {
 }
 
 pub(crate) fn read_file(path: &str) -> Result<Box<[u8]>> {
-    read_file_limit(path, usize::MAX)
-}
-
-pub(crate) fn read_file_limit(path: &str, limit: usize) -> Result<Box<[u8]>> {
     let mut path_c = Vec::from(path.as_bytes());
     path_c.push(0);
 
@@ -143,20 +67,19 @@ pub(crate) fn read_file_limit(path: &str, limit: usize) -> Result<Box<[u8]>> {
             && unsafe { syscalls::syscall3(syscalls::Sysno::lseek, fd as usize, 0, SEEK_SET) }
                 .is_ok()
         {
-            let read_size = core::cmp::min(file_size, limit);
-            buffer.reserve_exact(read_size);
+            buffer.reserve_exact(file_size);
             unsafe {
-                buffer.set_len(read_size);
+                buffer.set_len(file_size);
             }
             let bytes_read = unsafe {
                 syscalls::syscall3(
                     syscalls::Sysno::read,
                     fd as usize,
                     buffer.as_mut_ptr() as usize,
-                    read_size,
+                    file_size,
                 )?
             };
-            if bytes_read != read_size {
+            if bytes_read != file_size {
                 return Err(io_error("Failed to read complete file"));
             }
         } else {
@@ -166,16 +89,12 @@ pub(crate) fn read_file_limit(path: &str, limit: usize) -> Result<Box<[u8]>> {
             }
             let mut temp = [0u8; 1024];
             loop {
-                let to_read = core::cmp::min(temp.len(), limit - buffer.len());
-                if to_read == 0 {
-                    break;
-                }
                 let bytes_read = unsafe {
                     syscalls::syscall3(
                         syscalls::Sysno::read,
                         fd as usize,
                         temp.as_mut_ptr() as usize,
-                        to_read,
+                        temp.len(),
                     )?
                 };
                 if bytes_read == 0 {
@@ -191,19 +110,4 @@ pub(crate) fn read_file_limit(path: &str, limit: usize) -> Result<Box<[u8]>> {
         let _ = syscalls::syscall1(syscalls::Sysno::close, fd as usize);
     }
     read_result
-}
-
-pub(crate) fn get_file_identity(fd: isize) -> Result<FileIdentity> {
-    let mut stat_buf: LinuxStat = unsafe { core::mem::zeroed() };
-    unsafe {
-        syscalls::syscall2(
-            syscalls::Sysno::fstat,
-            fd as usize,
-            &mut stat_buf as *mut _ as usize,
-        )?;
-    }
-    Ok(FileIdentity {
-        dev: stat_buf.st_dev as u64,
-        ino: stat_buf.st_ino as u64,
-    })
 }

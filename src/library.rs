@@ -4,19 +4,16 @@ use crate::{
     error::find_symbol_error,
     registry::{ModuleLease, REGISTRY},
 };
-use alloc::{boxed::Box, ffi::CString, format, string::String, sync::Arc, vec::Vec};
-use core::{
-    ffi::c_char,
-    fmt::Debug,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use alloc::{boxed::Box, ffi::CString, format, string::String, sync::Arc};
+use core::{ffi::c_char, fmt::Debug};
+#[cfg(feature = "std")]
+use elf_loader::elf::ElfDyn;
 use elf_loader::{
     arch::NativeArch,
-    elf::{ElfDyn, ElfPhdr},
-    image::{LoadedCore, Symbol},
+    elf::ElfPhdr,
+    image::{ElfModule, LoadedCore, ModuleHandle, Symbol},
     memory::{HostRegion, VmAddr},
 };
-use spin::Once;
 
 #[cfg(not(feature = "std"))]
 pub type RuntimeLoader = elf_loader::Loader<ExtraData, crate::runtime::rtld::ActiveTlsResolver>;
@@ -26,70 +23,19 @@ pub(crate) use crate::runtime::rtld::ActiveTlsResolver;
 #[cfg(feature = "std")]
 pub(crate) use elf_loader::tls::DefaultTlsResolver as ActiveTlsResolver;
 
-#[cfg(not(feature = "std"))]
 pub type ElfDylib =
     elf_loader::image::RawDynamic<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
 
 pub(crate) type LoadedDylib = LoadedCore<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
-
-const UNLOADING: usize = 1 << (usize::BITS - 1);
-
-#[derive(Default)]
-pub(crate) struct ModuleState {
-    tls_dtors: AtomicUsize,
-}
-
-impl ModuleState {
-    #[cfg(feature = "std")]
-    pub(crate) fn register_tls_dtor(&self) -> bool {
-        self.tls_dtors
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                if state & UNLOADING != 0 || state == UNLOADING - 1 {
-                    None
-                } else {
-                    Some(state + 1)
-                }
-            })
-            .is_ok()
-    }
-
-    #[cfg(feature = "std")]
-    pub(crate) fn unregister_tls_dtor(&self) {
-        let previous = self.tls_dtors.fetch_sub(1, Ordering::Release);
-        debug_assert!(
-            previous > 0 && previous & UNLOADING == 0,
-            "TLS destructor count must have a matching registration"
-        );
-    }
-
-    #[inline]
-    pub(crate) fn has_tls_dtors(&self) -> bool {
-        self.tls_dtors.load(Ordering::Acquire) != 0
-    }
-
-    pub(crate) fn begin_unload(&self) -> bool {
-        self.tls_dtors
-            .compare_exchange(0, UNLOADING, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    pub(crate) fn cancel_unload(&self) {
-        let result =
-            self.tls_dtors
-                .compare_exchange(UNLOADING, 0, Ordering::Release, Ordering::Relaxed);
-        debug_assert!(result.is_ok(), "only a planned unload can be cancelled");
-    }
-}
+pub(crate) type NativeElfModule = ElfModule<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
+pub(crate) type NativeModuleHandle = ModuleHandle<NativeArch, ActiveTlsResolver>;
 
 #[derive(Default)]
 pub struct ExtraData {
     pub(crate) c_name: Option<CString>,
     pub(crate) link_map: Option<Box<LinkMap>>,
-    pub(crate) needed_libs: Vec<String>,
+    #[cfg(feature = "std")]
     pub(crate) dynamic_table: Option<Box<[ElfDyn]>>,
-    pub(crate) fini: Once<Box<[VmAddr]>>,
-    pub(crate) fini_ran: Arc<AtomicBool>,
-    pub(crate) state: Arc<ModuleState>,
 }
 
 impl Debug for ExtraData {
@@ -97,9 +43,8 @@ impl Debug for ExtraData {
         let mut d = f.debug_struct("UserData");
         d.field("c_name", &self.c_name);
         d.field("link_map", &self.link_map);
-        d.field("needed_libs", &self.needed_libs);
+        #[cfg(feature = "std")]
         d.field("dynamic_table", &self.dynamic_table);
-        d.field("fini", &self.fini.get());
         d.finish()
     }
 }
@@ -109,74 +54,49 @@ impl Debug for ExtraData {
 /// This is the primary interface for interacting with a loaded library.
 #[derive(Clone)]
 pub struct ElfLibrary {
-    pub(crate) inner: LoadedDylib,
-    /// The flattened dependency scope used by this library.
-    pub(crate) deps: Arc<[LoadedDylib]>,
+    /// The local lookup scope, starting with this library itself.
+    pub(crate) scope: Arc<[NativeModuleHandle]>,
     // Kept last so loaded library data is released before the lease triggers unloading.
     _lease: Arc<ModuleLease>,
 }
 
 impl Debug for ElfLibrary {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Dylib").field("inner", &self.inner).finish()
-    }
-}
-
-pub(crate) trait DylibExt {
-    fn needed_libs(&self) -> &[String];
-    fn contains_addr(&self, addr: usize) -> bool;
-    fn mapped_end(&self) -> usize;
-}
-
-impl DylibExt for LoadedDylib {
-    #[inline]
-    fn needed_libs(&self) -> &[String] {
-        &self.user_data().needed_libs
-    }
-
-    #[inline]
-    fn contains_addr(&self, addr: usize) -> bool {
-        self.segments().contains_addr(VmAddr::new(addr))
-    }
-
-    #[inline]
-    fn mapped_end(&self) -> usize {
-        let base = self.base().get();
-        self.segments()
-            .ranges()
-            .iter()
-            .filter_map(|range| {
-                range
-                    .offset
-                    .get()
-                    .checked_add(range.len)
-                    .and_then(|end| base.checked_add(end))
-            })
-            .max()
-            .unwrap_or(base)
+        f.debug_struct("Dylib")
+            .field("name", &self.name())
+            .field("base", &self.base())
+            .finish()
     }
 }
 
 impl ElfLibrary {
     #[inline]
-    pub(crate) fn new(inner: LoadedDylib, deps: Arc<[LoadedDylib]>, lease: ModuleLease) -> Self {
+    pub(crate) fn new(scope: Arc<[NativeModuleHandle]>, lease: ModuleLease) -> Self {
         Self {
-            inner,
-            deps,
+            scope,
             _lease: Arc::new(lease),
         }
+    }
+
+    #[inline]
+    pub(crate) fn module(&self) -> &NativeElfModule {
+        self.scope
+            .first()
+            .expect("library scope must contain its root module")
+            .downcast_ref()
+            .expect("library handle must contain an ELF module")
     }
 
     /// Get the name of the dynamic library.
     #[inline]
     pub fn name(&self) -> &str {
-        self.inner.name()
+        self.module().name()
     }
 
     /// Get the C-style name of the dynamic library.
     #[inline]
     pub fn cname(&self) -> *const c_char {
-        self.inner
+        self.module()
             .user_data()
             .c_name
             .as_ref()
@@ -196,19 +116,13 @@ impl ElfLibrary {
     /// Get the base address of the dynamic library.
     #[inline]
     pub fn base(&self) -> VmAddr {
-        self.inner.base()
+        self.module().segments().base()
     }
 
     /// Get the program headers of the dynamic library.
     #[inline]
     pub fn phdrs(&self) -> Option<&[ElfPhdr]> {
-        self.inner.phdrs()
-    }
-
-    /// Get the names of this object's needed libraries.
-    #[inline]
-    pub fn needed_libs(&self) -> &[String] {
-        self.inner.needed_libs()
+        self.module().phdrs()
     }
 
     /// Get a pointer to a function or static variable by symbol name.
@@ -237,8 +151,8 @@ impl ElfLibrary {
     /// ```
     #[inline]
     pub unsafe fn get<'lib, T>(&'lib self, name: &str) -> Result<Symbol<'lib, T>> {
-        log::info!("Get the symbol [{}] in [{}]", name, self.deps[0].name());
-        self.deps
+        log::info!("Get the symbol [{}] in [{}]", name, self.scope[0].name());
+        self.scope
             .iter()
             .find_map(|lib| unsafe { lib.get::<T>(name) })
             .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
@@ -251,6 +165,9 @@ impl ElfLibrary {
     /// # let lib = ElfLibrary::dlopen("awesome.so", OpenFlags::RTLD_NOW).unwrap();
     /// let symbol = unsafe { lib.get_version::<fn()>("function_name", "1.0").unwrap() };
     /// ```
+    ///
+    /// # Safety
+    /// The caller must specify the correct type for the symbol.
     #[cfg(feature = "version")]
     #[inline]
     pub unsafe fn get_version<'lib, T>(
@@ -258,11 +175,10 @@ impl ElfLibrary {
         name: &str,
         version: &str,
     ) -> Result<Symbol<'lib, T>> {
-        unsafe {
-            self.inner
-                .get_version(name, version)
-                .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
-        }
+        self.scope
+            .iter()
+            .find_map(|lib| unsafe { lib.get_version(name, version) })
+            .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
     }
 }
 
