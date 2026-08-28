@@ -1,13 +1,16 @@
-use super::loader_lock::{Registry, RegistryGuard};
+use super::loader_lock::Registry;
 use crate::{
     ElfLibrary, OpenFlags,
     library::{ActiveTlsResolver, LoadedDylib, NativeElfModule, NativeModuleHandle},
 };
-use alloc::{borrow::ToOwned, sync::Arc, vec::Vec};
+use alloc::{borrow::ToOwned, vec::Vec};
 use elf_loader::{
     arch::NativeArch,
     image::Module,
-    linker::{GraphModule, LinkContext, ModuleId, ModuleLease as NativeModuleLease, UnloadGroup},
+    linker::{
+        GraphModule, LinkContext, LoadResult, ModuleId, ModuleLease as NativeModuleLease,
+        UnloadGroup,
+    },
     memory::VmAddr,
     runtime::DomainId,
 };
@@ -24,6 +27,14 @@ impl ModuleLease {
     #[inline]
     const fn new(inner: NativeModuleLease) -> Self {
         Self { inner: Some(inner) }
+    }
+
+    #[inline]
+    pub(crate) fn id(&self) -> ModuleId {
+        self.inner
+            .as_ref()
+            .expect("live module lease must retain its identity")
+            .id()
     }
 }
 
@@ -127,19 +138,6 @@ pub(crate) fn loaded_by_addr(addr: usize) -> Option<NativeModuleHandle> {
     registry.borrow().module_by_addr(addr)
 }
 
-fn normalized_flags(name: &str, mut flags: OpenFlags) -> OpenFlags {
-    if name.contains("libc")
-        || name.contains("libpthread")
-        || name.contains("libdl")
-        || name.contains("libgcc_s")
-        || name.contains("ld-linux")
-        || name.contains("ld-musl")
-    {
-        flags |= OpenFlags::RTLD_NODELETE;
-    }
-    flags
-}
-
 fn libc_compat_aliases(name: &str) -> &'static [&'static str] {
     match name {
         "libc.so.6" => &[
@@ -160,10 +158,6 @@ impl Manager {
         &mut self.link_ctx
     }
 
-    fn dylib(&self, id: ModuleId) -> Option<&NativeElfModule> {
-        self.link_ctx.module(id).ok()?.downcast_ref()
-    }
-
     fn committed_id(&self, key: &str) -> Option<ModuleId> {
         self.link_ctx.module_id(key)
     }
@@ -179,7 +173,6 @@ impl Manager {
             .downcast_ref::<NativeElfModule>()
             .expect("preloaded handle must contain an ELF module");
         let name = lib.soname().unwrap_or_else(|| lib.name()).to_owned();
-        let flags = normalized_flags(lib.name(), flags);
         let deps = lib
             .needed_libs()
             .iter()
@@ -218,10 +211,8 @@ impl Manager {
             .expect("alias target must remain committed");
     }
 
-    pub(crate) fn flags(&self, name: &str) -> Option<OpenFlags> {
-        self.committed_id(name)
-            .and_then(|id| self.link_ctx.meta(id).ok())
-            .copied()
+    pub(crate) fn flags(&self, id: ModuleId) -> Option<OpenFlags> {
+        self.link_ctx.meta(id).ok().copied()
     }
 
     #[inline]
@@ -249,31 +240,23 @@ impl Manager {
         self.open_module(id)
     }
 
-    pub(crate) fn open_existing(&mut self, name: &str, flags: OpenFlags) -> Option<ElfLibrary> {
-        let id = self.committed_id(name)?;
+    pub(crate) fn open_existing(&mut self, key: &str, flags: OpenFlags) -> Option<ElfLibrary> {
+        let id = self.committed_id(key)?;
         self.promote(id, flags);
         self.open_module(id)
     }
 
     pub(crate) fn library_by_addr(&mut self, addr: usize) -> Option<ElfLibrary> {
-        let id = self.module_id_by_addr(VmAddr::new(addr))?;
+        let id = self.link_ctx.module_id_at(VmAddr::new(addr))?;
         self.open_module(id)
     }
 
     fn module_by_addr(&self, addr: usize) -> Option<NativeModuleHandle> {
-        let id = self.module_id_by_addr(VmAddr::new(addr))?;
+        let id = self.link_ctx.module_id_at(VmAddr::new(addr))?;
         let group = self.link_ctx.load_group(id).ok()?;
         let module = group.scope().first()?.clone();
         module.downcast_ref::<NativeElfModule>()?;
         Some(module)
-    }
-
-    fn module_id_by_addr(&self, addr: VmAddr) -> Option<ModuleId> {
-        self.link_ctx.load_order().find(|id| {
-            self.link_ctx
-                .module(*id)
-                .is_ok_and(|module| module.memory().range_at(addr).is_some())
-        })
     }
 
     pub(crate) fn library_snapshot(&mut self) -> Vec<LibrarySnapshot> {
@@ -292,10 +275,9 @@ impl Manager {
 
     pub(crate) fn open_module(&mut self, id: ModuleId) -> Option<ElfLibrary> {
         let group = self.link_ctx.load_group(id).ok()?;
-        let scope = group.scope().to_vec();
-        scope.first()?.downcast_ref::<NativeElfModule>()?;
+        let scope = group.scope().clone();
         let lease = self.acquire_module(id)?;
-        Some(ElfLibrary::new(Arc::from(scope), lease))
+        Some(ElfLibrary::new(scope, lease))
     }
 
     pub(crate) fn acquire_module(&mut self, id: ModuleId) -> Option<ModuleLease> {
@@ -304,7 +286,7 @@ impl Manager {
 
     #[cfg(feature = "std")]
     pub(crate) fn acquire_module_by_addr(&mut self, addr: usize) -> Option<ModuleLease> {
-        let id = self.module_id_by_addr(VmAddr::new(addr))?;
+        let id = self.link_ctx.module_id_at(VmAddr::new(addr))?;
         self.acquire_module(id)
     }
 
@@ -316,28 +298,16 @@ impl Manager {
         self.subs
     }
 
-    pub(crate) fn prepare_init(&mut self, root: ModuleId, flags: OpenFlags) {
-        if flags.is_global() {
-            self.link_ctx
-                .promote_global(root)
-                .expect("published root must remain committed");
-        }
-    }
-
-    pub(crate) fn commit_published(&mut self, modules: &[ModuleId], flags: OpenFlags) {
-        for &id in modules {
-            let Some(lib) = self.dylib(id) else {
-                continue;
-            };
-            let name = lib.name().to_owned();
+    pub(crate) fn open_load(&mut self, load: LoadResult, flags: OpenFlags) -> ElfLibrary {
+        let (lease, modules) = load.into_parts();
+        for &id in modules.iter() {
             self.adds += 1;
-            let module_flags = normalized_flags(&name, flags);
             *self
                 .link_ctx
                 .meta_mut(id)
-                .expect("published module must have metadata") = module_flags;
+                .expect("published module must have metadata") = flags;
 
-            if module_flags.is_nodelete() {
+            if flags.is_nodelete() {
                 let lease = self
                     .link_ctx
                     .acquire(id)
@@ -347,6 +317,19 @@ impl Manager {
                     .expect("published module must remain committed while pinning");
             }
         }
+
+        if flags.is_global() {
+            self.link_ctx
+                .promote_global(lease.id())
+                .expect("loaded root module must remain committed");
+        }
+
+        let group = self
+            .link_ctx
+            .load_group(lease.id())
+            .expect("linked root module must be registered");
+        let scope = group.scope().clone();
+        ElfLibrary::new(scope, ModuleLease::new(lease))
     }
 
     pub(crate) fn register_initial_aliases(&mut self) {
@@ -393,17 +376,6 @@ impl Manager {
             .release(lease)
             .expect("released module lease must belong to the global context");
         self.subs += unloaded.len() as u64;
-        unloaded
-    }
-}
-
-impl RegistryGuard<'_> {
-    pub(crate) fn release_load(&self, load: elf_loader::linker::LoadResult) -> GlobalUnloadGroup {
-        let mut manager = self.borrow_mut();
-        let unloaded = load
-            .release(manager.context_mut())
-            .expect("load result must belong to the global context");
-        manager.subs += unloaded.len() as u64;
         unloaded
     }
 }

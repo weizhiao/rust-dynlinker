@@ -300,17 +300,17 @@ fn nodelete() {
 fn dladdr() {
     compile();
     let path = lib_path("libaddress_lease.so");
-    let lib = ElfLibrary::dlopen(path, OpenFlags::RTLD_NOW).unwrap();
+    let lib = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
     let print = unsafe { lib.get::<fn(&str)>("print").unwrap() }.into_raw() as usize;
     let find = ElfLibrary::dladdr(print).unwrap();
     assert!(find.dylib().name() == lib.name());
 
     drop(lib);
-    let probe = ElfLibrary::dlopen("libaddress_lease.so", OpenFlags::RTLD_NOLOAD)
+    let probe = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD)
         .expect("DlInfo must retain its library lease");
     drop(probe);
     drop(find);
-    assert!(ElfLibrary::dlopen("libaddress_lease.so", OpenFlags::RTLD_NOLOAD).is_err());
+    assert!(ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD).is_err());
 }
 
 #[test]

@@ -12,7 +12,7 @@ use core::ffi::{c_int, c_void};
 pub use self::dl_find_object::{dl_find_dso_for_object, dl_find_object};
 pub use self::dl_iterate_phdr::dl_iterate_phdr;
 pub use self::dladdr::{DlInfo, dladdr};
-pub use self::dlopen::dlopen;
+pub use self::dlopen::{dlopen, dlopen_with_caller};
 pub use self::dlsym::dlsym;
 
 /// # Safety

@@ -11,7 +11,7 @@ use elf_loader::elf::ElfDyn;
 use elf_loader::{
     arch::NativeArch,
     elf::ElfPhdr,
-    image::{ElfModule, LoadedCore, ModuleHandle, Symbol},
+    image::{ElfModule, LoadedCore, ModuleHandle, ModuleScope, Symbol},
     memory::{HostRegion, VmAddr},
 };
 
@@ -55,9 +55,9 @@ impl Debug for ExtraData {
 #[derive(Clone)]
 pub struct ElfLibrary {
     /// The local lookup scope, starting with this library itself.
-    pub(crate) scope: Arc<[NativeModuleHandle]>,
+    pub(crate) scope: ModuleScope<NativeArch, ActiveTlsResolver>,
     // Kept last so loaded library data is released before the lease triggers unloading.
-    _lease: Arc<ModuleLease>,
+    lease: Arc<ModuleLease>,
 }
 
 impl Debug for ElfLibrary {
@@ -71,10 +71,13 @@ impl Debug for ElfLibrary {
 
 impl ElfLibrary {
     #[inline]
-    pub(crate) fn new(scope: Arc<[NativeModuleHandle]>, lease: ModuleLease) -> Self {
+    pub(crate) fn new(
+        scope: ModuleScope<NativeArch, ActiveTlsResolver>,
+        lease: ModuleLease,
+    ) -> Self {
         Self {
             scope,
-            _lease: Arc::new(lease),
+            lease: Arc::new(lease),
         }
     }
 
@@ -109,7 +112,7 @@ impl ElfLibrary {
         let registry = REGISTRY.lock();
         registry
             .borrow()
-            .flags(self.name())
+            .flags(self.lease.id())
             .unwrap_or(OpenFlags::empty())
     }
 

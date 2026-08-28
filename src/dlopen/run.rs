@@ -13,6 +13,7 @@ use elf_loader::{
     input::{ElfBinary, PathBuf as ElfPath},
     lazy::NativeLazyBinder,
     linker::{Linker, SearchPathResolver},
+    memory::VmAddr,
     relocation::Relocator,
 };
 use spin::Lazy;
@@ -31,15 +32,13 @@ pub(crate) enum LinkRoot<'bytes> {
     },
 }
 
-const fn dlopen_loader() -> DlopenLoader {
-    Loader::new()
-        .with_data::<ExtraData>()
-        .with_tls_resolver(ActiveTlsResolver::new())
-}
+const LOADER: DlopenLoader = Loader::new()
+    .with_data::<ExtraData>()
+    .with_tls_resolver(ActiveTlsResolver::new());
 
-const DLOPEN_LINKER: Linker<NativeArch, DlopenLoader, (), NativeLazyBinder, ActiveTlsResolver> =
+const LINKER: Linker<NativeArch, DlopenLoader, (), NativeLazyBinder, ActiveTlsResolver> =
     Linker::new()
-        .loader(dlopen_loader())
+        .loader(LOADER)
         .relocator(Relocator::new().lazy_binder(NativeLazyBinder::new()));
 
 static LD_CACHE: Lazy<Option<LdCache>> = Lazy::new(|| LdCache::new().ok());
@@ -94,6 +93,20 @@ fn push_platform_default_paths(resolver: &mut SearchPathResolver) {
 )))]
 fn push_platform_default_paths(_resolver: &mut SearchPathResolver) {}
 
+#[inline(always)]
+fn caller_module_address() -> usize {
+    let address: usize;
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("lea {}, [rip]", out(reg) address, options(nostack, nomem));
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("adr {}, .", out(reg) address, options(nostack, nomem));
+        #[cfg(target_arch = "riscv64")]
+        core::arch::asm!("auipc {}, 0", out(reg) address, options(nostack, nomem));
+    }
+    address
+}
+
 pub(super) fn get_env(name: &str) -> Option<&'static str> {
     unsafe {
         let mut cur = ENVP;
@@ -132,18 +145,36 @@ impl ElfLibrary {
     /// let path = "/path/to/library.so";
     /// let lib = ElfLibrary::dlopen(path, OpenFlags::RTLD_LOCAL).expect("Failed to load library");
     /// ```
+    #[inline(always)]
     pub fn dlopen(path: impl AsFilename, flags: OpenFlags) -> Result<ElfLibrary> {
+        let caller = caller_module_address();
         let path = path.as_filename();
-        dlopen_impl(path, flags, LinkRoot::File(path.to_owned()))
+        dlopen_impl(path, flags, LinkRoot::File(path.to_owned()), Some(caller))
+    }
+
+    pub(crate) fn dlopen_from(
+        path: impl AsFilename,
+        flags: OpenFlags,
+        caller: usize,
+    ) -> Result<ElfLibrary> {
+        let path = path.as_filename();
+        dlopen_impl(
+            path,
+            flags,
+            LinkRoot::File(path.to_owned()),
+            (caller != 0).then_some(caller),
+        )
     }
 
     /// Load a shared library from bytes. It is the same as dlopen. However, it can also be used in the no_std environment,
     /// and it will look for dependent libraries in those manually opened dynamic libraries.
+    #[inline(always)]
     pub fn dlopen_from_binary(
         bytes: &[u8],
         path: impl AsFilename,
         flags: OpenFlags,
     ) -> Result<ElfLibrary> {
+        let caller = caller_module_address();
         let path = path.as_filename();
         dlopen_impl(
             path,
@@ -152,6 +183,7 @@ impl ElfLibrary {
                 key: path.to_owned(),
                 bytes,
             },
+            Some(caller),
         )
     }
 }
@@ -160,6 +192,7 @@ pub(crate) fn dlopen_impl<'bytes>(
     request: &str,
     mut flags: OpenFlags,
     root: LinkRoot<'bytes>,
+    caller: Option<usize>,
 ) -> Result<ElfLibrary> {
     let registry = REGISTRY.lock();
     if get_env("LD_BIND_NOW").is_some() {
@@ -169,79 +202,70 @@ pub(crate) fn dlopen_impl<'bytes>(
     log::info!("dlopen: Try to open [{}] with [{:?}] ", request, flags);
 
     if matches!(root, LinkRoot::File(_) | LinkRoot::Binary { .. }) {
-        let name = request.rsplit(['/', '\\']).next().unwrap_or(request);
-        if let Some(lib) = registry.borrow_mut().open_existing(name, flags) {
+        if let Some(lib) = registry.borrow_mut().open_existing(request, flags) {
             log::info!(
-                "dlopen: Found existing library [{}] (canonical name: {})",
-                request,
-                lib.name()
+                "dlopen: Reusing loaded library [{}] for request [{}]",
+                lib.name(),
+                request
             );
             return Ok(lib);
         }
-        if flags.is_noload() {
-            return Err(crate::error::find_lib_error(format!(
-                "can not find file: {request}"
-            )));
-        }
+    }
+    if flags.is_noload() && matches!(root, LinkRoot::Binary { .. }) {
+        return Err(crate::error::find_lib_error(format!(
+            "can not find file: {request}"
+        )));
     }
 
     let mut observer = DlopenObserver::new(flags);
     let root = match root {
         LinkRoot::Binary { key, bytes } => {
-            let mapped_key = key.rsplit(['/', '\\']).next().unwrap_or(&key).to_owned();
-            let loader = dlopen_loader();
-            let raw = loader
+            let raw = LOADER
                 .run()
                 .with_observer(&mut observer)
-                .load_dylib(ElfBinary::owned(key, bytes.to_vec()))?;
+                .load_dylib(ElfBinary::owned(key.clone(), bytes.to_vec()))?;
             LinkRoot::Mapped {
-                key: mapped_key,
+                key,
                 raw: raw.into(),
             }
         }
         root => root,
     };
 
-    let linker = DLOPEN_LINKER.resolver((*SEARCH_PATHS).clone());
-    let mut linker_run = linker.run().with_observer(observer);
-    let prepared = {
-        let mut manager = registry.borrow_mut();
-        match root {
-            LinkRoot::File(path) => {
-                linker_run.prepare_load(manager.context_mut(), ElfPath::from(path))
+    let linker = LINKER.resolver((*SEARCH_PATHS).clone());
+    let mut manager = registry.borrow_mut();
+    let caller = caller.and_then(|addr| manager.context_mut().module_id_at(VmAddr::new(addr)));
+    let mut linker_run = linker.run().with_observer(observer).with_caller(caller);
+    let prepared = match root {
+        LinkRoot::File(path) => {
+            let path = ElfPath::from(path);
+            if flags.is_noload() {
+                let id = linker_run
+                    .resolve_committed(manager.context_mut(), path)?
+                    .ok_or_else(|| {
+                        crate::error::find_lib_error(format!("can not find file: {request}"))
+                    })?;
+                manager.promote(id, flags);
+                return Ok(manager
+                    .open_module(id)
+                    .expect("resolved module must remain committed"));
             }
-            LinkRoot::Binary { .. } => unreachable!("binary roots are mapped before linking"),
-            LinkRoot::Mapped { key, raw } => {
-                linker_run.prepare_mapped_root(manager.context_mut(), key.into(), raw)
-            }
+            linker_run.prepare_load(manager.context_mut(), path)
+        }
+        LinkRoot::Binary { .. } => unreachable!("binary roots are mapped before linking"),
+        LinkRoot::Mapped { key, raw } => {
+            linker_run.prepare_mapped(manager.context_mut(), key.into(), raw)
         }
     }?;
+    drop(manager);
     let relocated = linker_run.relocate(prepared)?;
 
     let published = {
         let mut manager = registry.borrow_mut();
-        relocated.publish(manager.context_mut())
-    }?;
-    {
-        let mut manager = registry.borrow_mut();
-        manager.prepare_init(published.root(), flags);
-        manager.add_alias(
-            published.root(),
-            request.rsplit(['/', '\\']).next().unwrap_or(request),
-        );
-    }
+        relocated.publish(manager.context_mut())?
+    };
     match published.initialize() {
-        Ok(load) => {
-            let library = {
-                let mut manager = registry.borrow_mut();
-                manager.commit_published(load.modules(), flags);
-                manager
-                    .open_module(load.root())
-                    .expect("linked root module must be registered")
-            };
-            drop(registry.release_load(load));
-            Ok(library)
-        }
+        Ok(load) => Ok(registry.borrow_mut().open_load(load, flags)),
         Err(failed) => {
             let error = {
                 let mut manager = registry.borrow_mut();

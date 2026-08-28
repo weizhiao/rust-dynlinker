@@ -73,7 +73,12 @@ pub fn link_mapped_root(root_request: &str, raw: ElfDylib, flags: OpenFlags) -> 
         name.rsplit(['/', '\\']).next().unwrap_or(name)
     }
     .to_owned();
-    let library = dlopen_impl(root_request, flags, LinkRoot::Mapped { key: root_key, raw })?;
+    let library = dlopen_impl(
+        root_request,
+        flags,
+        LinkRoot::Mapped { key: root_key, raw },
+        None,
+    )?;
     REGISTRY.lock().borrow_mut().register_initial_aliases();
     Ok(library)
 }

@@ -69,9 +69,9 @@ static DLFCN_HOOK: DlfcnHook = DlfcnHook {
 extern "C" fn dlfcn_dlopen(
     filename: *const c_char,
     flags: c_int,
-    _caller: *mut c_void,
+    caller: *mut c_void,
 ) -> *mut c_void {
-    unsafe { dlopen_rs::api::dlopen(filename, flags).cast_mut() }
+    unsafe { dlopen_rs::api::dlopen_with_caller(filename, flags, caller).cast_mut() }
 }
 
 extern "C" fn dlfcn_dlclose(handle: *mut c_void) -> c_int {
