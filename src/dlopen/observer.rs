@@ -31,10 +31,17 @@ impl DlopenObserver {
     }
 }
 
-impl LinkerObserver<ExtraData, NativeArch, HostRegion, ActiveTlsResolver> for DlopenObserver {
+impl LinkerObserver<Option<ExtraData>, NativeArch, HostRegion, ActiveTlsResolver>
+    for DlopenObserver
+{
     fn on_relocation(
         &mut self,
-        event: &mut LinkerRelocationEvent<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>,
+        event: &mut LinkerRelocationEvent<
+            Option<ExtraData>,
+            NativeArch,
+            HostRegion,
+            ActiveTlsResolver,
+        >,
     ) -> elf_loader::Result<()> {
         log::debug!("Planning relocation for dylib [{}]", event.raw().name());
         event.set_lookup_order(if self.flags.is_deepbind() {
@@ -49,10 +56,10 @@ impl LinkerObserver<ExtraData, NativeArch, HostRegion, ActiveTlsResolver> for Dl
     }
 }
 
-impl LoadObserver<ExtraData> for DlopenObserver {
+impl LoadObserver<Option<ExtraData>> for DlopenObserver {
     fn on_after_dynamic_load<R: RegionAccess, Tls: TlsResolver<NativeArch>>(
         &mut self,
-        mut event: AfterDynamicLoadEvent<'_, ExtraData, NativeArch, R, Tls>,
+        mut event: AfterDynamicLoadEvent<'_, Option<ExtraData>, NativeArch, R, Tls>,
     ) -> elf_loader::Result<()> {
         let dylib = event.raw_mut();
         let name = dylib.name().to_string();
@@ -101,8 +108,7 @@ impl LoadObserver<ExtraData> for DlopenObserver {
 
         unsafe { add_debug_link_map(link_map.as_mut()) };
         let user_data = dylib.user_data_mut().unwrap();
-        user_data.link_map = Some(link_map);
-        user_data.c_name = Some(c_name);
+        *user_data = Some(ExtraData::new(c_name, link_map));
         Ok(())
     }
 }

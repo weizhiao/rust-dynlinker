@@ -87,7 +87,10 @@ fn for_each_phdr<E>(
     };
     for lib in &libraries {
         let module = lib.module();
-        let extra_data = module.user_data();
+        let extra_data = module
+            .user_data()
+            .as_ref()
+            .expect("loaded module must have extra data");
         let phdrs = module.phdrs().unwrap_or(&[]);
         if phdrs.is_empty() {
             continue;
@@ -96,11 +99,7 @@ fn for_each_phdr<E>(
         let tls_data = tls_modid.map(tls_data_ptr).unwrap_or(null_mut());
         let info = DlPhdrInfo {
             lib_base: module.segments().base().get(),
-            lib_name: extra_data
-                .c_name
-                .as_ref()
-                .map(|n| n.as_ptr())
-                .unwrap_or(c"".as_ptr()),
+            lib_name: extra_data.c_name().as_ptr(),
             phdrs,
             dlpi_adds,
             dlpi_subs,

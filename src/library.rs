@@ -16,7 +16,8 @@ use elf_loader::{
 };
 
 #[cfg(not(feature = "std"))]
-pub type RuntimeLoader = elf_loader::Loader<ExtraData, crate::runtime::rtld::ActiveTlsResolver>;
+pub type RuntimeLoader =
+    elf_loader::Loader<Option<ExtraData>, crate::runtime::rtld::ActiveTlsResolver>;
 
 #[cfg(not(feature = "std"))]
 pub(crate) use crate::runtime::rtld::ActiveTlsResolver;
@@ -24,23 +25,61 @@ pub(crate) use crate::runtime::rtld::ActiveTlsResolver;
 pub(crate) use elf_loader::tls::DefaultTlsResolver as ActiveTlsResolver;
 
 pub type ElfDylib =
-    elf_loader::image::RawDynamic<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
+    elf_loader::image::RawDynamic<Option<ExtraData>, NativeArch, HostRegion, ActiveTlsResolver>;
 
-pub(crate) type LoadedDylib = LoadedCore<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
-pub(crate) type NativeElfModule = ElfModule<ExtraData, NativeArch, HostRegion, ActiveTlsResolver>;
+pub(crate) type LoadedDylib =
+    LoadedCore<Option<ExtraData>, NativeArch, HostRegion, ActiveTlsResolver>;
+pub(crate) type NativeElfModule =
+    ElfModule<Option<ExtraData>, NativeArch, HostRegion, ActiveTlsResolver>;
 pub(crate) type NativeModuleHandle = ModuleHandle<NativeArch, ActiveTlsResolver>;
+pub(crate) type NativeModuleScope = ModuleScope<NativeArch, ActiveTlsResolver>;
 
-#[derive(Default)]
 pub struct ExtraData {
-    pub(crate) c_name: Option<CString>,
-    pub(crate) link_map: Option<Box<LinkMap>>,
+    c_name: CString,
+    link_map: Box<LinkMap>,
     #[cfg(feature = "std")]
-    pub(crate) dynamic_table: Option<Box<[ElfDyn]>>,
+    dynamic_table: Box<[ElfDyn]>,
+}
+
+impl ExtraData {
+    #[inline]
+    pub(crate) fn new(c_name: CString, link_map: Box<LinkMap>) -> Self {
+        Self {
+            c_name,
+            link_map,
+            #[cfg(feature = "std")]
+            dynamic_table: Box::default(),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn with_dynamic_table(
+        c_name: CString,
+        link_map: Box<LinkMap>,
+        dynamic_table: Box<[ElfDyn]>,
+    ) -> Self {
+        Self {
+            c_name,
+            link_map,
+            dynamic_table,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn c_name(&self) -> &CString {
+        &self.c_name
+    }
+
+    #[inline]
+    pub(crate) fn link_map(&self) -> *mut LinkMap {
+        core::ptr::from_ref(self.link_map.as_ref()).cast_mut()
+    }
 }
 
 impl Debug for ExtraData {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let mut d = f.debug_struct("UserData");
+        let mut d = f.debug_struct("ExtraData");
         d.field("c_name", &self.c_name);
         d.field("link_map", &self.link_map);
         #[cfg(feature = "std")]
@@ -49,15 +88,63 @@ impl Debug for ExtraData {
     }
 }
 
+pub(crate) struct OpenedLibrary {
+    /// The stable dependency group used for local symbol lookup.
+    scope: NativeModuleScope,
+    // Kept last so loaded library data is released before the lease triggers unloading.
+    lease: ModuleLease,
+}
+
+impl OpenedLibrary {
+    #[inline]
+    pub(crate) const fn new(scope: NativeModuleScope, lease: ModuleLease) -> Self {
+        Self { scope, lease }
+    }
+
+    #[inline]
+    pub(crate) const fn scope(&self) -> &NativeModuleScope {
+        &self.scope
+    }
+
+    #[inline]
+    pub(crate) fn module(&self) -> &NativeElfModule {
+        self.scope()
+            .first()
+            .expect("library scope must contain its root module")
+            .downcast_ref()
+            .expect("library handle must contain an ELF module")
+    }
+
+    #[inline]
+    pub(crate) fn link_map(&self) -> *mut LinkMap {
+        self.module()
+            .user_data()
+            .as_ref()
+            .expect("library module must have extra data")
+            .link_map()
+    }
+
+    #[inline]
+    pub(crate) fn into_lease(self) -> ModuleLease {
+        self.lease
+    }
+}
+
 /// Represents a successfully loaded and relocated dynamic library.
 ///
 /// This is the primary interface for interacting with a loaded library.
 #[derive(Clone)]
 pub struct ElfLibrary {
-    /// The local lookup scope, starting with this library itself.
-    pub(crate) scope: ModuleScope<NativeArch, ActiveTlsResolver>,
-    // Kept last so loaded library data is released before the lease triggers unloading.
-    lease: Arc<ModuleLease>,
+    opened: Arc<OpenedLibrary>,
+}
+
+impl From<OpenedLibrary> for ElfLibrary {
+    #[inline]
+    fn from(opened: OpenedLibrary) -> Self {
+        Self {
+            opened: Arc::new(opened),
+        }
+    }
 }
 
 impl Debug for ElfLibrary {
@@ -71,23 +158,13 @@ impl Debug for ElfLibrary {
 
 impl ElfLibrary {
     #[inline]
-    pub(crate) fn new(
-        scope: ModuleScope<NativeArch, ActiveTlsResolver>,
-        lease: ModuleLease,
-    ) -> Self {
-        Self {
-            scope,
-            lease: Arc::new(lease),
-        }
+    pub(crate) fn scope(&self) -> &NativeModuleScope {
+        self.opened.scope()
     }
 
     #[inline]
     pub(crate) fn module(&self) -> &NativeElfModule {
-        self.scope
-            .first()
-            .expect("library scope must contain its root module")
-            .downcast_ref()
-            .expect("library handle must contain an ELF module")
+        self.opened.module()
     }
 
     /// Get the name of the dynamic library.
@@ -101,10 +178,10 @@ impl ElfLibrary {
     pub fn cname(&self) -> *const c_char {
         self.module()
             .user_data()
-            .c_name
             .as_ref()
-            .map(|n| n.as_ptr())
-            .unwrap_or(core::ptr::null())
+            .expect("library module must have extra data")
+            .c_name()
+            .as_ptr()
     }
 
     /// Get the current flags from the global registry.
@@ -112,7 +189,7 @@ impl ElfLibrary {
         let registry = REGISTRY.lock();
         registry
             .borrow()
-            .flags(self.lease.id())
+            .flags(self.opened.lease.id())
             .unwrap_or(OpenFlags::empty())
     }
 
@@ -154,8 +231,8 @@ impl ElfLibrary {
     /// ```
     #[inline]
     pub unsafe fn get<'lib, T>(&'lib self, name: &str) -> Result<Symbol<'lib, T>> {
-        log::info!("Get the symbol [{}] in [{}]", name, self.scope[0].name());
-        self.scope
+        log::info!("Get the symbol [{}] in [{}]", name, self.scope()[0].name());
+        self.scope()
             .iter()
             .find_map(|lib| unsafe { lib.get::<T>(name) })
             .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
@@ -178,7 +255,7 @@ impl ElfLibrary {
         name: &str,
         version: &str,
     ) -> Result<Symbol<'lib, T>> {
-        self.scope
+        self.scope()
             .iter()
             .find_map(|lib| unsafe { lib.get_version(name, version) })
             .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))

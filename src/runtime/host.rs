@@ -251,9 +251,7 @@ unsafe fn from_raw(
         return Ok(None);
     }
 
-    let mut user_data = ExtraData::default();
     let name_str = name.to_string_lossy().into_owned();
-    user_data.c_name = Some(name);
 
     // 1. Initialize LinkMap
     let mut link_map = Box::new(if !host_link_map.is_null() {
@@ -270,27 +268,28 @@ unsafe fn from_raw(
     });
 
     link_map.l_real = link_map.as_mut() as *mut LinkMap;
-    link_map.l_name = user_data.c_name.as_ref().unwrap().as_ptr();
+    link_map.l_name = name.as_ptr();
     link_map.l_next = null_mut();
     link_map.l_prev = null_mut();
-    user_data.link_map = Some(link_map);
 
     // 2. Recover dynamic table (glibc modifies it in place)
-    if !name_str.contains("linux-vdso.so.1") && !IS_MUSL.load(Ordering::Relaxed) {
-        let table = unsafe { recover_dynamic_table(dynamic_ptr, base) };
-        user_data.dynamic_table = Some(table.into_boxed_slice());
-    }
+    let dynamic_table = if !name_str.contains("linux-vdso.so.1") && !IS_MUSL.load(Ordering::Relaxed)
+    {
+        unsafe { recover_dynamic_table(dynamic_ptr, base) }.into_boxed_slice()
+    } else {
+        Box::default()
+    };
 
     // 3. Process phdrs and memory length
     let (phdrs, mut len) = get_phdrs_and_len(base, extra.map(|e| e.0));
     let mut use_phdrs = phdrs;
 
-    if let Some(table) = &user_data.dynamic_table
+    if !dynamic_table.is_empty()
         && let Some(p) = use_phdrs
             .iter_mut()
             .find(|p| p.program_type() == ElfProgramType::DYNAMIC)
     {
-        let offset = (table.as_ptr() as usize).wrapping_sub(base);
+        let offset = (dynamic_table.as_ptr() as usize).wrapping_sub(base);
         p.set_p_vaddr(VmOffset::new(offset));
     }
 
@@ -299,15 +298,15 @@ unsafe fn from_raw(
         use_phdrs.retain(|p| p.program_type() != ElfProgramType::TLS);
     }
 
-    if let Some(link_map) = user_data.link_map.as_mut() {
-        link_map.l_phdr = if use_phdrs.is_empty() {
-            core::ptr::null()
-        } else {
-            use_phdrs.as_ptr().cast()
-        };
-        link_map.l_entry = unsafe { (&*(base as *const ElfHeader)).e_entry() }.wrapping_add(base);
-        link_map.l_phnum = use_phdrs.len().min(u16::MAX as usize) as u16;
-    }
+    link_map.l_phdr = if use_phdrs.is_empty() {
+        core::ptr::null()
+    } else {
+        use_phdrs.as_ptr().cast()
+    };
+    link_map.l_entry = unsafe { (&*(base as *const ElfHeader)).e_entry() }.wrapping_add(base);
+    link_map.l_phnum = use_phdrs.len().min(u16::MAX as usize) as u16;
+
+    let user_data = Some(ExtraData::with_dynamic_table(name, link_map, dynamic_table));
 
     len = (len + 0xfff) & !0xfff; // align to page size
 

@@ -13,15 +13,13 @@
 //! ```no_run
 //! # use dlopen_rs::{ElfLibrary, OpenFlags};
 //!
-//! fn main(){
-//!     let path = "./target/release/libexample.so";
-//!     let libexample = ElfLibrary::dlopen(path, OpenFlags::RTLD_LOCAL | OpenFlags::RTLD_LAZY).unwrap();
+//! let path = "./target/release/libexample.so";
+//! let libexample = ElfLibrary::dlopen(path, OpenFlags::RTLD_LOCAL | OpenFlags::RTLD_LAZY).unwrap();
 //!
-//!     let add = unsafe {
-//!         libexample.get::<fn(i32, i32) -> i32>("add").unwrap()
-//!     };
-//!     println!("{}", add(1,1));
-//! }
+//! let add = unsafe {
+//!     libexample.get::<fn(i32, i32) -> i32>("add").unwrap()
+//! };
+//! println!("{}", add(1,1));
 //! ```
 #![allow(clippy::type_complexity)]
 #![warn(

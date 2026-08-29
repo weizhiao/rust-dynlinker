@@ -1,11 +1,11 @@
 use super::{ld_cache::LdCache, observer::DlopenObserver};
 use crate::{
     OpenFlags, Result,
-    library::{ActiveTlsResolver, AsFilename, ElfLibrary, ExtraData},
+    library::{ActiveTlsResolver, AsFilename, ElfLibrary, ExtraData, OpenedLibrary},
     registry::REGISTRY,
     runtime::ENVP,
 };
-use alloc::{borrow::ToOwned, format, string::String};
+use alloc::{borrow::ToOwned, boxed::Box, format, string::String};
 use core::ffi::CStr;
 use elf_loader::{
     Loader,
@@ -18,9 +18,9 @@ use elf_loader::{
 };
 use spin::Lazy;
 
-type DlopenLoader = Loader<ExtraData, ActiveTlsResolver>;
+type DlopenLoader = Loader<Option<ExtraData>, ActiveTlsResolver>;
 
-pub(crate) enum LinkRoot<'bytes> {
+enum LinkRoot<'bytes> {
     File(String),
     Binary {
         key: String,
@@ -28,12 +28,12 @@ pub(crate) enum LinkRoot<'bytes> {
     },
     Mapped {
         key: String,
-        raw: crate::library::ElfDylib,
+        raw: Box<crate::library::ElfDylib>,
     },
 }
 
 const LOADER: DlopenLoader = Loader::new()
-    .with_data::<ExtraData>()
+    .with_data::<Option<ExtraData>>()
     .with_tls_resolver(ActiveTlsResolver::new());
 
 const LINKER: Linker<NativeArch, DlopenLoader, (), NativeLazyBinder, ActiveTlsResolver> =
@@ -126,14 +126,44 @@ pub(super) fn get_env(name: &str) -> Option<&'static str> {
     None
 }
 
+pub(crate) fn open_main() -> OpenedLibrary {
+    let registry = REGISTRY.lock();
+    registry
+        .borrow_mut()
+        .main_library()
+        .expect("Main executable must be initialized")
+}
+
+pub(crate) fn open_file(
+    path: &str,
+    flags: OpenFlags,
+    caller: Option<usize>,
+) -> Result<OpenedLibrary> {
+    open(path, flags, LinkRoot::File(path.to_owned()), caller)
+}
+
+#[cfg(not(feature = "std"))]
+pub(crate) fn open_mapped(
+    request: &str,
+    key: String,
+    raw: crate::library::ElfDylib,
+    flags: OpenFlags,
+) -> Result<OpenedLibrary> {
+    open(
+        request,
+        flags,
+        LinkRoot::Mapped {
+            key,
+            raw: Box::new(raw),
+        },
+        None,
+    )
+}
+
 impl ElfLibrary {
     /// Get the main executable as an `ElfLibrary`. It is the same as `dlopen(NULL, RTLD_NOW)`.
     pub fn this() -> ElfLibrary {
-        let registry = REGISTRY.lock();
-        registry
-            .borrow_mut()
-            .main_library()
-            .expect("Main executable must be initialized")
+        open_main().into()
     }
 
     /// Load a shared library from a specified path. It is the same as dlopen.
@@ -149,21 +179,7 @@ impl ElfLibrary {
     pub fn dlopen(path: impl AsFilename, flags: OpenFlags) -> Result<ElfLibrary> {
         let caller = caller_module_address();
         let path = path.as_filename();
-        dlopen_impl(path, flags, LinkRoot::File(path.to_owned()), Some(caller))
-    }
-
-    pub(crate) fn dlopen_from(
-        path: impl AsFilename,
-        flags: OpenFlags,
-        caller: usize,
-    ) -> Result<ElfLibrary> {
-        let path = path.as_filename();
-        dlopen_impl(
-            path,
-            flags,
-            LinkRoot::File(path.to_owned()),
-            (caller != 0).then_some(caller),
-        )
+        open_file(path, flags, Some(caller)).map(ElfLibrary::from)
     }
 
     /// Load a shared library from bytes. It is the same as dlopen. However, it can also be used in the no_std environment,
@@ -176,7 +192,7 @@ impl ElfLibrary {
     ) -> Result<ElfLibrary> {
         let caller = caller_module_address();
         let path = path.as_filename();
-        dlopen_impl(
+        open(
             path,
             flags,
             LinkRoot::Binary {
@@ -185,15 +201,16 @@ impl ElfLibrary {
             },
             Some(caller),
         )
+        .map(ElfLibrary::from)
     }
 }
 
-pub(crate) fn dlopen_impl<'bytes>(
+fn open<'bytes>(
     request: &str,
     mut flags: OpenFlags,
     root: LinkRoot<'bytes>,
     caller: Option<usize>,
-) -> Result<ElfLibrary> {
+) -> Result<OpenedLibrary> {
     let registry = REGISTRY.lock();
     if get_env("LD_BIND_NOW").is_some() {
         flags |= OpenFlags::RTLD_NOW;
@@ -201,15 +218,15 @@ pub(crate) fn dlopen_impl<'bytes>(
 
     log::info!("dlopen: Try to open [{}] with [{:?}] ", request, flags);
 
-    if matches!(root, LinkRoot::File(_) | LinkRoot::Binary { .. }) {
-        if let Some(lib) = registry.borrow_mut().open_existing(request, flags) {
-            log::info!(
-                "dlopen: Reusing loaded library [{}] for request [{}]",
-                lib.name(),
-                request
-            );
-            return Ok(lib);
-        }
+    if matches!(root, LinkRoot::File(_) | LinkRoot::Binary { .. })
+        && let Some(lib) = registry.borrow_mut().open_existing(request, flags)
+    {
+        log::info!(
+            "dlopen: Reusing loaded library [{}] for request [{}]",
+            lib.module().name(),
+            request
+        );
+        return Ok(lib);
     }
     if flags.is_noload() && matches!(root, LinkRoot::Binary { .. }) {
         return Err(crate::error::find_lib_error(format!(
@@ -226,7 +243,7 @@ pub(crate) fn dlopen_impl<'bytes>(
                 .load_dylib(ElfBinary::owned(key.clone(), bytes.to_vec()))?;
             LinkRoot::Mapped {
                 key,
-                raw: raw.into(),
+                raw: Box::new(raw.into()),
             }
         }
         root => root,
@@ -254,7 +271,7 @@ pub(crate) fn dlopen_impl<'bytes>(
         }
         LinkRoot::Binary { .. } => unreachable!("binary roots are mapped before linking"),
         LinkRoot::Mapped { key, raw } => {
-            linker_run.prepare_mapped(manager.context_mut(), key.into(), raw)
+            linker_run.prepare_mapped(manager.context_mut(), key.into(), *raw)
         }
     }?;
     drop(manager);

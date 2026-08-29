@@ -12,8 +12,6 @@ pub enum Error {
     FindSymbolError { msg: String },
     /// Failed to parse the `ld.so.cache`.
     ParseLdCacheError { msg: String },
-    /// The provided path is invalid.
-    InvalidPath,
     /// The operation is not supported on the current target or without the required feature.
     Unsupported,
     /// An I/O error occurred.
@@ -31,7 +29,6 @@ impl Display for Error {
             Error::FindLibError { msg } => write!(f, "{msg}"),
             Error::FindSymbolError { msg } => write!(f, "{msg}"),
             Error::ParseLdCacheError { msg } => write!(f, "{msg}"),
-            Error::InvalidPath => write!(f, "invalid path"),
             Error::Unsupported => write!(f, "unsupported"),
             #[cfg(feature = "std")]
             Error::IO(err) => write!(f, "IO error: {err}"),

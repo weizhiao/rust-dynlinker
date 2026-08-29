@@ -1,5 +1,8 @@
-use crate::{ElfLibrary, OpenFlags};
-use alloc::boxed::Box;
+use crate::{
+    OpenFlags,
+    dlopen::{open_file, open_main},
+    registry::register_handle,
+};
 use core::ffi::{CStr, c_char, c_int, c_void};
 
 /// # Safety
@@ -52,18 +55,19 @@ pub unsafe extern "C" fn dlopen_with_caller(
     flags: c_int,
     caller: *const c_void,
 ) -> *const c_void {
-    let lib = if filename.is_null() {
-        ElfLibrary::this()
+    let opened = if filename.is_null() {
+        open_main()
     } else {
         let flags = OpenFlags::from_bits_retain(flags as _);
         let filename = unsafe { CStr::from_ptr(filename) };
         let Ok(path) = filename.to_str() else {
             return core::ptr::null();
         };
-        let Ok(lib) = ElfLibrary::dlopen_from(path, flags, caller as usize) else {
+        let caller = caller as usize;
+        let Ok(opened) = open_file(path, flags, (caller != 0).then_some(caller)) else {
             return core::ptr::null();
         };
-        lib
+        opened
     };
-    Box::into_raw(Box::new(lib)) as _
+    register_handle(opened) as _
 }

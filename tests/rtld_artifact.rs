@@ -1,7 +1,5 @@
 #![cfg(target_arch = "x86_64")]
 
-mod support;
-
 use std::{
     collections::BTreeSet,
     fs,
@@ -148,7 +146,6 @@ fn build_rtld() -> Option<PathBuf> {
         "--target",
         RTLD_TARGET,
     ]);
-    support::apply_local_relink_patch(&mut cmd);
     let output = cmd.output().expect("failed to invoke cargo");
     assert!(
         output.status.success(),

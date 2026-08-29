@@ -1,5 +1,3 @@
-mod support;
-
 use dlopen_rs::{ElfLibrary, OpenFlags};
 use std::env::consts;
 use std::fs;
@@ -52,7 +50,6 @@ fn compile() {
                 .env("CARGO_PROFILE_RELEASE_PANIC", "unwind")
                 .arg("--target")
                 .arg(TARGET_TRIPLE.get().unwrap().as_str());
-            support::apply_local_relink_patch(&mut cmd);
             assert!(
                 cmd.status()
                     .expect("could not compile the test helpers!")
@@ -73,7 +70,7 @@ fn test_symlink_inode_detection() {
 
     // Ensure the library exists and convert to absolute path
     let original_path = fs::canonicalize(&original_path)
-        .expect(&format!("Failed to find library at: {}", original_path));
+        .unwrap_or_else(|_| panic!("Failed to find library at: {original_path}"));
 
     println!("Original library path: {:?}", original_path);
 

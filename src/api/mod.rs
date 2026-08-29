@@ -6,7 +6,6 @@ pub(crate) mod dladdr;
 mod dlopen;
 pub mod dlsym;
 
-use alloc::boxed::Box;
 use core::ffi::{c_int, c_void};
 
 pub use self::dl_find_object::{dl_find_dso_for_object, dl_find_object};
@@ -20,10 +19,12 @@ pub use self::dlsym::dlsym;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dlclose(handle: *const c_void) -> c_int {
     if handle.is_null() {
-        return 0;
+        return -1;
     }
-    let lib = unsafe { Box::from_raw(handle as *mut crate::ElfLibrary) };
-    let name = lib.name();
-    log::info!("dlclose: Closing [{}]", name);
-    0
+    log::info!("dlclose: Closing handle [{handle:p}]");
+    if crate::registry::release_handle(handle as usize) {
+        0
+    } else {
+        -1
+    }
 }

@@ -1,7 +1,6 @@
-mod support;
-
 use dlopen_rs::{ElfLibrary, OpenFlags};
 use std::env::consts;
+use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Barrier, OnceLock,
@@ -59,7 +58,6 @@ fn compile() {
                 .env("CARGO_PROFILE_RELEASE_PANIC", "unwind")
                 .arg("--target")
                 .arg(TARGET_TRIPLE.get().unwrap().as_str());
-            support::apply_local_relink_patch(&mut cmd);
             assert!(
                 cmd.status()
                     .expect("could not compile the test helpers!")
@@ -77,6 +75,7 @@ fn compile() {
         let _ = std::fs::copy(&libexample, lib_path("libthread_dtor.so"));
         let _ = std::fs::copy(&libexample, lib_path("libmulti_open.so"));
         let _ = std::fs::copy(&libexample, lib_path("libnested_outer.so"));
+        let _ = std::fs::copy(&libexample, lib_path("libstable_c_handle.so"));
     });
 }
 
@@ -85,6 +84,44 @@ fn dlopen() {
     compile();
     let path = lib_path("libexample.so");
     assert!(ElfLibrary::dlopen(path, OpenFlags::RTLD_NOW).is_ok());
+}
+
+#[test]
+fn c_dlopen_reuses_stable_handle() {
+    compile();
+    let path = lib_path("libstable_c_handle.so");
+    let filename = CString::new(path.as_str()).unwrap();
+    let flags = OpenFlags::RTLD_NOW.bits() as core::ffi::c_int;
+
+    let first = unsafe { dlopen_rs::api::dlopen(filename.as_ptr(), flags) };
+    let second = unsafe { dlopen_rs::api::dlopen(filename.as_ptr(), flags) };
+    assert!(!first.is_null());
+    assert_eq!(first, second);
+
+    let symbol = CString::new("print").unwrap();
+    assert!(!unsafe { dlopen_rs::api::dlsym(first, symbol.as_ptr()) }.is_null());
+
+    assert_eq!(unsafe { dlopen_rs::api::dlclose(first) }, 0);
+    let probe = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD)
+        .expect("the second C handle must keep the module loaded");
+    drop(probe);
+
+    assert_eq!(unsafe { dlopen_rs::api::dlclose(second) }, 0);
+    assert!(ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOLOAD).is_err());
+}
+
+#[test]
+fn c_dlopen_main_uses_its_load_group() {
+    let flags = OpenFlags::RTLD_NOW.bits() as core::ffi::c_int;
+    let first = unsafe { dlopen_rs::api::dlopen(core::ptr::null(), flags) };
+    let second = unsafe { dlopen_rs::api::dlopen(core::ptr::null(), flags) };
+    assert!(!first.is_null());
+    assert_eq!(first, second);
+
+    let symbol = CString::new("dlopen").unwrap();
+    assert!(!unsafe { dlopen_rs::api::dlsym(first, symbol.as_ptr()) }.is_null());
+    assert_eq!(unsafe { dlopen_rs::api::dlclose(first) }, 0);
+    assert_eq!(unsafe { dlopen_rs::api::dlclose(second) }, 0);
 }
 
 #[test]

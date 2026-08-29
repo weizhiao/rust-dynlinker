@@ -1,9 +1,15 @@
 use super::loader_lock::Registry;
+#[cfg(not(feature = "std"))]
+use crate::abi::link_map::LinkMap;
 use crate::{
     ElfLibrary, OpenFlags,
-    library::{ActiveTlsResolver, LoadedDylib, NativeElfModule, NativeModuleHandle},
+    library::{ActiveTlsResolver, LoadedDylib, NativeElfModule, NativeModuleHandle, OpenedLibrary},
 };
-use alloc::{borrow::ToOwned, vec::Vec};
+use alloc::{
+    borrow::ToOwned,
+    collections::{BTreeMap, btree_map::Entry},
+    vec::Vec,
+};
 use elf_loader::{
     arch::NativeArch,
     image::Module,
@@ -35,6 +41,13 @@ impl ModuleLease {
             .as_ref()
             .expect("live module lease must retain its identity")
             .id()
+    }
+
+    #[inline]
+    fn into_inner(mut self) -> NativeModuleLease {
+        self.inner
+            .take()
+            .expect("live module lease must retain its acquisition")
     }
 }
 
@@ -73,9 +86,16 @@ impl LibrarySnapshot {
     }
 }
 
+struct HandleState {
+    opened: OpenedLibrary,
+    // Each additional C dlopen keeps its own Relink acquisition.
+    extra_leases: Vec<ModuleLease>,
+}
+
 /// The process-wide dynamic-loader registry state.
 pub(crate) struct Manager {
     link_ctx: GlobalLinkContext,
+    handles: BTreeMap<usize, HandleState>,
     adds: u64,
     subs: u64,
 }
@@ -83,6 +103,7 @@ pub(crate) struct Manager {
 pub(crate) static REGISTRY: Lazy<Registry> = Lazy::new(|| {
     Registry::new(Manager {
         link_ctx: LinkContext::new(DomainId::PROCESS),
+        handles: BTreeMap::new(),
         adds: 0,
         subs: 0,
     })
@@ -91,7 +112,9 @@ pub(crate) static REGISTRY: Lazy<Registry> = Lazy::new(|| {
 /// Finds a symbol in the global search scope.
 pub(crate) unsafe fn global_find<'a, T>(name: &str) -> Option<crate::Symbol<'a, T>> {
     let registry = REGISTRY.lock();
-    registry.borrow().global_values().find_map(|lib| unsafe {
+    let manager = registry.borrow();
+    let global = manager.link_ctx.global_scope().modules();
+    global.iter().find_map(|lib| unsafe {
         lib.get::<T>(name).map(|sym| {
             log::trace!(
                 "Lazy Binding: find symbol [{}] from [{}] in global scope ",
@@ -127,15 +150,60 @@ pub(crate) unsafe fn next_find<'a, T>(addr: usize, name: &str) -> Option<crate::
         })
 }
 
+pub(crate) fn register_handle(opened: OpenedLibrary) -> usize {
+    let registry = REGISTRY.lock();
+    registry.borrow_mut().register_handle(opened)
+}
+
+pub(crate) fn release_handle(handle: usize) -> bool {
+    let unloaded = {
+        let registry = REGISTRY.lock();
+        registry.borrow_mut().release_handle(handle)
+    };
+    let valid = unloaded.is_some();
+    drop(unloaded);
+    valid
+}
+
+pub(crate) unsafe fn handle_find<'a, T>(handle: usize, name: &str) -> Option<crate::Symbol<'a, T>> {
+    let registry = REGISTRY.lock();
+    let manager = registry.borrow();
+    manager
+        .handles
+        .get(&handle)?
+        .opened
+        .scope()
+        .iter()
+        .find_map(|module| unsafe {
+            module
+                .get::<T>(name)
+                .map(|symbol| core::mem::transmute(symbol))
+        })
+}
+
+#[cfg(not(feature = "std"))]
+pub(crate) fn handle_link_map(handle: usize) -> Option<*mut LinkMap> {
+    let registry = REGISTRY.lock();
+    let manager = registry.borrow();
+    manager
+        .handles
+        .contains_key(&handle)
+        .then_some(handle as *mut LinkMap)
+}
+
 pub(crate) fn library_by_addr(addr: usize) -> Option<ElfLibrary> {
     log::trace!("library_by_addr: addr [{:#x}]", addr);
-    REGISTRY.lock().borrow_mut().library_by_addr(addr)
+    REGISTRY
+        .lock()
+        .borrow_mut()
+        .library_by_addr(addr)
+        .map(ElfLibrary::from)
 }
 
 pub(crate) fn loaded_by_addr(addr: usize) -> Option<NativeModuleHandle> {
     log::trace!("loaded_by_addr: addr [{:#x}]", addr);
     let registry = REGISTRY.lock();
-    registry.borrow().module_by_addr(addr)
+    registry.borrow_mut().module_by_addr(addr)
 }
 
 fn libc_compat_aliases(name: &str) -> &'static [&'static str] {
@@ -158,8 +226,31 @@ impl Manager {
         &mut self.link_ctx
     }
 
-    fn committed_id(&self, key: &str) -> Option<ModuleId> {
-        self.link_ctx.module_id(key)
+    fn register_handle(&mut self, opened: OpenedLibrary) -> usize {
+        let handle = opened.link_map() as usize;
+        match self.handles.entry(handle) {
+            Entry::Vacant(entry) => {
+                entry.insert(HandleState {
+                    opened,
+                    extra_leases: Vec::new(),
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().extra_leases.push(opened.into_lease());
+            }
+        }
+        handle
+    }
+
+    fn release_handle(&mut self, handle: usize) -> Option<GlobalUnloadGroup> {
+        let lease = match self.handles.entry(handle) {
+            Entry::Vacant(_) => return None,
+            Entry::Occupied(mut entry) => match entry.get_mut().extra_leases.pop() {
+                Some(lease) => lease,
+                None => entry.remove().opened.into_lease(),
+            },
+        };
+        Some(self.release(lease.into_inner()))
     }
 
     /// Registers an object that was loaded before this linker took control.
@@ -176,7 +267,7 @@ impl Manager {
         let deps = lib
             .needed_libs()
             .iter()
-            .filter_map(|needed| self.committed_id(needed))
+            .filter_map(|needed| self.link_ctx.module_id(needed))
             .filter_map(|id| self.link_ctx.module(id).ok())
             .map(|module| module.state().instance_id())
             .collect::<Vec<_>>();
@@ -224,37 +315,27 @@ impl Manager {
             .filter_map(|id| self.link_ctx.module(id).ok())
     }
 
-    pub(crate) fn global_values(&self) -> alloc::vec::IntoIter<NativeModuleHandle> {
-        self.link_ctx
-            .global_scope()
-            .modules()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-    }
-
     #[inline]
-    pub(crate) fn main_library(&mut self) -> Option<ElfLibrary> {
+    pub(crate) fn main_library(&mut self) -> Option<OpenedLibrary> {
         let id = self.link_ctx.load_order().next()?;
         self.open_module(id)
     }
 
-    pub(crate) fn open_existing(&mut self, key: &str, flags: OpenFlags) -> Option<ElfLibrary> {
-        let id = self.committed_id(key)?;
+    pub(crate) fn open_existing(&mut self, key: &str, flags: OpenFlags) -> Option<OpenedLibrary> {
+        let id = self.link_ctx.module_id(key)?;
         self.promote(id, flags);
         self.open_module(id)
     }
 
-    pub(crate) fn library_by_addr(&mut self, addr: usize) -> Option<ElfLibrary> {
+    pub(crate) fn library_by_addr(&mut self, addr: usize) -> Option<OpenedLibrary> {
         let id = self.link_ctx.module_id_at(VmAddr::new(addr))?;
         self.open_module(id)
     }
 
-    fn module_by_addr(&self, addr: usize) -> Option<NativeModuleHandle> {
+    fn module_by_addr(&mut self, addr: usize) -> Option<NativeModuleHandle> {
         let id = self.link_ctx.module_id_at(VmAddr::new(addr))?;
-        let group = self.link_ctx.load_group(id).ok()?;
-        let module = group.scope().first()?.clone();
+        let scope = self.link_ctx.load_group(id).ok()?;
+        let module = scope.first()?.clone();
         module.downcast_ref::<NativeElfModule>()?;
         Some(module)
     }
@@ -264,8 +345,8 @@ impl Manager {
         modules
             .into_iter()
             .filter_map(|id| {
-                let group = self.link_ctx.load_group(id).ok()?;
-                let inner = group.scope().first()?.clone();
+                let scope = self.link_ctx.load_group(id).ok()?;
+                let inner = scope.first()?.clone();
                 inner.downcast_ref::<NativeElfModule>()?;
                 let lease = self.acquire_module(id)?;
                 Some(LibrarySnapshot::new(inner, lease))
@@ -273,11 +354,10 @@ impl Manager {
             .collect()
     }
 
-    pub(crate) fn open_module(&mut self, id: ModuleId) -> Option<ElfLibrary> {
-        let group = self.link_ctx.load_group(id).ok()?;
-        let scope = group.scope().clone();
+    pub(crate) fn open_module(&mut self, id: ModuleId) -> Option<OpenedLibrary> {
+        let scope = self.link_ctx.load_group(id).ok()?;
         let lease = self.acquire_module(id)?;
-        Some(ElfLibrary::new(scope, lease))
+        Some(OpenedLibrary::new(scope, lease))
     }
 
     pub(crate) fn acquire_module(&mut self, id: ModuleId) -> Option<ModuleLease> {
@@ -298,9 +378,9 @@ impl Manager {
         self.subs
     }
 
-    pub(crate) fn open_load(&mut self, load: LoadResult, flags: OpenFlags) -> ElfLibrary {
+    pub(crate) fn open_load(&mut self, load: LoadResult, flags: OpenFlags) -> OpenedLibrary {
         let (lease, modules) = load.into_parts();
-        for &id in modules.iter() {
+        for &id in &modules {
             self.adds += 1;
             *self
                 .link_ctx
@@ -324,17 +404,16 @@ impl Manager {
                 .expect("loaded root module must remain committed");
         }
 
-        let group = self
+        let scope = self
             .link_ctx
             .load_group(lease.id())
             .expect("linked root module must be registered");
-        let scope = group.scope().clone();
-        ElfLibrary::new(scope, ModuleLease::new(lease))
+        OpenedLibrary::new(scope, ModuleLease::new(lease))
     }
 
     pub(crate) fn register_initial_aliases(&mut self) {
         for name in ["libc.so.6", "ld-linux-x86-64.so.2"] {
-            let Some(id) = self.committed_id(name) else {
+            let Some(id) = self.link_ctx.module_id(name) else {
                 continue;
             };
             for alias in libc_compat_aliases(name) {

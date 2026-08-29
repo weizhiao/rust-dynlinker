@@ -33,7 +33,10 @@ pub unsafe fn dl_find_object(pc: *const c_void, dlfo: *mut c_void) -> c_int {
         .downcast_ref::<NativeElfModule>()
         .expect("loaded_by_addr must return an ELF module");
 
-    let user_data = dso.user_data();
+    let user_data = dso
+        .user_data()
+        .as_ref()
+        .expect("loaded module must have extra data");
     let phdrs = dso.phdrs().unwrap_or(&[]);
     let mapped_range = dso
         .segments()
@@ -50,11 +53,7 @@ pub unsafe fn dl_find_object(pc: *const c_void, dlfo: *mut c_void) -> c_int {
     info.dlfo_flags = 0;
     info.dlfo_map_start = dso.segments().base().as_mut_ptr();
     info.dlfo_map_end = mapped_range.end.as_mut_ptr::<c_void>();
-    info.dlfo_link_map = user_data
-        .link_map
-        .as_ref()
-        .map(|lm| lm.as_ref() as *const _ as *mut _)
-        .unwrap_or(core::ptr::null_mut());
+    info.dlfo_link_map = user_data.link_map();
     info.dlfo_eh_frame = eh_frame as *const c_void;
     for i in 0..7 {
         info.dlfo_reserved[i] = 0;
@@ -81,10 +80,10 @@ pub fn dl_find_dso_for_object(addr: *const c_void) -> *mut c_void {
         .expect("loaded_by_addr must return an ELF module");
 
     dso.user_data()
-        .link_map
         .as_ref()
-        .map(|link_map| link_map.as_ref() as *const LinkMap as *mut c_void)
-        .unwrap_or(null_mut())
+        .expect("loaded module must have extra data")
+        .link_map()
+        .cast()
 }
 
 #[cfg(feature = "std")]

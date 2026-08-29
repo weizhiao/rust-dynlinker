@@ -2,7 +2,7 @@ pub use crate::abi::{auxv, debug, elf, link_map, memory, relocation};
 
 use crate::{
     OpenFlags, Result,
-    dlopen::{LinkRoot, dlopen_impl},
+    dlopen::open_mapped,
     library::{ElfLibrary, ExtraData, LoadedDylib},
     registry::REGISTRY,
     runtime::{ARGC, ARGV, ENVP},
@@ -39,7 +39,7 @@ pub fn tls_get_addr_soft(mod_id: TlsModuleId) -> *mut u8 {
 #[doc(hidden)]
 pub fn new_loader() -> RuntimeLoader {
     ElfLoader::new()
-        .with_data::<ExtraData>()
+        .with_data::<Option<ExtraData>>()
         .with_tls_resolver(ActiveTlsResolver::default())
         .with_static_tls(true)
 }
@@ -73,27 +73,21 @@ pub fn link_mapped_root(root_request: &str, raw: ElfDylib, flags: OpenFlags) -> 
         name.rsplit(['/', '\\']).next().unwrap_or(name)
     }
     .to_owned();
-    let library = dlopen_impl(
-        root_request,
-        flags,
-        LinkRoot::Mapped { key: root_key, raw },
-        None,
-    )?;
+    let opened = open_mapped(root_request, root_key, raw, flags)?;
     REGISTRY.lock().borrow_mut().register_initial_aliases();
-    Ok(library)
+    Ok(opened.into())
 }
 
 #[doc(hidden)]
 pub fn raw_link_map(raw: &ElfDylib) -> *mut link_map::LinkMap {
-    extra_data_link_map(raw.user_data())
+    raw.user_data()
+        .as_ref()
+        .map_or(core::ptr::null_mut(), ExtraData::link_map)
 }
 
 #[doc(hidden)]
 pub unsafe fn handle_link_map(handle: *mut c_void) -> *mut link_map::LinkMap {
-    let Some(library) = (unsafe { handle.cast::<ElfLibrary>().as_ref() }) else {
-        return core::ptr::null_mut();
-    };
-    extra_data_link_map(library.module().user_data())
+    crate::registry::handle_link_map(handle as usize).unwrap_or(core::ptr::null_mut())
 }
 
 #[doc(hidden)]
@@ -104,17 +98,18 @@ pub struct StartupLinkMaps {
 
 #[doc(hidden)]
 pub fn startup_link_maps(library: &ElfLibrary, rtld: *mut link_map::LinkMap) -> StartupLinkMaps {
-    let mut maps = Vec::with_capacity(library.scope.len() + 1);
+    let mut maps = Vec::with_capacity(library.scope().len() + 1);
     let mut libc_map = core::ptr::null_mut();
 
-    for dep in library.scope.iter() {
+    for dep in library.scope().iter() {
         let Some(dep) = dep.downcast_ref::<crate::library::NativeElfModule>() else {
             continue;
         };
-        let link_map = extra_data_link_map(dep.user_data());
-        if link_map.is_null() {
-            continue;
-        }
+        let link_map = dep
+            .user_data()
+            .as_ref()
+            .expect("loaded dependency must have extra data")
+            .link_map();
 
         if dep.name() == "libc.so.6" {
             libc_map = link_map;
@@ -131,14 +126,6 @@ pub fn startup_link_maps(library: &ElfLibrary, rtld: *mut link_map::LinkMap) -> 
         maps: maps.into_boxed_slice(),
         libc_map,
     }
-}
-
-fn extra_data_link_map(data: &ExtraData) -> *mut link_map::LinkMap {
-    data.link_map
-        .as_deref()
-        .map_or(core::ptr::null_mut(), |link_map| {
-            core::ptr::from_ref(link_map).cast_mut()
-        })
 }
 
 #[doc(hidden)]

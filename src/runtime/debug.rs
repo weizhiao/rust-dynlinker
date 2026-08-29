@@ -73,46 +73,44 @@ pub(crate) unsafe fn add_debug_link_map(link_map: *mut LinkMap) {
 
 impl Drop for ExtraData {
     fn drop(&mut self) {
-        if let Some(link_map) = self.link_map.as_ref() {
-            let link_map_ptr = core::ptr::addr_of!(**link_map) as *mut LinkMap;
-            unsafe {
-                let mut custom_debug = DEBUG.lock();
-                if custom_debug.debug.is_null() {
-                    return;
-                }
-                let tail = custom_debug.tail;
-                let debug = &mut *custom_debug.debug;
-
-                if debug.map != link_map_ptr && (*link_map_ptr).l_prev.is_null() {
-                    return;
-                }
-
-                debug.state = RT_DELETE;
-                call_debug_state(debug);
-                match (debug.map == link_map_ptr, tail == link_map_ptr) {
-                    (true, true) => {
-                        debug.map = null_mut();
-                        custom_debug.tail = null_mut();
-                    }
-                    (true, false) => {
-                        debug.map = (*link_map_ptr).l_next;
-                        (*(*link_map_ptr).l_next).l_prev = null_mut();
-                    }
-                    (false, true) => {
-                        let prev = &mut *(*link_map_ptr).l_prev;
-                        prev.l_next = null_mut();
-                        custom_debug.tail = prev;
-                    }
-                    (false, false) => {
-                        let prev = &mut *(*link_map_ptr).l_prev;
-                        let next = &mut *(*link_map_ptr).l_next;
-                        prev.l_next = next;
-                        next.l_prev = prev;
-                    }
-                }
-                debug.state = RT_CONSISTENT;
-                call_debug_state(debug);
+        let link_map_ptr = self.link_map();
+        unsafe {
+            let mut custom_debug = DEBUG.lock();
+            if custom_debug.debug.is_null() {
+                return;
             }
+            let tail = custom_debug.tail;
+            let debug = &mut *custom_debug.debug;
+
+            if debug.map != link_map_ptr && (*link_map_ptr).l_prev.is_null() {
+                return;
+            }
+
+            debug.state = RT_DELETE;
+            call_debug_state(debug);
+            match (debug.map == link_map_ptr, tail == link_map_ptr) {
+                (true, true) => {
+                    debug.map = null_mut();
+                    custom_debug.tail = null_mut();
+                }
+                (true, false) => {
+                    debug.map = (*link_map_ptr).l_next;
+                    (*(*link_map_ptr).l_next).l_prev = null_mut();
+                }
+                (false, true) => {
+                    let prev = &mut *(*link_map_ptr).l_prev;
+                    prev.l_next = null_mut();
+                    custom_debug.tail = prev;
+                }
+                (false, false) => {
+                    let prev = &mut *(*link_map_ptr).l_prev;
+                    let next = &mut *(*link_map_ptr).l_next;
+                    prev.l_next = next;
+                    next.l_prev = prev;
+                }
+            }
+            debug.state = RT_CONSISTENT;
+            call_debug_state(debug);
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
     Result, Symbol,
     error::find_symbol_error,
-    registry::{global_find, next_find},
+    registry::{global_find, handle_find, next_find},
 };
 use core::{
     ffi::{CStr, c_char, c_void},
@@ -27,10 +27,7 @@ pub unsafe extern "C" fn dlsym(handle: *const c_void, symbol_name: *const c_char
         log::info!("dlsym: Use RTLD_NEXT flag to find symbol [{}]", name);
         unsafe { dlsym_next::<()>(name).ok().map(|s| s.into_raw()) }
     } else {
-        let lib = unsafe { &*(handle as *const crate::ElfLibrary) };
-        unsafe { lib.get::<()>(name) }
-            .ok()
-            .map(|sym| sym.into_raw())
+        unsafe { handle_find::<()>(value, name) }.map(|sym| sym.into_raw())
     };
     sym.unwrap_or(null()).cast()
 }
