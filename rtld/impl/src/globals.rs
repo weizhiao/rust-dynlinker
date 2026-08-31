@@ -22,8 +22,6 @@ pub static mut _rtld_global_ro: RtldGlobalRo = RtldGlobalRo::new();
 #[unsafe(no_mangle)]
 pub static mut _r_debug: RDebug = RDebug::zero();
 
-static mut RTLD_LINK_MAP: LinkMap = LinkMap::zero();
-
 #[unsafe(no_mangle)]
 pub static mut __libc_enable_secure: c_int = 0;
 
@@ -35,10 +33,6 @@ pub static mut __rseq_size: u32 = 0;
 
 #[unsafe(no_mangle)]
 pub static mut __rseq_offset: isize = 0;
-
-pub(crate) unsafe fn rtld_link_map() -> *mut LinkMap {
-    addr_of_mut!(RTLD_LINK_MAP)
-}
 
 pub(crate) unsafe fn rtld_x86_cpu_features() -> *const c_void {
     unsafe { (&*addr_of_mut!(_rtld_global_ro)).x86_cpu_features() }

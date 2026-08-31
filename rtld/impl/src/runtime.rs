@@ -5,10 +5,6 @@ use syscalls::Sysno;
 
 pub(crate) const RTLD_FATAL_EXIT_STATUS: usize = 127;
 
-pub(crate) unsafe fn read_usize(ptr: *const usize) -> usize {
-    unsafe { core::ptr::read(ptr) }
-}
-
 pub(crate) fn write_stderr(bytes: &[u8]) {
     write_fd(2, bytes);
 }

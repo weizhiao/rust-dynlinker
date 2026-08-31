@@ -12,7 +12,7 @@ use elf_loader::{
     arch::NativeArch,
     input::{ElfBinary, PathBuf as ElfPath},
     lazy::NativeLazyBinder,
-    linker::{Linker, SearchPathResolver},
+    linker::{Linker, ModuleId, SearchPathResolver},
     memory::VmAddr,
     relocation::Relocator,
 };
@@ -134,12 +134,8 @@ pub(crate) fn open_main() -> OpenedLibrary {
         .expect("Main executable must be initialized")
 }
 
-pub(crate) fn open_file(
-    path: &str,
-    flags: OpenFlags,
-    caller: Option<usize>,
-) -> Result<OpenedLibrary> {
-    open(path, flags, LinkRoot::File(path.to_owned()), caller)
+pub(crate) fn open_file(path: &str, flags: OpenFlags, caller: usize) -> Result<OpenedLibrary> {
+    open(path, flags, LinkRoot::File(path.to_owned()), Some(caller))
 }
 
 #[cfg(not(feature = "std"))]
@@ -148,8 +144,9 @@ pub(crate) fn open_mapped(
     key: String,
     raw: crate::library::ElfDylib,
     flags: OpenFlags,
+    before_init: impl FnOnce(ModuleId) -> Result<()>,
 ) -> Result<OpenedLibrary> {
-    open(
+    open_with(
         request,
         flags,
         LinkRoot::Mapped {
@@ -157,6 +154,7 @@ pub(crate) fn open_mapped(
             raw: Box::new(raw),
         },
         None,
+        before_init,
     )
 }
 
@@ -179,7 +177,7 @@ impl ElfLibrary {
     pub fn dlopen(path: impl AsFilename, flags: OpenFlags) -> Result<ElfLibrary> {
         let caller = caller_module_address();
         let path = path.as_filename();
-        open_file(path, flags, Some(caller)).map(ElfLibrary::from)
+        open_file(path, flags, caller).map(ElfLibrary::from)
     }
 
     /// Load a shared library from bytes. It is the same as dlopen. However, it can also be used in the no_std environment,
@@ -207,9 +205,19 @@ impl ElfLibrary {
 
 fn open<'bytes>(
     request: &str,
+    flags: OpenFlags,
+    root: LinkRoot<'bytes>,
+    caller: Option<usize>,
+) -> Result<OpenedLibrary> {
+    open_with(request, flags, root, caller, |_| Ok(()))
+}
+
+fn open_with<'bytes>(
+    request: &str,
     mut flags: OpenFlags,
     root: LinkRoot<'bytes>,
     caller: Option<usize>,
+    before_init: impl FnOnce(ModuleId) -> Result<()>,
 ) -> Result<OpenedLibrary> {
     let registry = REGISTRY.lock();
     if get_env("LD_BIND_NOW").is_some() {
@@ -281,6 +289,13 @@ fn open<'bytes>(
         let mut manager = registry.borrow_mut();
         relocated.publish(manager.context_mut())?
     };
+    if let Err(error) = before_init(published.root()) {
+        let rollback = {
+            let mut manager = registry.borrow_mut();
+            published.rollback(manager.context_mut())
+        };
+        return Err(rollback.err().map_or(error, Into::into));
+    }
     match published.initialize() {
         Ok(load) => Ok(registry.borrow_mut().open_load(load, flags)),
         Err(failed) => {

@@ -10,9 +10,10 @@ use alloc::{
     collections::{BTreeMap, btree_map::Entry},
     vec::Vec,
 };
+#[cfg(not(feature = "std"))]
+use elf_loader::image::Module;
 use elf_loader::{
     arch::NativeArch,
-    image::Module,
     linker::{
         GraphModule, LinkContext, LoadResult, ModuleId, ModuleLease as NativeModuleLease,
         UnloadGroup,
@@ -129,25 +130,49 @@ pub(crate) unsafe fn global_find<'a, T>(name: &str) -> Option<crate::Symbol<'a, 
 /// Finds the next occurrence of a symbol after the specified address.
 pub(crate) unsafe fn next_find<'a, T>(addr: usize, name: &str) -> Option<crate::Symbol<'a, T>> {
     let registry = REGISTRY.lock();
-    registry
-        .borrow()
-        .all_values()
-        .skip_while(|lib| {
-            lib.memory()
-                .range_at(elf_loader::memory::VmAddr::new(addr))
-                .is_none()
+    unsafe { registry.borrow_mut().next_find(addr, name) }
+}
+
+unsafe fn find_symbol<'symbol, 'module, T>(
+    mut modules: impl Iterator<Item = &'module NativeModuleHandle>,
+    name: &str,
+) -> Option<crate::Symbol<'symbol, T>> {
+    modules.find_map(|lib| unsafe {
+        lib.get::<T>(name).map(|sym| {
+            log::trace!(
+                "dlsym: find symbol [{}] from [{}] via RTLD_NEXT",
+                name,
+                lib.name()
+            );
+            core::mem::transmute(sym)
         })
-        .skip(1)
-        .find_map(|lib| unsafe {
-            lib.get::<T>(name).map(|sym| {
-                log::trace!(
-                    "dlsym: find symbol [{}] from [{}] via RTLD_NEXT",
-                    name,
-                    lib.name()
-                );
-                core::mem::transmute(sym)
-            })
-        })
+    })
+}
+
+impl Manager {
+    unsafe fn next_find<'a, T>(&mut self, addr: usize, name: &str) -> Option<crate::Symbol<'a, T>> {
+        let caller = self.link_ctx.module_id_at(VmAddr::new(addr))?;
+        let caller_instance = self.link_ctx.module(caller).ok()?.state().instance_id();
+        let global = self.link_ctx.global_scope().modules();
+        let scope = if global
+            .iter()
+            .any(|module| module.state().instance_id() == caller_instance)
+        {
+            global
+        } else {
+            self.link_ctx.load_group(caller).ok()?
+        };
+
+        unsafe {
+            find_symbol(
+                scope
+                    .iter()
+                    .skip_while(|module| module.state().instance_id() != caller_instance)
+                    .skip(1),
+                name,
+            )
+        }
+    }
 }
 
 pub(crate) fn register_handle(opened: OpenedLibrary) -> usize {
@@ -307,6 +332,7 @@ impl Manager {
     }
 
     #[inline]
+    #[cfg(not(feature = "std"))]
     pub(crate) fn all_values(
         &self,
     ) -> impl Iterator<Item = &(dyn Module<NativeArch, ActiveTlsResolver> + 'static)> + '_ {

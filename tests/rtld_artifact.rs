@@ -289,6 +289,14 @@ fn rtld_artifact_exports_libc_needed_ld_so_symbols() {
     );
 
     let rtld_exports = exported_symbols(&path);
+    for name in ["dlopen", "dlsym", "dlclose", "dlerror"] {
+        for version in ["GLIBC_2.2.5", "GLIBC_2.34"] {
+            assert!(
+                rtld_exports.contains(&(name.to_owned(), Some(version.to_owned()))),
+                "rtld artifact is missing {name}@{version}"
+            );
+        }
+    }
     let missing = required
         .difference(&rtld_exports)
         .map(format_symbol_id)
@@ -1090,7 +1098,19 @@ fn rtld_artifact_supports_libc_dlfcn_hook() {
     fs::write(
         &plugin_source,
         br#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <string.h>
+
 int plugin_value(void) {
+    Dl_info owner;
+    if (dladdr((void *) dlsym, &owner) == 0 || owner.dli_fname == 0
+        || strstr(owner.dli_fname, "ld-linux-x86-64.so.2") == 0) {
+        return -1;
+    }
+    if (dlsym(RTLD_NEXT, "malloc") == 0) {
+        return -2;
+    }
     return 42;
 }
 "#,
@@ -1114,12 +1134,20 @@ int plugin_value(void) {
         &source,
         format!(
             r#"
+#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>
+#include <string.h>
 
 typedef int (*plugin_value_fn)(void);
 
 int main(void) {{
+    Dl_info owner;
+    if (dladdr((void *) dlopen, &owner) == 0 || owner.dli_fname == 0
+        || strstr(owner.dli_fname, "ld-linux-x86-64.so.2") == 0) {{
+        return 9;
+    }}
+
     void *handle = dlopen("{plugin_path}", RTLD_NOW | RTLD_LOCAL);
     if (handle == 0) {{
         const char *err = dlerror();
@@ -1127,17 +1155,35 @@ int main(void) {{
         return 10;
     }}
 
+    if (dlerror() != 0) {{
+        return 11;
+    }}
+
+    void *missing = dlsym(handle, "__dlerror_missing_symbol");
+    const char *error = dlerror();
+    if (missing != 0 || error == 0 || strstr(error, "__dlerror_missing_symbol") == 0) {{
+        return 12;
+    }}
+    if (dlerror() != 0) {{
+        return 13;
+    }}
+
+    (void) dlsym(handle, "__dlerror_stale_symbol");
+
     plugin_value_fn plugin_value = (plugin_value_fn) dlsym(handle, "plugin_value");
     if (plugin_value == 0) {{
         const char *err = dlerror();
         printf("dlsym-error:%s\n", err == 0 ? "" : err);
-        return 11;
+        return 14;
+    }}
+    if (dlerror() != 0) {{
+        return 15;
     }}
 
     int value = plugin_value();
     int closed = dlclose(handle);
     printf("dlfcn:%d:%d\n", value, closed);
-    return value == 42 && closed == 0 ? 0 : 12;
+    return value == 42 && closed == 0 ? 0 : 16;
 }}
 "#
         ),
@@ -1347,6 +1393,179 @@ int main(int argc, char **argv) {
         "direct:2:custom-argv0\n"
     );
     assert_eq!(output.status.code(), Some(9));
+}
+
+#[test]
+fn rtld_artifact_can_run_system_ls() {
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+    let interp = rtld_interp_path();
+    assert!(interp.exists(), "missing {}", interp.display());
+
+    let Some(ls) = ["/usr/bin/gnuls", "/bin/gnuls", "/usr/bin/ls", "/bin/ls"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| {
+            fs::symlink_metadata(path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        })
+    else {
+        eprintln!("skipping system ls test because no standalone ls executable was found");
+        return;
+    };
+
+    let dir = test_work_dir("system-ls");
+    fs::write(dir.join("alpha"), []).unwrap();
+    fs::write(dir.join("beta"), []).unwrap();
+    let output = Command::new(&interp)
+        .arg(ls)
+        .arg("-1")
+        .arg(&dir)
+        .output()
+        .expect("failed to execute system ls through rtld");
+    assert!(
+        output.status.success(),
+        "{} failed through rtld\nstdout:\n{}\nstderr:\n{}",
+        ls.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "alpha\nbeta\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn rtld_artifact_publishes_before_init_and_finalizes_startup_modules() {
+    if !has_command("cc") {
+        eprintln!("skipping startup lifecycle test because cc is unavailable");
+        return;
+    }
+
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+    let interp = rtld_interp_path();
+    assert!(interp.exists(), "missing {}", interp.display());
+
+    let dir = test_work_dir("pt-interp-lifecycle");
+    let dependency_source = dir.join("dependency.c");
+    let dependency = dir.join("libstartup_dependency.so");
+    let main_source = dir.join("main.c");
+    let program = dir.join("main");
+    fs::write(
+        &dependency_source,
+        br#"
+#define _GNU_SOURCE
+#include <link.h>
+#include <string.h>
+#include <unistd.h>
+
+__attribute__((constructor)) static void dependency_init(void) {
+    int rtld_maps = 0;
+    for (struct link_map *map = _r_debug.r_map; map != 0; map = map->l_next) {
+        if (map->l_name != 0 && strstr(map->l_name, "ld-linux-x86-64.so.2") != 0) {
+            ++rtld_maps;
+        }
+    }
+    if (rtld_maps != 1) {
+        _exit(92);
+    }
+    write(1, "dependency-init\n", 16);
+}
+
+__attribute__((destructor)) static void dependency_fini(void) {
+    write(1, "dependency-fini\n", 16);
+}
+
+void dependency_touch(void) {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &main_source,
+        br#"
+#define _GNU_SOURCE
+#include <link.h>
+#include <unistd.h>
+
+extern void dependency_touch(void);
+
+static int loaded;
+
+static int count_loaded(struct dl_phdr_info *info, size_t size, void *data) {
+    (void) info;
+    (void) size;
+    (void) data;
+    ++loaded;
+    return 0;
+}
+
+__attribute__((constructor)) static void main_init(void) {
+    dependency_touch();
+    dl_iterate_phdr(count_loaded, 0);
+    if (loaded < 3) {
+        _exit(91);
+    }
+    write(1, "main-init\n", 10);
+}
+
+__attribute__((destructor)) static void main_fini(void) {
+    write(1, "main-fini\n", 10);
+}
+
+int main(void) {
+    write(1, "main\n", 5);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    assert!(
+        Command::new("cc")
+            .arg("-shared")
+            .arg("-fPIC")
+            .arg(&dependency_source)
+            .arg("-Wl,-soname,libstartup_dependency.so")
+            .arg("-o")
+            .arg(&dependency)
+            .status()
+            .expect("failed to compile startup dependency")
+            .success(),
+        "failed to compile startup dependency"
+    );
+    assert!(
+        Command::new("cc")
+            .arg(&main_source)
+            .arg(format!("-Wl,--dynamic-linker={}", interp.display()))
+            .arg(format!("-Wl,-rpath={}", dir.display()))
+            .arg(format!("-L{}", dir.display()))
+            .arg("-lstartup_dependency")
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .expect("failed to compile startup lifecycle program")
+            .success(),
+        "failed to compile startup lifecycle program"
+    );
+
+    let output = Command::new(&program)
+        .output()
+        .expect("failed to execute startup lifecycle program");
+    assert!(
+        output.status.success(),
+        "startup lifecycle test failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "dependency-init\nmain-init\nmain\nmain-fini\ndependency-fini\n"
+    );
 }
 
 #[test]

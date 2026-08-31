@@ -80,7 +80,10 @@ fn find_best_symbol(dylib: &ElfLibrary, addr: usize) -> Option<(Option<&'static 
     best_match
 }
 
-pub(crate) unsafe fn dladdr_raw(addr: *const c_void, info: *mut CDlInfo) -> c_int {
+/// # Safety
+/// It is the same as `dladdr`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dladdr(addr: *const c_void, info: *mut CDlInfo) -> c_int {
     let Some(dl_info) = ElfLibrary::dladdr(addr as usize) else {
         return 0;
     };
@@ -92,11 +95,4 @@ pub(crate) unsafe fn dladdr_raw(addr: *const c_void, info: *mut CDlInfo) -> c_in
         .symbol_name()
         .map_or(null(), |name| name.as_ptr() as *const c_char);
     1
-}
-
-/// # Safety
-/// It is the same as `dladdr`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dladdr(addr: *const c_void, info: *mut CDlInfo) -> c_int {
-    unsafe { dladdr_raw(addr, info) }
 }

@@ -14,7 +14,7 @@ _start:
     andq $-16, %rsp
     call rtld_bootstrap
     movq %rbx, %rsp
-    xorq %rdx, %rdx
+    leaq rtld_fini(%rip), %rdx
     jmp *%rax
     .size _start, . - _start
 "#,

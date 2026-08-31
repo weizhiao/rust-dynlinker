@@ -1,5 +1,6 @@
 use crate::{
     OpenFlags,
+    api::dlerror,
     dlopen::{open_file, open_main},
     registry::register_handle,
 };
@@ -47,27 +48,31 @@ pub unsafe extern "C" fn dlopen(_filename: *const c_char, _flags: c_int) -> *con
 /// Calls `dlopen` on behalf of the module containing `caller`.
 ///
 /// # Safety
-/// `filename` follows the same requirements as [`dlopen`]. A null or unknown
-/// `caller` falls back to the process-wide root search policy.
+/// `filename` follows the same requirements as [`dlopen`]. An unknown `caller`
+/// falls back to the process-wide root search policy.
 #[doc(hidden)]
 pub unsafe extern "C" fn dlopen_with_caller(
     filename: *const c_char,
     flags: c_int,
     caller: *const c_void,
 ) -> *const c_void {
+    dlerror::clear();
     let opened = if filename.is_null() {
         open_main()
     } else {
         let flags = OpenFlags::from_bits_retain(flags as _);
         let filename = unsafe { CStr::from_ptr(filename) };
         let Ok(path) = filename.to_str() else {
+            dlerror::set("library name is not valid UTF-8");
             return core::ptr::null();
         };
-        let caller = caller as usize;
-        let Ok(opened) = open_file(path, flags, (caller != 0).then_some(caller)) else {
-            return core::ptr::null();
-        };
-        opened
+        match open_file(path, flags, caller as usize) {
+            Ok(opened) => opened,
+            Err(error) => {
+                dlerror::set(error);
+                return core::ptr::null();
+            }
+        }
     };
     register_handle(opened) as _
 }

@@ -81,13 +81,9 @@ extern "C" fn dlfcn_dlclose(handle: *mut c_void) -> c_int {
 extern "C" fn dlfcn_dlsym(
     handle: *mut c_void,
     name: *const c_char,
-    _caller: *mut c_void,
+    caller: *mut c_void,
 ) -> *mut c_void {
-    if name.is_null() {
-        return null_mut();
-    }
-
-    unsafe { dlopen_rs::api::dlsym(handle.cast_const(), name).cast_mut() }
+    unsafe { dlopen_rs::api::dlsym_with_caller(handle.cast_const(), name, caller).cast_mut() }
 }
 
 extern "C" fn dlfcn_dlvsym(
@@ -100,7 +96,7 @@ extern "C" fn dlfcn_dlvsym(
 }
 
 extern "C" fn dlfcn_dlerror() -> *mut c_char {
-    null_mut()
+    dlopen_rs::api::dlerror()
 }
 
 extern "C" fn dlfcn_dladdr(addr: *const c_void, info: *mut c_void) -> c_int {

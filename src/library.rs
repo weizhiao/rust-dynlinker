@@ -16,10 +16,6 @@ use elf_loader::{
 };
 
 #[cfg(not(feature = "std"))]
-pub type RuntimeLoader =
-    elf_loader::Loader<Option<ExtraData>, crate::runtime::rtld::ActiveTlsResolver>;
-
-#[cfg(not(feature = "std"))]
 pub(crate) use crate::runtime::rtld::ActiveTlsResolver;
 #[cfg(feature = "std")]
 pub(crate) use elf_loader::tls::DefaultTlsResolver as ActiveTlsResolver;

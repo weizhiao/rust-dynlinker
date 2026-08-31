@@ -1,6 +1,6 @@
 use dlopen_rs::{ElfLibrary, OpenFlags};
 use std::env::consts;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Barrier, OnceLock,
@@ -79,6 +79,19 @@ fn compile() {
     });
 }
 
+fn take_dlerror() -> Option<String> {
+    let error = dlopen_rs::api::dlerror();
+    if error.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
 #[test]
 fn dlopen() {
     compile();
@@ -122,6 +135,61 @@ fn c_dlopen_main_uses_its_load_group() {
     assert!(!unsafe { dlopen_rs::api::dlsym(first, symbol.as_ptr()) }.is_null());
     assert_eq!(unsafe { dlopen_rs::api::dlclose(first) }, 0);
     assert_eq!(unsafe { dlopen_rs::api::dlclose(second) }, 0);
+}
+
+#[test]
+fn c_dlerror_reports_and_consumes_errors() {
+    while take_dlerror().is_some() {}
+
+    let missing = CString::new("__dlerror_missing_symbol").unwrap();
+    assert!(unsafe { dlopen_rs::api::dlsym(core::ptr::null(), missing.as_ptr()) }.is_null());
+    assert!(
+        take_dlerror()
+            .expect("failed dlsym must set dlerror")
+            .contains("__dlerror_missing_symbol")
+    );
+    assert!(take_dlerror().is_none(), "dlerror must consume the error");
+
+    assert_eq!(
+        unsafe { dlopen_rs::api::dlclose(core::ptr::without_provenance(1)) },
+        -1
+    );
+    assert!(
+        take_dlerror()
+            .expect("failed dlclose must set dlerror")
+            .contains("invalid library handle")
+    );
+
+    assert!(unsafe { dlopen_rs::api::dlsym(core::ptr::null(), missing.as_ptr()) }.is_null());
+    let flags = OpenFlags::RTLD_NOW.bits() as core::ffi::c_int;
+    let handle = unsafe { dlopen_rs::api::dlopen(core::ptr::null(), flags) };
+    assert!(!handle.is_null());
+    assert!(
+        take_dlerror().is_none(),
+        "a successful operation must clear the previous error"
+    );
+    assert_eq!(unsafe { dlopen_rs::api::dlclose(handle) }, 0);
+}
+
+#[test]
+fn c_dlerror_is_thread_local() {
+    let barrier = Arc::new(Barrier::new(2));
+    let threads = ["__dlerror_thread_one", "__dlerror_thread_two"].map(|name| {
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            while take_dlerror().is_some() {}
+            let name = CString::new(name).unwrap();
+            assert!(unsafe { dlopen_rs::api::dlsym(core::ptr::null(), name.as_ptr()) }.is_null());
+            barrier.wait();
+            let error = take_dlerror().expect("thread must retain its own dlerror");
+            assert!(error.contains(name.to_str().unwrap()));
+            assert!(take_dlerror().is_none());
+        })
+    });
+
+    for thread in threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]

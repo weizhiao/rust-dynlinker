@@ -108,6 +108,7 @@ enum TlsModule {
         source: Option<TlsImageSource>,
     },
     Static {
+        info: TlsInfo,
         offset: TlsTpOffset,
     },
 }
@@ -188,18 +189,19 @@ fn register_static_module(tls_info: &TlsInfo) -> ElfResult<(TlsModuleId, TlsTpOf
         .align
         .max(1)
         .checked_next_power_of_two()
-        .ok_or(TlsError::StaticResolverUnsupported)?;
+        .ok_or(TlsError::ResolverUnsupported)?;
 
     let used = static_module_end(area.used, tls_info.memsz, tls_info.vaddr, align)
-        .ok_or(TlsError::StaticResolverUnsupported)?;
-    if static_used_with_rseq(used).ok_or(TlsError::StaticResolverUnsupported)?
-        > STATIC_TLS_ARENA_SIZE
-    {
-        return Err(TlsError::StaticResolverUnsupported.into());
+        .ok_or(TlsError::ResolverUnsupported)?;
+    if static_used_with_rseq(used).ok_or(TlsError::ResolverUnsupported)? > STATIC_TLS_ARENA_SIZE {
+        return Err(TlsError::ResolverUnsupported.into());
     }
 
     let offset = TlsTpOffset::new(-(used as isize));
-    let id = register_module(TlsModule::Static { offset })?;
+    let id = register_module(TlsModule::Static {
+        info: *tls_info,
+        offset,
+    })?;
     area.used = used;
     area.max_align = area.max_align.max(align);
     STATIC_TLS_MODULES.lock().push(StaticTlsModule {
@@ -212,7 +214,10 @@ fn register_static_module(tls_info: &TlsInfo) -> ElfResult<(TlsModuleId, TlsTpOf
 }
 
 fn add_static_module(tls_info: &TlsInfo, offset: TlsTpOffset) -> ElfResult<TlsModuleId> {
-    let id = register_module(TlsModule::Static { offset })?;
+    let id = register_module(TlsModule::Static {
+        info: *tls_info,
+        offset,
+    })?;
     STATIC_TLS_MODULES.lock().push(StaticTlsModule {
         id,
         info: *tls_info,
@@ -227,10 +232,17 @@ fn init_tls_module(
     id: TlsModuleId,
     offset: Option<TlsTpOffset>,
 ) -> ElfResult<()> {
-    let info = source.info();
-    match offset {
-        Some(offset) => init_static_tls(info, source, id, offset),
-        None => init_dynamic_tls(info, source, id),
+    match (tls_module(id), offset) {
+        (Some(TlsModule::Dynamic { info, .. }), None) => init_dynamic_tls(info, source, id),
+        (
+            Some(TlsModule::Static {
+                info,
+                offset: registered,
+            }),
+            Some(offset),
+        ) if offset == registered => init_static_tls(info, source, id, offset),
+        (None, _) => Err(TlsError::InvalidModuleId { mod_id: id }.into()),
+        _ => Err(TlsError::ModuleMismatch.into()),
     }
 }
 
@@ -257,7 +269,7 @@ fn init_static_tls(
     id: TlsModuleId,
     offset: TlsTpOffset,
 ) -> ElfResult<()> {
-    update_static_module_slot(id, offset)?;
+    update_static_module_slot(id, info, offset)?;
     let module = {
         let mut modules = STATIC_TLS_MODULES.lock();
         if let Some(module) = modules.iter_mut().find(|module| module.id == id) {
@@ -286,23 +298,23 @@ fn init_static_tls(
     Ok(())
 }
 
-fn update_static_module_slot(id: TlsModuleId, offset: TlsTpOffset) -> ElfResult<()> {
+fn update_static_module_slot(id: TlsModuleId, info: TlsInfo, offset: TlsTpOffset) -> ElfResult<()> {
     let raw = id.get();
     if raw == 0 {
-        return Err(TlsError::StaticResolverUnsupported.into());
+        return Err(TlsError::ResolverUnsupported.into());
     }
 
     let mut modules = TLS_MODULES.lock();
     let Some(slot) = modules.get_mut(raw - 1) else {
-        return Err(TlsError::StaticResolverUnsupported.into());
+        return Err(TlsError::ResolverUnsupported.into());
     };
-    *slot = Some(TlsModule::Static { offset });
+    *slot = Some(TlsModule::Static { info, offset });
     Ok(())
 }
 
 fn ensure_static_tls_area() -> ElfResult<StaticTlsArea> {
     let layout = Layout::from_size_align(STATIC_TLS_ARENA_SIZE + TLS_TCB_SIZE, 4096)
-        .map_err(|_| TlsError::StaticResolverUnsupported)?;
+        .map_err(|_| TlsError::ResolverUnsupported)?;
     let base = unsafe { alloc_zeroed(layout) };
     if base.is_null() {
         handle_alloc_error(layout);
@@ -349,7 +361,7 @@ fn static_rseq_offset(used: usize) -> Option<isize> {
 
 fn init_tcb(tp: *mut u8) -> ElfResult<()> {
     if tp.is_null() {
-        return Err(TlsError::StaticResolverUnsupported.into());
+        return Err(TlsError::ResolverUnsupported.into());
     }
     unsafe { crate::glibc::init_tcb(tp) };
     Ok(())
@@ -357,7 +369,7 @@ fn init_tcb(tp: *mut u8) -> ElfResult<()> {
 
 fn install_thread_pointer(tp: *mut u8) -> ElfResult<()> {
     if tp.is_null() || !crate::arch::install_thread_pointer(tp) {
-        return Err(TlsError::StaticResolverUnsupported.into());
+        return Err(TlsError::ResolverUnsupported.into());
     }
     Ok(())
 }

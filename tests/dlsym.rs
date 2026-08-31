@@ -67,7 +67,8 @@ fn test_dlsym_next() {
 
     // dlsym_next should skip the local "add" (which returns a+b+100)
     // and find the one in libexample.so (which returns a+b).
-    let add_func = unsafe { dlsym_next::<fn(i32, i32) -> i32>("add").unwrap() };
+    let caller = add as *const () as usize;
+    let add_func = unsafe { dlsym_next::<fn(i32, i32) -> i32>(caller, "add").unwrap() };
 
     // If it found the local one, it would be 103.
     // If it correctly found the next one, it should be 3.
@@ -77,7 +78,7 @@ fn test_dlsym_next() {
     assert_ne!(add_func.into_raw() as usize, add as *const () as usize);
 
     // Test non-existent symbol
-    let non_existent = unsafe { dlsym_next::<fn()>("non_existent_symbol") };
+    let non_existent = unsafe { dlsym_next::<fn()>(caller, "non_existent_symbol") };
     assert!(non_existent.is_err());
 }
 

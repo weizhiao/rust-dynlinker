@@ -2,19 +2,24 @@ pub use crate::abi::{auxv, debug, elf, link_map, memory, relocation};
 
 use crate::{
     OpenFlags, Result,
-    dlopen::open_mapped,
-    library::{ElfLibrary, ExtraData, LoadedDylib},
+    dlopen::{DlopenObserver, open_mapped},
+    library::{ExtraData, LoadedDylib, NativeElfModule},
     registry::REGISTRY,
     runtime::{ARGC, ARGV, ENVP},
 };
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 use core::ffi::{c_char, c_void};
-use elf_loader::Loader as ElfLoader;
+use elf_loader::{Loader as ElfLoader, linker::ModuleId};
+use spin::Mutex;
+
+type RuntimeLoader = ElfLoader<Option<ExtraData>, ActiveTlsResolver>;
+
+static STARTUP_ROOT: Mutex<Option<ModuleId>> = Mutex::new(None);
 
 #[doc(hidden)]
 pub use self::tls::{ActiveTlsResolver, RtldTlsOps};
 #[doc(hidden)]
-pub use crate::library::{ElfDylib, RuntimeLoader};
+pub use crate::library::ElfDylib;
 #[doc(hidden)]
 pub use elf_loader::{
     Result as ElfResult,
@@ -36,12 +41,41 @@ pub fn tls_get_addr_soft(mod_id: TlsModuleId) -> *mut u8 {
     tls::tls_get_addr_soft(mod_id)
 }
 
-#[doc(hidden)]
-pub fn new_loader() -> RuntimeLoader {
+fn loader() -> RuntimeLoader {
     ElfLoader::new()
         .with_data::<Option<ExtraData>>()
         .with_tls_resolver(ActiveTlsResolver::default())
         .with_static_tls(true)
+}
+
+#[doc(hidden)]
+pub fn load_exec(
+    path: &str,
+) -> ElfResult<
+    RawExec<Option<ExtraData>, NativeArch, elf_loader::memory::HostRegion, ActiveTlsResolver>,
+> {
+    let mut observer = DlopenObserver::new(OpenFlags::empty());
+    loader().run().with_observer(&mut observer).load_exec(path)
+}
+
+/// # Safety
+///
+/// The mapped image must satisfy the requirements of
+/// [`elf_loader::loader::LoaderRun::load_mapped_dynamic`].
+#[doc(hidden)]
+pub unsafe fn load_mapped(
+    path: PathBuf,
+    load_bias: VmAddr,
+    phdrs: Vec<elf::ElfPhdr>,
+    entry: usize,
+) -> ElfResult<ElfDylib> {
+    let mut observer = DlopenObserver::new(OpenFlags::empty());
+    unsafe {
+        loader()
+            .run()
+            .with_observer(&mut observer)
+            .load_mapped_dynamic(path, load_bias, phdrs, entry)
+    }
 }
 
 #[doc(hidden)]
@@ -58,14 +92,26 @@ pub unsafe fn set_initial_process_state(
 }
 
 #[doc(hidden)]
-pub fn register_loaded_object(raw: &ElfDylib, flags: OpenFlags) {
+pub fn register_loaded(raw: &ElfDylib, flags: OpenFlags) -> Result<*mut link_map::LinkMap> {
+    let link_map = raw
+        .user_data()
+        .as_ref()
+        .map(ExtraData::link_map)
+        .ok_or_else(|| crate::error::find_lib_error("loaded object is missing link map"))?;
     let registry = REGISTRY.lock();
     let loaded = unsafe { LoadedDylib::from_core((**raw).clone()) };
     registry.borrow_mut().register_loaded(loaded, flags);
+    Ok(link_map)
 }
 
 #[doc(hidden)]
-pub fn link_mapped_root(root_request: &str, raw: ElfDylib, flags: OpenFlags) -> Result<ElfLibrary> {
+pub fn link_mapped_root(
+    root_request: &str,
+    raw: ElfDylib,
+    flags: OpenFlags,
+    rtld: *mut link_map::LinkMap,
+    before_init: impl FnOnce(StartupState) -> Result<()>,
+) -> Result<()> {
     let name = raw.name();
     let root_key = if name.is_empty() {
         "main"
@@ -73,16 +119,15 @@ pub fn link_mapped_root(root_request: &str, raw: ElfDylib, flags: OpenFlags) -> 
         name.rsplit(['/', '\\']).next().unwrap_or(name)
     }
     .to_owned();
-    let opened = open_mapped(root_request, root_key, raw, flags)?;
-    REGISTRY.lock().borrow_mut().register_initial_aliases();
-    Ok(opened.into())
-}
-
-#[doc(hidden)]
-pub fn raw_link_map(raw: &ElfDylib) -> *mut link_map::LinkMap {
-    raw.user_data()
-        .as_ref()
-        .map_or(core::ptr::null_mut(), ExtraData::link_map)
+    let mut startup_root = None;
+    let opened = open_mapped(root_request, root_key, raw, flags, |root| {
+        startup_root = Some(root);
+        let state = startup_state(root, rtld)?;
+        before_init(state)
+    })?;
+    *STARTUP_ROOT.lock() = startup_root;
+    drop(opened);
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -91,18 +136,29 @@ pub unsafe fn handle_link_map(handle: *mut c_void) -> *mut link_map::LinkMap {
 }
 
 #[doc(hidden)]
-pub struct StartupLinkMaps {
+pub struct StartupState {
+    pub main: *mut link_map::LinkMap,
     pub maps: Box<[*mut link_map::LinkMap]>,
     pub libc_map: *mut link_map::LinkMap,
 }
 
-#[doc(hidden)]
-pub fn startup_link_maps(library: &ElfLibrary, rtld: *mut link_map::LinkMap) -> StartupLinkMaps {
-    let mut maps = Vec::with_capacity(library.scope().len() + 1);
+fn startup_state(root: ModuleId, rtld: *mut link_map::LinkMap) -> Result<StartupState> {
+    let registry = REGISTRY.lock();
+    let mut manager = registry.borrow_mut();
+    manager.context_mut().promote_global(root)?;
+    manager.register_initial_aliases();
+    let scope = manager.context_mut().load_group(root)?;
+    let main = scope
+        .first()
+        .and_then(|module| module.downcast_ref::<NativeElfModule>())
+        .and_then(|module| module.user_data().as_ref())
+        .map(ExtraData::link_map)
+        .ok_or_else(|| crate::error::find_lib_error("startup root is missing link map"))?;
+    let mut maps = Vec::with_capacity(scope.len() + 1);
     let mut libc_map = core::ptr::null_mut();
 
-    for dep in library.scope().iter() {
-        let Some(dep) = dep.downcast_ref::<crate::library::NativeElfModule>() else {
+    for dep in scope.iter() {
+        let Some(dep) = dep.downcast_ref::<NativeElfModule>() else {
             continue;
         };
         let link_map = dep
@@ -114,17 +170,43 @@ pub fn startup_link_maps(library: &ElfLibrary, rtld: *mut link_map::LinkMap) -> 
         if dep.name() == "libc.so.6" {
             libc_map = link_map;
         }
+        let is_rtld = link_map == rtld
+            || (!rtld.is_null()
+                && unsafe { core::ptr::addr_eq((*link_map).l_addr, (*rtld).l_addr) });
+        if is_rtld {
+            continue;
+        }
         maps.push(link_map);
     }
 
-    if !rtld.is_null() && !maps.contains(&rtld) {
+    if !rtld.is_null() {
         let insert_at = usize::from(!maps.is_empty());
         maps.insert(insert_at, rtld);
     }
 
-    StartupLinkMaps {
+    Ok(StartupState {
+        main,
         maps: maps.into_boxed_slice(),
         libc_map,
+    })
+}
+
+#[doc(hidden)]
+pub fn finalize_startup() {
+    let Some(root) = STARTUP_ROOT.lock().take() else {
+        return;
+    };
+    let scope = {
+        let registry = REGISTRY.lock();
+        let mut manager = registry.borrow_mut();
+        manager.context_mut().load_group(root).ok()
+    };
+    let Some(scope) = scope else {
+        return;
+    };
+    for module in scope.iter() {
+        let module = module.as_ref();
+        let _ = module.state().finalize(|| module.finalize());
     }
 }
 
