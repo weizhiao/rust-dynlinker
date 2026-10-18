@@ -342,7 +342,7 @@ unsafe fn from_raw(
             ModuleSourceId::fresh(),
             use_phdrs,
             segments,
-            Domain::new(AddressSpaceId::PROCESS, DefaultTlsResolver::new())?,
+            Domain::native(AddressSpaceId::PROCESS).with_tls(DefaultTlsResolver::new())?,
             tls,
             user_data,
         )

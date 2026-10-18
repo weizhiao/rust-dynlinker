@@ -104,7 +104,7 @@ pub(crate) struct Manager {
 pub(crate) static REGISTRY: Lazy<Registry> = Lazy::new(|| {
     Registry::new(Manager {
         link_ctx: LinkContext::new(
-            Domain::new(AddressSpaceId::PROCESS, ActiveTlsResolver::default())
+            Domain::native(AddressSpaceId::PROCESS).with_tls(ActiveTlsResolver::default())
                 .expect("process TLS runtime must provide an entry"),
         ),
         handles: BTreeMap::new(),
