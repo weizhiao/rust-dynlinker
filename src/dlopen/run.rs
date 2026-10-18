@@ -1,69 +1,65 @@
 use super::{ld_cache::LdCache, observer::DlopenObserver};
 use crate::{
     OpenFlags, Result,
-    library::{ActiveTlsResolver, AsFilename, ElfLibrary, ExtraData, OpenedLibrary},
+    library::{AsFilename, ElfLibrary, ExtraData, OpenedLibrary},
     registry::REGISTRY,
     runtime::ENVP,
 };
-use alloc::{borrow::ToOwned, boxed::Box, format, string::String};
+use alloc::{borrow::ToOwned, boxed::Box, format};
 use core::ffi::CStr;
 use elf_loader::{
     Loader,
-    arch::NativeArch,
-    input::{ElfBinary, PathBuf as ElfPath},
+    input::{ElfBinary, Path, PathBuf as ElfPath},
     lazy::NativeLazyBinder,
     linker::{Linker, ModuleId, SearchPathResolver},
     memory::VmAddr,
-    relocation::Relocator,
+    relocation::{BindingMode, LookupOrder, Relocator},
 };
 use spin::Lazy;
 
-type DlopenLoader = Loader<Option<ExtraData>, ActiveTlsResolver>;
+type DlopenLoader = Loader<Option<ExtraData>>;
 
-enum LinkRoot<'bytes> {
-    File(String),
+pub(crate) enum LinkRoot<'bytes> {
+    File(ElfPath),
     Binary {
-        key: String,
+        key: ElfPath,
         bytes: &'bytes [u8],
     },
     Mapped {
-        key: String,
+        key: alloc::vec::Vec<u8>,
         raw: Box<crate::library::ElfDylib>,
     },
 }
 
-const LOADER: DlopenLoader = Loader::new()
-    .with_data::<Option<ExtraData>>()
-    .with_tls_resolver(ActiveTlsResolver::new());
-
-const LINKER: Linker<NativeArch, DlopenLoader, (), NativeLazyBinder, ActiveTlsResolver> =
-    Linker::new()
-        .loader(LOADER)
-        .relocator(Relocator::new().lazy_binder(NativeLazyBinder::new()));
-
-static LD_CACHE: Lazy<Option<LdCache>> = Lazy::new(|| LdCache::new().ok());
+fn loader() -> DlopenLoader {
+    Loader::new().with_data::<Option<ExtraData>>()
+}
 
 static SEARCH_PATHS: Lazy<SearchPathResolver> = Lazy::new(|| {
     let mut resolver = SearchPathResolver::new();
     resolver.push_rpath();
     if let Some(paths) = get_env("LD_LIBRARY_PATH") {
-        for path in paths.split(':').filter(|path| !path.is_empty()) {
-            resolver.push_fixed_dir(path);
+        for path in paths
+            .split(|byte| *byte == b':')
+            .filter(|path| !path.is_empty())
+        {
+            resolver.push_fixed_dir(Path::new(path));
         }
     }
     resolver.push_runpath();
-    resolver.push_candidate_provider(|request, candidates| {
-        if let Some(path) = LD_CACHE
+    let cache = LdCache::new().ok();
+    resolver.push_candidate_provider(move |request, candidates| {
+        if let Some(path) = cache
             .as_ref()
-            .and_then(|cache| cache.lookup(request.requested().as_str()))
+            .and_then(|cache| cache.lookup(request.requested().as_bytes()))
         {
-            candidates.push(path.into());
+            candidates.push(path);
         }
         Ok(())
     });
     push_platform_default_paths(&mut resolver);
     for path in ["/lib", "/usr/lib", "/lib64", "/usr/lib64"] {
-        resolver.push_fixed_dir(path);
+        resolver.push_fixed_dir(Path::new(path));
     }
     resolver
 });
@@ -107,18 +103,18 @@ fn caller_module_address() -> usize {
     address
 }
 
-pub(super) fn get_env(name: &str) -> Option<&'static str> {
+pub(super) fn get_env(name: &str) -> Option<&'static [u8]> {
     unsafe {
         let mut cur = ENVP;
         if cur.is_null() {
             return None;
         }
         while !(*cur).is_null() {
-            if let Ok(env) = CStr::from_ptr(*cur).to_str()
-                && let Some((key, value)) = env.split_once('=')
-                && key == name
+            let env = CStr::from_ptr(*cur).to_bytes();
+            if let Some(index) = env.iter().position(|byte| *byte == b'=')
+                && &env[..index] == name.as_bytes()
             {
-                return Some(value);
+                return Some(&env[index + 1..]);
             }
             cur = cur.add(1);
         }
@@ -134,14 +130,10 @@ pub(crate) fn open_main() -> OpenedLibrary {
         .expect("Main executable must be initialized")
 }
 
-pub(crate) fn open_file(path: &str, flags: OpenFlags, caller: usize) -> Result<OpenedLibrary> {
-    open(path, flags, LinkRoot::File(path.to_owned()), Some(caller))
-}
-
 #[cfg(not(feature = "std"))]
 pub(crate) fn open_mapped(
-    request: &str,
-    key: String,
+    request: &Path,
+    key: alloc::vec::Vec<u8>,
     raw: crate::library::ElfDylib,
     flags: OpenFlags,
     before_init: impl FnOnce(ModuleId) -> Result<()>,
@@ -177,7 +169,7 @@ impl ElfLibrary {
     pub fn dlopen(path: impl AsFilename, flags: OpenFlags) -> Result<ElfLibrary> {
         let caller = caller_module_address();
         let path = path.as_filename();
-        open_file(path, flags, caller).map(ElfLibrary::from)
+        open(path, flags, LinkRoot::File(path.to_owned()), Some(caller)).map(ElfLibrary::from)
     }
 
     /// Load a shared library from bytes. It is the same as dlopen. However, it can also be used in the no_std environment,
@@ -203,8 +195,8 @@ impl ElfLibrary {
     }
 }
 
-fn open<'bytes>(
-    request: &str,
+pub(crate) fn open<'bytes>(
+    request: &Path,
     flags: OpenFlags,
     root: LinkRoot<'bytes>,
     caller: Option<usize>,
@@ -213,7 +205,7 @@ fn open<'bytes>(
 }
 
 fn open_with<'bytes>(
-    request: &str,
+    request: &Path,
     mut flags: OpenFlags,
     root: LinkRoot<'bytes>,
     caller: Option<usize>,
@@ -227,11 +219,13 @@ fn open_with<'bytes>(
     log::info!("dlopen: Try to open [{}] with [{:?}] ", request, flags);
 
     if matches!(root, LinkRoot::File(_) | LinkRoot::Binary { .. })
-        && let Some(lib) = registry.borrow_mut().open_existing(request, flags)
+        && let Some(lib) = registry
+            .borrow_mut()
+            .open_existing(request.as_bytes(), flags)
     {
         log::info!(
             "dlopen: Reusing loaded library [{}] for request [{}]",
-            lib.module().name(),
+            lib.module().name().escape_ascii(),
             request
         );
         return Ok(lib);
@@ -242,28 +236,52 @@ fn open_with<'bytes>(
         )));
     }
 
-    let mut observer = DlopenObserver::new(flags);
+    let domain = registry.borrow_mut().context_mut().domain().clone();
+    let loader = loader();
+    let mut observer = DlopenObserver;
     let root = match root {
         LinkRoot::Binary { key, bytes } => {
-            let raw = LOADER
-                .run()
+            let raw = loader
+                .run(domain)
                 .with_observer(&mut observer)
-                .load_dylib(ElfBinary::owned(key.clone(), bytes.to_vec()))?;
+                .load_dylib(ElfBinary::new(key.clone(), bytes))?;
             LinkRoot::Mapped {
-                key,
+                key: key.into_bytes(),
                 raw: Box::new(raw.into()),
             }
         }
         root => root,
     };
 
-    let linker = LINKER.resolver((*SEARCH_PATHS).clone());
+    let linker = Linker::new()
+        .loader(loader)
+        .relocator(Relocator::new().lazy_binder(NativeLazyBinder::new()))
+        .map_relocator(|relocator| {
+            relocator.binding(if flags.is_now() {
+                BindingMode::Eager
+            } else {
+                BindingMode::Default
+            })
+        })
+        .resolver((*SEARCH_PATHS).clone());
     let mut manager = registry.borrow_mut();
-    let caller = caller.and_then(|addr| manager.context_mut().module_id_at(VmAddr::new(addr)));
-    let mut linker_run = linker.run().with_observer(observer).with_caller(caller);
+    let caller = caller.and_then(|addr| {
+        manager
+            .context_mut()
+            .address_at(VmAddr::new(addr))
+            .map(|matched| matched.owner)
+    });
+    let mut linker_run = linker
+        .run()
+        .lookup_order(if flags.is_deepbind() {
+            LookupOrder::LocalFirst
+        } else {
+            LookupOrder::GlobalFirst
+        })
+        .with_observer(observer)
+        .with_caller(caller);
     let prepared = match root {
         LinkRoot::File(path) => {
-            let path = ElfPath::from(path);
             if flags.is_noload() {
                 let id = linker_run
                     .resolve_committed(manager.context_mut(), path)?

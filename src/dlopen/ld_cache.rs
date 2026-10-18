@@ -1,8 +1,9 @@
 use crate::Result;
 use crate::error::parse_ld_cache_error;
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
-use alloc::string::String;
 use core::cmp::Ordering;
+use elf_loader::input::{Path, PathBuf};
 
 pub(crate) struct LdCache {
     data: Box<[u8]>,
@@ -67,7 +68,7 @@ impl LdCache {
         Ok(cache)
     }
 
-    pub fn lookup(&self, lib_name: &str) -> Option<String> {
+    pub fn lookup(&self, lib_name: &[u8]) -> Option<PathBuf> {
         if self.nlibs == 0 {
             return None;
         }
@@ -78,7 +79,7 @@ impl LdCache {
         let last_name = self.get_name(self.nlibs - 1)?;
         let is_descending = first_name > last_name;
         log::debug!(
-            "LD_CACHE lookup: {}, descending={}",
+            "LD_CACHE lookup: {:?}, descending={}",
             lib_name,
             is_descending
         );
@@ -112,23 +113,23 @@ impl LdCache {
                         if self.check_flags(i)
                             && let Some(path) = self.get_path(i)
                         {
-                            log::debug!("LD_CACHE match: {} -> {}", lib_name, path);
+                            log::debug!("LD_CACHE match: {:?} -> {}", lib_name, path);
                             return Some(path);
                         }
                         i += 1;
                     }
-                    log::debug!("LD_CACHE no flag match for {}", lib_name);
+                    log::debug!("LD_CACHE no flag match for {:?}", lib_name);
                     return None;
                 }
                 Ordering::Less => right = mid,
                 Ordering::Greater => left = mid + 1,
             }
         }
-        log::debug!("LD_CACHE not found: {}", lib_name);
+        log::debug!("LD_CACHE not found: {:?}", lib_name);
         None
     }
 
-    fn get_name(&self, idx: usize) -> Option<&str> {
+    fn get_name(&self, idx: usize) -> Option<&[u8]> {
         let entry_offset = self.header_offset + HEADER_SIZE + idx * ENTRY_SIZE;
         if entry_offset + 8 > self.data.len() {
             return None;
@@ -142,14 +143,14 @@ impl LdCache {
         // Try relative to header first, then relative to string table
         if let Some(s) = extract_str(&self.data[self.header_offset..], key_idx)
             && !s.is_empty()
-            && !s.starts_with('/')
+            && !s.starts_with(b"/")
         {
             return Some(s);
         }
         extract_str(&self.data[self.string_table_offset..], key_idx)
     }
 
-    fn get_path(&self, idx: usize) -> Option<String> {
+    fn get_path(&self, idx: usize) -> Option<PathBuf> {
         let entry_offset = self.header_offset + HEADER_SIZE + idx * ENTRY_SIZE;
         if entry_offset + 12 > self.data.len() {
             return None;
@@ -161,11 +162,12 @@ impl LdCache {
         ) as usize;
 
         if let Some(s) = extract_str(&self.data[self.header_offset..], val_idx)
-            && s.starts_with('/')
+            && s.starts_with(b"/")
         {
-            return Some(String::from(s));
+            return Some(Path::new(s).to_owned());
         }
-        extract_str(&self.data[self.string_table_offset..], val_idx).map(String::from)
+        extract_str(&self.data[self.string_table_offset..], val_idx)
+            .map(|bytes| Path::new(bytes).to_owned())
     }
 
     fn check_flags(&self, idx: usize) -> bool {
@@ -192,11 +194,11 @@ impl LdCache {
     }
 }
 
-fn extract_str(table: &[u8], offset: usize) -> Option<&str> {
+fn extract_str(table: &[u8], offset: usize) -> Option<&[u8]> {
     if offset >= table.len() {
         return None;
     }
     let slice = &table[offset..];
     let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-    core::str::from_utf8(&slice[..len]).ok()
+    Some(&slice[..len])
 }

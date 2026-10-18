@@ -4,7 +4,7 @@ use crate::{
     error::find_symbol_error,
     registry::{ModuleLease, REGISTRY},
 };
-use alloc::{boxed::Box, ffi::CString, format, string::String, sync::Arc};
+use alloc::{boxed::Box, ffi::CString, format, sync::Arc};
 use core::{ffi::c_char, fmt::Debug};
 #[cfg(feature = "std")]
 use elf_loader::elf::ElfDyn;
@@ -27,14 +27,28 @@ pub(crate) type LoadedDylib =
     LoadedCore<Option<ExtraData>, NativeArch, HostRegion, ActiveTlsResolver>;
 pub(crate) type NativeElfModule =
     ElfModule<Option<ExtraData>, NativeArch, HostRegion, ActiveTlsResolver>;
-pub(crate) type NativeModuleHandle = ModuleHandle<NativeArch, ActiveTlsResolver>;
-pub(crate) type NativeModuleScope = ModuleScope<NativeArch, ActiveTlsResolver>;
+pub(crate) type NativeModuleHandle = ModuleHandle<NativeArch>;
+pub(crate) type NativeModuleScope = ModuleScope<NativeArch>;
+
+/// Caller-owned local registration used to expose a host module's TLS.
+#[cfg(feature = "std")]
+pub(crate) struct HostTlsRegistration(pub(crate) elf_loader::tls::TlsModule);
+
+#[cfg(feature = "std")]
+impl Drop for HostTlsRegistration {
+    fn drop(&mut self) {
+        use elf_loader::tls::TlsResolver;
+        ActiveTlsResolver::new().unregister(self.0.mod_id());
+    }
+}
 
 pub struct ExtraData {
     c_name: CString,
     link_map: Box<LinkMap>,
     #[cfg(feature = "std")]
     dynamic_table: Box<[ElfDyn]>,
+    #[cfg(feature = "std")]
+    _host_tls: Option<HostTlsRegistration>,
 }
 
 impl ExtraData {
@@ -45,6 +59,8 @@ impl ExtraData {
             link_map,
             #[cfg(feature = "std")]
             dynamic_table: Box::default(),
+            #[cfg(feature = "std")]
+            _host_tls: None,
         }
     }
 
@@ -54,11 +70,13 @@ impl ExtraData {
         c_name: CString,
         link_map: Box<LinkMap>,
         dynamic_table: Box<[ElfDyn]>,
+        host_tls: Option<HostTlsRegistration>,
     ) -> Self {
         Self {
             c_name,
             link_map,
             dynamic_table,
+            _host_tls: host_tls,
         }
     }
 
@@ -163,9 +181,11 @@ impl ElfLibrary {
         self.opened.module()
     }
 
-    /// Get the name of the dynamic library.
+    /// Get the name of the dynamic library as raw bytes.
+    ///
+    /// Library filenames need not be valid UTF-8.
     #[inline]
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &[u8] {
         self.module().name()
     }
 
@@ -227,7 +247,11 @@ impl ElfLibrary {
     /// ```
     #[inline]
     pub unsafe fn get<'lib, T>(&'lib self, name: &str) -> Result<Symbol<'lib, T>> {
-        log::info!("Get the symbol [{}] in [{}]", name, self.scope()[0].name());
+        log::info!(
+            "Get the symbol [{}] in [{}]",
+            name,
+            self.scope()[0].name().escape_ascii()
+        );
         self.scope()
             .iter()
             .find_map(|lib| unsafe { lib.get::<T>(name) })
@@ -258,52 +282,13 @@ impl ElfLibrary {
     }
 }
 
+/// A filename represented without requiring UTF-8.
 pub trait AsFilename {
-    fn as_filename(&self) -> &str;
+    fn as_filename(&self) -> &elf_loader::input::Path;
 }
 
-impl AsFilename for str {
-    fn as_filename(&self) -> &str {
-        self
-    }
-}
-
-impl AsFilename for String {
-    fn as_filename(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl<T: AsFilename + ?Sized> AsFilename for &T {
-    fn as_filename(&self) -> &str {
-        (**self).as_filename()
-    }
-}
-
-#[cfg(feature = "std")]
-impl AsFilename for std::path::Path {
-    fn as_filename(&self) -> &str {
-        self.to_str().expect("Path must be valid UTF-8")
-    }
-}
-
-#[cfg(feature = "std")]
-impl AsFilename for std::path::PathBuf {
-    fn as_filename(&self) -> &str {
-        self.to_str().expect("Path must be valid UTF-8")
-    }
-}
-
-#[cfg(feature = "std")]
-impl AsFilename for std::ffi::OsStr {
-    fn as_filename(&self) -> &str {
-        self.to_str().expect("OsStr must be valid UTF-8")
-    }
-}
-
-#[cfg(feature = "std")]
-impl AsFilename for std::ffi::OsString {
-    fn as_filename(&self) -> &str {
-        self.to_str().expect("OsString must be valid UTF-8")
+impl<T: AsRef<elf_loader::input::Path> + ?Sized> AsFilename for T {
+    fn as_filename(&self) -> &elf_loader::input::Path {
+        self.as_ref()
     }
 }

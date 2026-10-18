@@ -19,12 +19,12 @@ use elf_loader::{
         UnloadGroup,
     },
     memory::VmAddr,
-    runtime::DomainId,
+    runtime::{AddressSpaceId, Domain},
 };
 use spin::Lazy;
 
 pub(crate) type GlobalLinkContext = LinkContext<OpenFlags, NativeArch, ActiveTlsResolver>;
-type GlobalUnloadGroup = UnloadGroup<OpenFlags, NativeArch, ActiveTlsResolver>;
+type GlobalUnloadGroup = UnloadGroup<OpenFlags, NativeArch>;
 
 pub(crate) struct ModuleLease {
     inner: Option<NativeModuleLease>,
@@ -103,7 +103,10 @@ pub(crate) struct Manager {
 
 pub(crate) static REGISTRY: Lazy<Registry> = Lazy::new(|| {
     Registry::new(Manager {
-        link_ctx: LinkContext::new(DomainId::PROCESS),
+        link_ctx: LinkContext::new(
+            Domain::new(AddressSpaceId::PROCESS, ActiveTlsResolver::default())
+                .expect("process TLS runtime must provide an entry"),
+        ),
         handles: BTreeMap::new(),
         adds: 0,
         subs: 0,
@@ -120,7 +123,7 @@ pub(crate) unsafe fn global_find<'a, T>(name: &str) -> Option<crate::Symbol<'a, 
             log::trace!(
                 "Lazy Binding: find symbol [{}] from [{}] in global scope ",
                 name,
-                lib.name()
+                lib.name().escape_ascii()
             );
             core::mem::transmute(sym)
         })
@@ -142,7 +145,7 @@ unsafe fn find_symbol<'symbol, 'module, T>(
             log::trace!(
                 "dlsym: find symbol [{}] from [{}] via RTLD_NEXT",
                 name,
-                lib.name()
+                lib.name().escape_ascii()
             );
             core::mem::transmute(sym)
         })
@@ -151,7 +154,7 @@ unsafe fn find_symbol<'symbol, 'module, T>(
 
 impl Manager {
     unsafe fn next_find<'a, T>(&mut self, addr: usize, name: &str) -> Option<crate::Symbol<'a, T>> {
-        let caller = self.link_ctx.module_id_at(VmAddr::new(addr))?;
+        let caller = self.link_ctx.address_at(VmAddr::new(addr))?.owner;
         let caller_instance = self.link_ctx.module(caller).ok()?.state().instance_id();
         let global = self.link_ctx.global_scope().modules();
         let scope = if global
@@ -314,12 +317,12 @@ impl Manager {
             .expect("preloaded modules must remain committed");
     }
 
-    pub(crate) fn add_alias(&mut self, id: ModuleId, alias: &str) {
+    pub(crate) fn add_alias(&mut self, id: ModuleId, alias: &[u8]) {
         let key = self
             .link_ctx
             .module_key(id)
             .expect("alias target must already be committed");
-        if alias.is_empty() || alias == key.as_str() {
+        if alias.is_empty() || alias == key.as_bytes() {
             return;
         }
         self.link_ctx
@@ -335,7 +338,7 @@ impl Manager {
     #[cfg(not(feature = "std"))]
     pub(crate) fn all_values(
         &self,
-    ) -> impl Iterator<Item = &(dyn Module<NativeArch, ActiveTlsResolver> + 'static)> + '_ {
+    ) -> impl Iterator<Item = &(dyn Module<NativeArch> + 'static)> + '_ {
         self.link_ctx
             .load_order()
             .filter_map(|id| self.link_ctx.module(id).ok())
@@ -347,19 +350,19 @@ impl Manager {
         self.open_module(id)
     }
 
-    pub(crate) fn open_existing(&mut self, key: &str, flags: OpenFlags) -> Option<OpenedLibrary> {
+    pub(crate) fn open_existing(&mut self, key: &[u8], flags: OpenFlags) -> Option<OpenedLibrary> {
         let id = self.link_ctx.module_id(key)?;
         self.promote(id, flags);
         self.open_module(id)
     }
 
     pub(crate) fn library_by_addr(&mut self, addr: usize) -> Option<OpenedLibrary> {
-        let id = self.link_ctx.module_id_at(VmAddr::new(addr))?;
+        let id = self.link_ctx.address_at(VmAddr::new(addr))?.owner;
         self.open_module(id)
     }
 
     fn module_by_addr(&mut self, addr: usize) -> Option<NativeModuleHandle> {
-        let id = self.link_ctx.module_id_at(VmAddr::new(addr))?;
+        let id = self.link_ctx.address_at(VmAddr::new(addr))?.owner;
         let scope = self.link_ctx.load_group(id).ok()?;
         let module = scope.first()?.clone();
         module.downcast_ref::<NativeElfModule>()?;
@@ -392,7 +395,7 @@ impl Manager {
 
     #[cfg(feature = "std")]
     pub(crate) fn acquire_module_by_addr(&mut self, addr: usize) -> Option<ModuleLease> {
-        let id = self.link_ctx.module_id_at(VmAddr::new(addr))?;
+        let id = self.link_ctx.address_at(VmAddr::new(addr))?.owner;
         self.acquire_module(id)
     }
 
@@ -443,7 +446,7 @@ impl Manager {
                 continue;
             };
             for alias in libc_compat_aliases(name) {
-                self.add_alias(id, alias);
+                self.add_alias(id, alias.as_bytes());
             }
         }
     }

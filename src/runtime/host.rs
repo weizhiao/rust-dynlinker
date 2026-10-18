@@ -4,23 +4,29 @@ use crate::{
     OpenFlags, Result,
     abi::link_map::LinkMap,
     abi::phdr::{CDlPhdrInfo, DlIteratePhdrCallback},
-    library::{ExtraData, LoadedDylib},
+    library::{ExtraData, HostTlsRegistration, LoadedDylib},
     registry::{DestructorFn, REGISTRY, ThreadAtexitFn, register_thread_destructor},
     runtime::{ARGC, ARGV, ENVP},
 };
 use alloc::{borrow::ToOwned, boxed::Box, ffi::CString, vec::Vec};
 use core::{
     ffi::{CStr, c_char, c_int, c_void},
-    ptr::{NonNull, null_mut},
+    ptr::null_mut,
     sync::atomic::{AtomicBool, Ordering},
 };
 use elf_loader::{
     elf::{ElfDyn, ElfDynamicTag, ElfHeader, ElfPhdr, ElfProgramType},
     image::ElfSegments,
+    input::ModuleSourceId,
     memory::{MappedRegion, VmAddr, VmOffset},
-    tls::{DefaultTlsResolver, TlsTpOffset},
+    runtime::{AddressSpaceId, Domain},
+    tls::{DefaultTlsResolver, TlsInfo},
 };
 use spin::Once;
+
+#[path = "host_tls.rs"]
+mod host_tls;
+use host_tls::{HOST_TLS, HostTlsFn, HostTlsOps, import_host_tls};
 
 #[inline]
 fn get_debug_struct() -> Option<&'static mut GDBDebug> {
@@ -236,7 +242,7 @@ unsafe fn from_raw(
     name: CString,
     base: usize,
     dynamic_ptr: *const ElfDyn,
-    extra: Option<(&'static [ElfPhdr], Option<NonNull<u8>>, Option<usize>)>,
+    extra: Option<(&'static [ElfPhdr], Option<HostTlsRegistration>)>,
     host_link_map: *mut LinkMap,
 ) -> Result<Option<LoadedDylib>> {
     log::info!(
@@ -281,7 +287,7 @@ unsafe fn from_raw(
     };
 
     // 3. Process phdrs and memory length
-    let (phdrs, mut len) = get_phdrs_and_len(base, extra.map(|e| e.0));
+    let (phdrs, mut len) = get_phdrs_and_len(base, extra.as_ref().map(|e| e.0));
     let mut use_phdrs = phdrs;
 
     if !dynamic_table.is_empty()
@@ -293,8 +299,9 @@ unsafe fn from_raw(
         p.set_p_vaddr(VmOffset::new(offset));
     }
 
-    // Filter out PT_TLS if we don't have tls_data (e.g. from host dl_iterate_phdr with null dlpi_tls_data)
-    if extra.as_ref().is_none_or(|e| e.1.is_none()) {
+    // Bootstrap views expose symbols only. Final imported views retain PT_TLS,
+    // even when the current thread has not allocated the host block yet.
+    if extra.is_none() {
         use_phdrs.retain(|p| p.program_type() != ElfProgramType::TLS);
     }
 
@@ -306,7 +313,16 @@ unsafe fn from_raw(
     link_map.l_entry = unsafe { (&*(base as *const ElfHeader)).e_entry() }.wrapping_add(base);
     link_map.l_phnum = use_phdrs.len().min(u16::MAX as usize) as u16;
 
-    let user_data = Some(ExtraData::with_dynamic_table(name, link_map, dynamic_table));
+    let host_tls = extra.and_then(|e| e.1);
+    let tls = host_tls.as_ref().map(|registration| registration.0.clone());
+    // The caller owns the local bridge registration. Its provider retains the
+    // host dlopen handle; the imported Relink view only borrows its metadata.
+    let user_data = Some(ExtraData::with_dynamic_table(
+        name,
+        link_map,
+        dynamic_table,
+        host_tls,
+    ));
 
     len = (len + 0xfff) & !0xfff; // align to page size
 
@@ -323,12 +339,11 @@ unsafe fn from_raw(
     let lib = unsafe {
         LoadedDylib::new_unchecked(
             name_str.clone(),
+            ModuleSourceId::fresh(),
             use_phdrs,
             segments,
-            DefaultTlsResolver::new(),
-            extra
-                .and_then(|e| e.2)
-                .map(|o| TlsTpOffset::new(-(o as isize))),
+            Domain::new(AddressSpaceId::PROCESS, DefaultTlsResolver::new())?,
+            tls,
             user_data,
         )
     }
@@ -432,6 +447,9 @@ fn find_iterate_phdr(start: *mut LinkMap) -> Option<IterPhdr> {
     }
 
     let mut iter_phdr = None;
+    let mut tls_get_addr = None;
+    let mut tls_libc = None;
+    let interpreter_base = get_auxv(AT_BASE);
     for cur_map in (LinkMapIter { current: start }) {
         let name_ptr = if cur_map.l_name.is_null() {
             c"".as_ptr()
@@ -446,9 +464,14 @@ fn find_iterate_phdr(start: *mut LinkMap) -> Option<IterPhdr> {
         }
 
         let is_main = ns.is_empty();
-        let is_libc = (ns.contains("libc") || ns.contains("ld-musl")) && ns.contains(".so");
+        let filename = ns.rsplit('/').next().unwrap_or_default();
+        let is_libc = filename == "libc.so.6"
+            || filename == "libc.so"
+            || filename.starts_with("libc-")
+            || filename.starts_with("ld-musl-");
 
-        if is_main || is_libc {
+        let is_loader = interpreter_base != 0 && cur_map.l_addr as usize == interpreter_base;
+        if is_main || is_libc || is_loader {
             let lib = unsafe {
                 from_raw(
                     name.to_owned(),
@@ -462,7 +485,13 @@ fn find_iterate_phdr(start: *mut LinkMap) -> Option<IterPhdr> {
             .flatten();
 
             if let Some(lib) = lib {
+                if is_libc || is_loader {
+                    tls_get_addr = tls_get_addr.or_else(|| unsafe {
+                        lib.get::<HostTlsFn>("__tls_get_addr").map(|symbol| *symbol)
+                    });
+                }
                 if is_libc {
+                    tls_libc = Some(lib.clone());
                     init_libc_thread_atexit(&lib);
                 }
                 update_libc_globals(&lib);
@@ -478,6 +507,11 @@ fn find_iterate_phdr(start: *mut LinkMap) -> Option<IterPhdr> {
         }
     }
 
+    if let (Some(lib), Some(get_addr)) = (tls_libc, tls_get_addr)
+        && let Some(ops) = unsafe { HostTlsOps::from_libc(&lib, get_addr) }
+    {
+        HOST_TLS.call_once(|| ops);
+    }
     Some(iter_phdr.expect("iterate_phdr: could not find libc with dl_iterate_phdr"))
 }
 
@@ -491,22 +525,19 @@ unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut 
         .map(|p| (base + p.p_vaddr().get()) as *const ElfDyn)
         .expect("No PT_DYNAMIC found in phdrs");
 
-    // Calculate static TLS offset if applicable
-    let static_offset = (!info.dlpi_tls_data.is_null()).then(|| {
-        (DefaultTlsResolver::get_thread_pointer() as usize)
-            .wrapping_sub(info.dlpi_tls_data as usize)
-    });
+    let tls = phdrs
+        .iter()
+        .find(|phdr| phdr.program_type() == ElfProgramType::TLS)
+        .map(|phdr| unsafe { import_host_tls(info, TlsInfo::new(phdr)) })
+        .transpose()
+        .expect("cannot import host TLS");
 
     let lib = unsafe {
         from_raw(
             CStr::from_ptr(info.dlpi_name).to_owned(),
             base,
             dynamic_ptr,
-            Some((
-                phdrs,
-                NonNull::new(info.dlpi_tls_data as *mut _),
-                static_offset,
-            )),
+            Some((phdrs, tls)),
             find_host_link_map(base),
         )
     }
@@ -515,7 +546,7 @@ unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut 
 
     log::info!(
         "Initialize lib: [{}] @ [{:#x}]",
-        lib.name(),
+        lib.name().escape_ascii(),
         lib.segments().base().get()
     );
     let registry = REGISTRY.lock();

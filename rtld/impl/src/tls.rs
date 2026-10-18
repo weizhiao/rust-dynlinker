@@ -108,7 +108,6 @@ enum TlsModule {
         source: Option<TlsImageSource>,
     },
     Static {
-        info: TlsInfo,
         offset: TlsTpOffset,
     },
 }
@@ -198,10 +197,7 @@ fn register_static_module(tls_info: &TlsInfo) -> ElfResult<(TlsModuleId, TlsTpOf
     }
 
     let offset = TlsTpOffset::new(-(used as isize));
-    let id = register_module(TlsModule::Static {
-        info: *tls_info,
-        offset,
-    })?;
+    let id = register_module(TlsModule::Static { offset })?;
     area.used = used;
     area.max_align = area.max_align.max(align);
     STATIC_TLS_MODULES.lock().push(StaticTlsModule {
@@ -214,10 +210,7 @@ fn register_static_module(tls_info: &TlsInfo) -> ElfResult<(TlsModuleId, TlsTpOf
 }
 
 fn add_static_module(tls_info: &TlsInfo, offset: TlsTpOffset) -> ElfResult<TlsModuleId> {
-    let id = register_module(TlsModule::Static {
-        info: *tls_info,
-        offset,
-    })?;
+    let id = register_module(TlsModule::Static { offset })?;
     STATIC_TLS_MODULES.lock().push(StaticTlsModule {
         id,
         info: *tls_info,
@@ -227,89 +220,47 @@ fn add_static_module(tls_info: &TlsInfo, offset: TlsTpOffset) -> ElfResult<TlsMo
     Ok(id)
 }
 
-fn init_tls_module(
-    source: TlsImageSource,
-    id: TlsModuleId,
-    offset: Option<TlsTpOffset>,
-) -> ElfResult<()> {
-    match (tls_module(id), offset) {
-        (Some(TlsModule::Dynamic { info, .. }), None) => init_dynamic_tls(info, source, id),
-        (
-            Some(TlsModule::Static {
-                info,
-                offset: registered,
-            }),
-            Some(offset),
-        ) if offset == registered => init_static_tls(info, source, id, offset),
-        (None, _) => Err(TlsError::InvalidModuleId { mod_id: id }.into()),
-        _ => Err(TlsError::ModuleMismatch.into()),
+fn init_tls_module(source: TlsImageSource, id: TlsModuleId) -> ElfResult<()> {
+    {
+        let mut modules = TLS_MODULES.lock();
+        let module = id
+            .get()
+            .checked_sub(1)
+            .and_then(|index| modules.get_mut(index))
+            .and_then(Option::as_mut)
+            .ok_or(TlsError::InvalidModuleId { mod_id: id })?;
+        if let TlsModule::Dynamic { source: image, .. } = module {
+            assert!(image.is_none(), "TLS template must be published only once");
+            *image = Some(source);
+            return Ok(());
+        }
     }
-}
-
-fn init_dynamic_tls(info: TlsInfo, source: TlsImageSource, id: TlsModuleId) -> ElfResult<()> {
-    let raw = id.get();
-    if raw == 0 {
-        return Err(TlsError::ResolverUnsupported.into());
-    }
-
-    let mut modules = TLS_MODULES.lock();
-    let Some(slot) = modules.get_mut(raw - 1) else {
-        return Err(TlsError::ResolverUnsupported.into());
-    };
-    *slot = Some(TlsModule::Dynamic {
-        info,
-        source: Some(source),
-    });
+    init_static_tls(source, id);
     Ok(())
 }
 
-fn init_static_tls(
-    info: TlsInfo,
-    source: TlsImageSource,
-    id: TlsModuleId,
-    offset: TlsTpOffset,
-) -> ElfResult<()> {
-    update_static_module_slot(id, info, offset)?;
+fn init_static_tls(source: TlsImageSource, id: TlsModuleId) {
     let module = {
         let mut modules = STATIC_TLS_MODULES.lock();
-        if let Some(module) = modules.iter_mut().find(|module| module.id == id) {
-            module.info = info;
-            module.source = Some(source);
-            module.offset = offset;
-            module.clone()
-        } else {
-            let module = StaticTlsModule {
-                id,
-                info,
-                source: Some(source),
-                offset,
-            };
-            modules.push(module.clone());
-            module
-        }
+        let module = modules
+            .iter_mut()
+            .find(|module| module.id == id)
+            .expect("registered static TLS module must have an initialization record");
+        assert!(
+            module.source.is_none(),
+            "TLS template must be published only once"
+        );
+        module.source = Some(source);
+        module.clone()
     };
 
-    if let Some((tp, used)) = STATIC_TLS.lock().as_ref().map(|area| (area.tp, area.used)) {
+    let current = STATIC_TLS.lock().as_ref().map(|area| (area.tp, area.used));
+    if let Some((tp, used)) = current {
         unsafe {
             init_static_tls_module(tp, &module);
             init_rseq_area(tp, used);
         }
     }
-    Ok(())
-}
-
-fn update_static_module_slot(id: TlsModuleId, info: TlsInfo, offset: TlsTpOffset) -> ElfResult<()> {
-    let raw = id.get();
-    if raw == 0 {
-        return Err(TlsError::ResolverUnsupported.into());
-    }
-
-    let mut modules = TLS_MODULES.lock();
-    let Some(slot) = modules.get_mut(raw - 1) else {
-        return Err(TlsError::ResolverUnsupported.into());
-    };
-    *slot = Some(TlsModule::Static { info, offset });
-    Ok(())
 }
 
 fn ensure_static_tls_area() -> ElfResult<StaticTlsArea> {

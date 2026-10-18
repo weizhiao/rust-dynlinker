@@ -7,10 +7,10 @@ fn glibc_234_compat_sonames_resolve_to_libc() {
     for soname in ["libdl.so.2", "libpthread.so.0", "librt.so.1"] {
         let lib = ElfLibrary::dlopen(soname, OpenFlags::RTLD_NOW).unwrap();
         assert!(
-            lib.name() == "libc.so.6" || lib.name().contains("libc.so"),
+            lib.name() == b"libc.so.6" || lib.name().windows(7).any(|part| part == b"libc.so"),
             "{soname} resolved to {} ({}) instead of libc",
-            lib.name(),
-            lib.name()
+            lib.name().escape_ascii(),
+            lib.name().escape_ascii()
         );
     }
 }

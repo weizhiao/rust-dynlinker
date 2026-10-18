@@ -25,7 +25,7 @@
 - **Dependency resolution:** Handle `DT_NEEDED`, `RPATH`, `RUNPATH`, `ld.so.cache`, and common system search paths.
 - **Symbol lookup:** Provide Rust APIs and C ABI entry points, including global lookup, dependency scopes, `RTLD_NEXT`, and `RTLD_DEFAULT`.
 - **Relocation:** Support regular dynamic relocations, PLT/GOT relocation, lazy binding, and RELR.
-- **TLS:** Support dynamic TLS, static TLS registration, and initial-thread TLS needed during rtld startup.
+- **TLS:** Support dynamic TLS, static TLS registration, and initial-thread TLS needed during rtld startup. Imported host TLS keeps its native storage and library handle; Relink resolves it through the original host runtime. Host static TP offsets currently use the x86_64 glibc 2.39 layout adapter; other layouts do not expose a static offset.
 - **`no_std`:** Run the core loading path without `std`, with an optional Linux syscall backend via `use-syscall`.
 - **Replacement rtld:** Build an experimental ELF interpreter that advertises itself as `ld-linux-x86-64.so.2`.
 

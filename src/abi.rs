@@ -82,6 +82,8 @@ pub mod link_map {
     use core::ffi::{c_char, c_void};
 
     use super::elf::ElfPhdr;
+    use elf_loader::memory::VmAddr;
+    use elf_loader::tls::TlsBinding;
 
     #[derive(Debug, Clone, Copy)]
     #[repr(C)]
@@ -115,6 +117,26 @@ pub mod link_map {
     }
 
     impl LinkMap {
+        /// Initializes TLS ABI fields on a freshly zeroed link map.
+        pub(crate) fn init_tls(
+            &mut self,
+            base: VmAddr,
+            tls_phdr: Option<&ElfPhdr>,
+            tls: Option<TlsBinding>,
+        ) {
+            let Some(tls) = tls else { return };
+            self.l_tls_modid = tls.mod_id().get();
+            self.l_tls_offset = tls.tp_offset().map_or(0, |offset| offset.get());
+            let Some(tls) = tls_phdr else { return };
+            self.l_tls_blocksize = tls.p_memsz();
+            self.l_tls_align = tls.p_align();
+            self.l_tls_firstbyte_offset = tls.p_vaddr().get() & tls.p_align().saturating_sub(1);
+            self.l_tls_initimage_size = tls.p_filesz();
+            if tls.p_filesz() != 0 {
+                self.l_tls_initimage = (base + tls.p_vaddr()).as_mut_ptr();
+            }
+        }
+
         pub const fn zero() -> Self {
             Self {
                 l_addr: core::ptr::null_mut(),

@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
 
     if let Some(info) = ElfLibrary::dladdr(addr) {
         println!("\nSymbol info for 'add':");
-        println!("  File: {}", info.dylib().name());
+        println!("  File: {}", info.dylib().name().escape_ascii());
         if let Some(sname) = info.symbol_name() {
             println!("  Symbol: {}", sname);
         }

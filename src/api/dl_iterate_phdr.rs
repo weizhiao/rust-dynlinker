@@ -8,8 +8,11 @@ use core::{
     ptr::null_mut,
 };
 #[cfg(feature = "std")]
-use elf_loader::tls::DefaultTlsResolver;
-use elf_loader::{elf::ElfPhdr, tls::TlsModuleId};
+use elf_loader::tls::{DefaultTlsResolver, TlsResolver};
+use elf_loader::{
+    elf::ElfPhdr,
+    tls::{TlsModule, TlsModuleId},
+};
 
 pub struct DlPhdrInfo<'lib> {
     lib_base: usize,
@@ -22,13 +25,16 @@ pub struct DlPhdrInfo<'lib> {
 }
 
 #[cfg(not(feature = "std"))]
-fn tls_data_ptr(mod_id: TlsModuleId) -> *mut c_void {
-    crate::runtime::rtld::tls_get_addr_soft(mod_id).cast()
+fn tls_data_ptr(module: &TlsModule) -> *mut c_void {
+    crate::runtime::rtld::tls_get_addr_soft(module).cast()
 }
 
 #[cfg(feature = "std")]
-fn tls_data_ptr(mod_id: TlsModuleId) -> *mut c_void {
-    DefaultTlsResolver::get_ptr(mod_id)
+fn tls_data_ptr(module: &TlsModule) -> *mut c_void {
+    if DefaultTlsResolver::new().bind_tls_get_addr().ok() != Some(module.entry()) {
+        return null_mut();
+    }
+    DefaultTlsResolver::get_ptr_if_allocated(module.mod_id())
         .map(|ptr| ptr.cast())
         .unwrap_or(null_mut())
 }
@@ -95,8 +101,9 @@ fn for_each_phdr<E>(
         if phdrs.is_empty() {
             continue;
         }
-        let tls_modid = module.tls().map(|tls| tls.mod_id());
-        let tls_data = tls_modid.map(tls_data_ptr).unwrap_or(null_mut());
+        let tls = module.tls();
+        let tls_modid = tls.map(TlsModule::mod_id);
+        let tls_data = tls.map(tls_data_ptr).unwrap_or(null_mut());
         let info = DlPhdrInfo {
             lib_base: module.segments().base().get(),
             lib_name: extra_data.c_name().as_ptr(),

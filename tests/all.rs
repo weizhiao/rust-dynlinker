@@ -373,7 +373,7 @@ fn soname_alias() {
     let path = lib_path("libpromotion.so");
 
     let lib = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW).unwrap();
-    assert_eq!(lib.name(), "libpromotion.so");
+    assert_eq!(lib.name(), b"libpromotion.so");
 
     let by_soname = ElfLibrary::dlopen(
         "libpromotion_soname.so.1",

@@ -9,10 +9,10 @@ use crate::{
 };
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 use core::ffi::{c_char, c_void};
-use elf_loader::{Loader as ElfLoader, linker::ModuleId};
+use elf_loader::{Loader as ElfLoader, linker::ModuleId, runtime::Domain};
 use spin::Mutex;
 
-type RuntimeLoader = ElfLoader<Option<ExtraData>, ActiveTlsResolver>;
+type RuntimeLoader = ElfLoader<Option<ExtraData>>;
 
 static STARTUP_ROOT: Mutex<Option<ModuleId>> = Mutex::new(None);
 
@@ -37,15 +37,18 @@ pub fn register_tls_ops(ops: RtldTlsOps) {
 }
 
 #[doc(hidden)]
-pub fn tls_get_addr_soft(mod_id: TlsModuleId) -> *mut u8 {
-    tls::tls_get_addr_soft(mod_id)
+pub fn tls_get_addr_soft(module: &elf_loader::tls::TlsModule) -> *mut u8 {
+    tls::tls_get_addr_soft(module)
 }
 
 fn loader() -> RuntimeLoader {
     ElfLoader::new()
         .with_data::<Option<ExtraData>>()
-        .with_tls_resolver(ActiveTlsResolver::default())
         .with_static_tls(true)
+}
+
+fn domain() -> Domain<NativeArch, ActiveTlsResolver> {
+    REGISTRY.lock().borrow_mut().context_mut().domain().clone()
 }
 
 #[doc(hidden)]
@@ -54,8 +57,11 @@ pub fn load_exec(
 ) -> ElfResult<
     RawExec<Option<ExtraData>, NativeArch, elf_loader::memory::HostRegion, ActiveTlsResolver>,
 > {
-    let mut observer = DlopenObserver::new(OpenFlags::empty());
-    loader().run().with_observer(&mut observer).load_exec(path)
+    let mut observer = DlopenObserver;
+    loader()
+        .run(domain())
+        .with_observer(&mut observer)
+        .load_exec(path)
 }
 
 /// # Safety
@@ -69,10 +75,10 @@ pub unsafe fn load_mapped(
     phdrs: Vec<elf::ElfPhdr>,
     entry: usize,
 ) -> ElfResult<ElfDylib> {
-    let mut observer = DlopenObserver::new(OpenFlags::empty());
+    let mut observer = DlopenObserver;
     unsafe {
         loader()
-            .run()
+            .run(domain())
             .with_observer(&mut observer)
             .load_mapped_dynamic(path, load_bias, phdrs, entry)
     }
@@ -114,17 +120,25 @@ pub fn link_mapped_root(
 ) -> Result<()> {
     let name = raw.name();
     let root_key = if name.is_empty() {
-        "main"
+        b"main".as_slice()
     } else {
-        name.rsplit(['/', '\\']).next().unwrap_or(name)
+        name.rsplit(|byte| matches!(byte, b'/' | b'\\'))
+            .next()
+            .unwrap_or(name)
     }
     .to_owned();
     let mut startup_root = None;
-    let opened = open_mapped(root_request, root_key, raw, flags, |root| {
-        startup_root = Some(root);
-        let state = startup_state(root, rtld)?;
-        before_init(state)
-    })?;
+    let opened = open_mapped(
+        elf_loader::input::Path::new(root_request),
+        root_key,
+        raw,
+        flags,
+        |root| {
+            startup_root = Some(root);
+            let state = startup_state(root, rtld)?;
+            before_init(state)
+        },
+    )?;
     *STARTUP_ROOT.lock() = startup_root;
     drop(opened);
     Ok(())
@@ -167,7 +181,7 @@ fn startup_state(root: ModuleId, rtld: *mut link_map::LinkMap) -> Result<Startup
             .expect("loaded dependency must have extra data")
             .link_map();
 
-        if dep.name() == "libc.so.6" {
+        if dep.name() == b"libc.so.6" {
             libc_map = link_map;
         }
         let is_rtld = link_map == rtld
@@ -220,98 +234,111 @@ pub unsafe fn find_loaded_symbol<T: Copy>(name: &str) -> Option<T> {
 }
 
 mod tls {
-    use alloc::vec::Vec;
     use elf_loader::{
         Result,
         arch::NativeArch,
         memory::VmAddr,
         tls::{
-            DefaultTlsResolver, ModuleTls, TlsImageSource, TlsIndex, TlsInfo, TlsModuleId,
-            TlsRequest, TlsResolver, TlsTpOffset,
+            DefaultTlsResolver, TlsBinding, TlsImageSource, TlsIndex, TlsInfo, TlsModule,
+            TlsModuleId, TlsRequest, TlsResolver, TlsTpOffset,
         },
     };
-    use spin::{Mutex, Once};
+    use spin::Once;
 
     pub type ActiveTlsResolver = RtldTlsResolver;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     pub struct RtldTlsOps {
         pub register: fn(&TlsInfo) -> Result<TlsModuleId>,
         pub register_static: fn(&TlsInfo) -> Result<(TlsModuleId, TlsTpOffset)>,
         pub add_static_tls: fn(&TlsInfo, TlsTpOffset) -> Result<TlsModuleId>,
-        pub init_tls: fn(TlsImageSource, TlsModuleId, Option<TlsTpOffset>) -> Result<()>,
+        pub init_tls: fn(TlsImageSource, TlsModuleId) -> Result<()>,
         pub unregister: fn(TlsModuleId),
         pub tls_get_addr: extern "C" fn(*const TlsIndex) -> *mut u8,
         pub tls_get_addr_soft: fn(TlsModuleId) -> *mut u8,
     }
 
     static RTLD_TLS_OPS: Once<RtldTlsOps> = Once::new();
-    static TLS_MODULES: Mutex<Vec<(TlsModuleId, Option<TlsTpOffset>)>> = Mutex::new(Vec::new());
 
     pub(crate) fn register_ops(ops: RtldTlsOps) {
         RTLD_TLS_OPS.call_once(|| ops);
     }
 
-    pub(crate) fn tls_get_addr_soft(mod_id: TlsModuleId) -> *mut u8 {
+    pub(crate) fn tls_get_addr_soft(module: &TlsModule) -> *mut u8 {
+        let mod_id = module.mod_id();
         if mod_id.is_reserved() {
             return core::ptr::null_mut();
         }
-        if let Some(ops) = RTLD_TLS_OPS.get() {
+        // The two runtimes have independent ID namespaces. Installing rtld's
+        // callbacks must not redirect registrations created by the default runtime.
+        let entry = module.entry();
+        if let Some(ops) = RTLD_TLS_OPS.get()
+            && entry == VmAddr::from_ptr(ops.tls_get_addr as *const ())
+        {
             return (ops.tls_get_addr_soft)(mod_id);
         }
-        DefaultTlsResolver::get_ptr(mod_id).unwrap_or(core::ptr::null_mut())
+        if DefaultTlsResolver::new().bind_tls_get_addr().ok() == Some(entry) {
+            return DefaultTlsResolver::get_ptr_if_allocated(mod_id)
+                .unwrap_or(core::ptr::null_mut());
+        }
+        core::ptr::null_mut()
     }
 
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct RtldTlsResolver;
+    #[derive(Clone, Copy, Debug)]
+    enum Backend {
+        Default,
+        Rtld(&'static RtldTlsOps),
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct RtldTlsResolver {
+        backend: Backend,
+    }
 
     impl RtldTlsResolver {
-        pub const fn new() -> Self {
-            Self
+        pub fn new() -> Self {
+            Self {
+                backend: RTLD_TLS_OPS.get().map_or(Backend::Default, Backend::Rtld),
+            }
+        }
+    }
+
+    impl Default for RtldTlsResolver {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
     impl TlsResolver<NativeArch> for RtldTlsResolver {
         const OVERRIDE_TLS_GET_ADDR: bool = true;
 
-        fn register(&self, info: TlsInfo, request: TlsRequest) -> Result<ModuleTls> {
-            let Some(ops) = RTLD_TLS_OPS.get() else {
+        fn register(&self, info: TlsInfo, request: TlsRequest) -> Result<TlsModule> {
+            let Backend::Rtld(ops) = self.backend else {
                 return DefaultTlsResolver::new().register(info, request);
             };
+            let entry = self.bind_tls_get_addr()?;
             let module = match request {
-                TlsRequest::Dynamic => ModuleTls::Dynamic {
-                    mod_id: (ops.register)(&info)?,
-                },
+                TlsRequest::Dynamic => TlsBinding::new((ops.register)(&info)?, None),
                 TlsRequest::Static(None) => {
                     let (mod_id, tp_offset) = (ops.register_static)(&info)?;
-                    ModuleTls::Static { mod_id, tp_offset }
+                    TlsBinding::new(mod_id, Some(tp_offset))
                 }
-                TlsRequest::Static(Some(tp_offset)) => ModuleTls::Static {
-                    mod_id: (ops.add_static_tls)(&info, tp_offset)?,
-                    tp_offset,
-                },
+                TlsRequest::Static(Some(tp_offset)) => {
+                    TlsBinding::new((ops.add_static_tls)(&info, tp_offset)?, Some(tp_offset))
+                }
             };
-            TLS_MODULES
-                .lock()
-                .push((module.mod_id(), module.tp_offset()));
-            Ok(module)
+            Ok(unsafe { TlsModule::new(module, entry) })
         }
 
         fn publish(&self, source: TlsImageSource, mod_id: TlsModuleId) -> Result<()> {
-            let Some(ops) = RTLD_TLS_OPS.get() else {
+            let Backend::Rtld(ops) = self.backend else {
                 return DefaultTlsResolver::new().publish(source, mod_id);
             };
-            let offset = TLS_MODULES
-                .lock()
-                .iter()
-                .find(|(id, _)| *id == mod_id)
-                .and_then(|(_, offset)| *offset);
-            (ops.init_tls)(source, mod_id, offset)
+            (ops.init_tls)(source, mod_id)
         }
 
         fn unregister(&self, mod_id: TlsModuleId) {
-            if let Some(ops) = RTLD_TLS_OPS.get() {
-                TLS_MODULES.lock().retain(|(id, _)| *id != mod_id);
+            if let Backend::Rtld(ops) = self.backend {
                 (ops.unregister)(mod_id);
                 return;
             }
@@ -319,7 +346,7 @@ mod tls {
         }
 
         fn bind_tls_get_addr(&self) -> Result<VmAddr> {
-            if let Some(ops) = RTLD_TLS_OPS.get() {
+            if let Backend::Rtld(ops) = self.backend {
                 return Ok(VmAddr::from_ptr(ops.tls_get_addr as *const ()));
             }
             DefaultTlsResolver::new().bind_tls_get_addr()

@@ -176,6 +176,8 @@ impl ImageMemory for BootstrapMemory {
         None
     }
 
+    fn visit_ranges(&self, _f: &mut dyn FnMut(core::ops::Range<VmAddr>)) {}
+
     fn host_ptr(&self, addr: VmAddr) -> Option<NonNull<u8>> {
         NonNull::new(addr.get() as *mut u8)
     }
