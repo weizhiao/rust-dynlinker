@@ -104,7 +104,8 @@ pub(crate) struct Manager {
 pub(crate) static REGISTRY: Lazy<Registry> = Lazy::new(|| {
     Registry::new(Manager {
         link_ctx: LinkContext::new(
-            Domain::native(AddressSpaceId::PROCESS).with_tls(ActiveTlsResolver::default())
+            Domain::native(AddressSpaceId::PROCESS)
+                .with_tls(ActiveTlsResolver::default())
                 .expect("process TLS runtime must provide an entry"),
         ),
         handles: BTreeMap::new(),
@@ -114,48 +115,50 @@ pub(crate) static REGISTRY: Lazy<Registry> = Lazy::new(|| {
 });
 
 /// Finds a symbol in the global search scope.
-pub(crate) unsafe fn global_find<'a, T>(name: &str) -> Option<crate::Symbol<'a, T>> {
+pub(crate) unsafe fn global_find<'a, T>(name: &str) -> crate::Result<Option<crate::Symbol<'a, T>>> {
     let registry = REGISTRY.lock();
     let manager = registry.borrow();
     let global = manager.link_ctx.global_scope().modules();
-    global.iter().find_map(|lib| unsafe {
-        lib.get::<T>(name).map(|sym| {
-            log::trace!(
-                "Lazy Binding: find symbol [{}] from [{}] in global scope ",
-                name,
-                lib.name().escape_ascii()
-            );
-            core::mem::transmute(sym)
-        })
-    })
+    unsafe { find_symbol(global.iter(), name) }
 }
 
 /// Finds the next occurrence of a symbol after the specified address.
-pub(crate) unsafe fn next_find<'a, T>(addr: usize, name: &str) -> Option<crate::Symbol<'a, T>> {
+pub(crate) unsafe fn next_find<'a, T>(
+    addr: usize,
+    name: &str,
+) -> crate::Result<Option<crate::Symbol<'a, T>>> {
     let registry = REGISTRY.lock();
     unsafe { registry.borrow_mut().next_find(addr, name) }
 }
 
 unsafe fn find_symbol<'symbol, 'module, T>(
-    mut modules: impl Iterator<Item = &'module NativeModuleHandle>,
+    modules: impl Iterator<Item = &'module NativeModuleHandle>,
     name: &str,
-) -> Option<crate::Symbol<'symbol, T>> {
-    modules.find_map(|lib| unsafe {
-        lib.get::<T>(name).map(|sym| {
+) -> crate::Result<Option<crate::Symbol<'symbol, T>>> {
+    for lib in modules {
+        if let Some(symbol) = unsafe { lib.get::<T>(name) }? {
             log::trace!(
-                "dlsym: find symbol [{}] from [{}] via RTLD_NEXT",
+                "find symbol [{}] from [{}]",
                 name,
                 lib.name().escape_ascii()
             );
-            core::mem::transmute(sym)
-        })
-    })
+            return Ok(Some(unsafe { core::mem::transmute(symbol) }));
+        }
+    }
+    Ok(None)
 }
 
 impl Manager {
-    unsafe fn next_find<'a, T>(&mut self, addr: usize, name: &str) -> Option<crate::Symbol<'a, T>> {
-        let caller = self.link_ctx.address_at(VmAddr::new(addr))?.owner;
-        let caller_instance = self.link_ctx.module(caller).ok()?.state().instance_id();
+    unsafe fn next_find<'a, T>(
+        &mut self,
+        addr: usize,
+        name: &str,
+    ) -> crate::Result<Option<crate::Symbol<'a, T>>> {
+        let Some(address) = self.link_ctx.address_at(VmAddr::new(addr)) else {
+            return Ok(None);
+        };
+        let caller = address.owner;
+        let caller_instance = self.link_ctx.module(caller)?.state().instance_id();
         let global = self.link_ctx.global_scope().modules();
         let scope = if global
             .iter()
@@ -163,7 +166,7 @@ impl Manager {
         {
             global
         } else {
-            self.link_ctx.load_group(caller).ok()?
+            self.link_ctx.load_group(caller)?
         };
 
         unsafe {
@@ -193,20 +196,16 @@ pub(crate) fn release_handle(handle: usize) -> bool {
     valid
 }
 
-pub(crate) unsafe fn handle_find<'a, T>(handle: usize, name: &str) -> Option<crate::Symbol<'a, T>> {
+pub(crate) unsafe fn handle_find<'a, T>(
+    handle: usize,
+    name: &str,
+) -> crate::Result<Option<crate::Symbol<'a, T>>> {
     let registry = REGISTRY.lock();
     let manager = registry.borrow();
-    manager
-        .handles
-        .get(&handle)?
-        .opened
-        .scope()
-        .iter()
-        .find_map(|module| unsafe {
-            module
-                .get::<T>(name)
-                .map(|symbol| core::mem::transmute(symbol))
-        })
+    let Some(handle) = manager.handles.get(&handle) else {
+        return Ok(None);
+    };
+    unsafe { find_symbol(handle.opened.scope().iter(), name) }
 }
 
 #[cfg(not(feature = "std"))]

@@ -32,23 +32,13 @@ pub(crate) type NativeModuleScope = ModuleScope<NativeArch>;
 
 /// Caller-owned local registration used to expose a host module's TLS.
 #[cfg(feature = "std")]
-pub(crate) struct HostTlsRegistration(pub(crate) elf_loader::tls::TlsModule);
-
-#[cfg(feature = "std")]
-impl Drop for HostTlsRegistration {
-    fn drop(&mut self) {
-        use elf_loader::tls::TlsResolver;
-        ActiveTlsResolver::new().unregister(self.0.mod_id());
-    }
-}
+pub(crate) type HostTlsRegistration = elf_loader::tls::TlsRegistration;
 
 pub struct ExtraData {
     c_name: CString,
     link_map: Box<LinkMap>,
     #[cfg(feature = "std")]
     dynamic_table: Box<[ElfDyn]>,
-    #[cfg(feature = "std")]
-    _host_tls: Option<HostTlsRegistration>,
 }
 
 impl ExtraData {
@@ -59,8 +49,6 @@ impl ExtraData {
             link_map,
             #[cfg(feature = "std")]
             dynamic_table: Box::default(),
-            #[cfg(feature = "std")]
-            _host_tls: None,
         }
     }
 
@@ -70,13 +58,11 @@ impl ExtraData {
         c_name: CString,
         link_map: Box<LinkMap>,
         dynamic_table: Box<[ElfDyn]>,
-        host_tls: Option<HostTlsRegistration>,
     ) -> Self {
         Self {
             c_name,
             link_map,
             dynamic_table,
-            _host_tls: host_tls,
         }
     }
 
@@ -254,7 +240,8 @@ impl ElfLibrary {
         );
         self.scope()
             .iter()
-            .find_map(|lib| unsafe { lib.get::<T>(name) })
+            .find_map(|lib| unsafe { lib.get::<T>(name) }.transpose())
+            .transpose()?
             .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
     }
 
@@ -277,7 +264,8 @@ impl ElfLibrary {
     ) -> Result<Symbol<'lib, T>> {
         self.scope()
             .iter()
-            .find_map(|lib| unsafe { lib.get_version(name, version) })
+            .find_map(|lib| unsafe { lib.get_version(name, version) }.transpose())
+            .transpose()?
             .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
     }
 }

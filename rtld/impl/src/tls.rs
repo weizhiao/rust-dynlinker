@@ -4,8 +4,7 @@ use alloc::{
 };
 use core::{alloc::Layout, ffi::c_void, ptr};
 use dlopen_rs::rtld::{
-    self, ElfResult, RtldTlsOps, TlsError, TlsImageSource, TlsIndex, TlsInfo, TlsModuleId,
-    TlsTpOffset,
+    self, ElfResult, RtldTlsOps, TlsError, TlsIndex, TlsInfo, TlsModuleId, TlsTemplate, TlsTpOffset,
 };
 use spin::Mutex;
 
@@ -95,7 +94,7 @@ static STATIC_TLS: Mutex<Option<StaticTlsArea>> = Mutex::new(None);
 struct StaticTlsModule {
     id: TlsModuleId,
     info: TlsInfo,
-    source: Option<TlsImageSource>,
+    source: Option<TlsTemplate>,
     offset: TlsTpOffset,
 }
 
@@ -105,7 +104,7 @@ static STATIC_TLS_MODULES: Mutex<Vec<StaticTlsModule>> = Mutex::new(Vec::new());
 enum TlsModule {
     Dynamic {
         info: TlsInfo,
-        source: Option<TlsImageSource>,
+        source: Option<TlsTemplate>,
     },
     Static {
         offset: TlsTpOffset,
@@ -220,7 +219,7 @@ fn add_static_module(tls_info: &TlsInfo, offset: TlsTpOffset) -> ElfResult<TlsMo
     Ok(id)
 }
 
-fn init_tls_module(source: TlsImageSource, id: TlsModuleId) -> ElfResult<()> {
+fn init_tls_module(source: TlsTemplate, id: TlsModuleId) -> ElfResult<()> {
     {
         let mut modules = TLS_MODULES.lock();
         let module = id
@@ -239,7 +238,7 @@ fn init_tls_module(source: TlsImageSource, id: TlsModuleId) -> ElfResult<()> {
     Ok(())
 }
 
-fn init_static_tls(source: TlsImageSource, id: TlsModuleId) {
+fn init_static_tls(source: TlsTemplate, id: TlsModuleId) {
     let module = {
         let mut modules = STATIC_TLS_MODULES.lock();
         let module = modules
@@ -336,7 +335,7 @@ fn static_tls_addr(offset: TlsTpOffset, ti_offset: usize) -> *mut u8 {
 fn dynamic_tls_addr(
     id: TlsModuleId,
     info: &TlsInfo,
-    source: Option<&TlsImageSource>,
+    source: Option<&TlsTemplate>,
     ti_offset: usize,
 ) -> *mut u8 {
     let tp = crate::arch::get_thread_pointer();
@@ -358,8 +357,9 @@ fn allocate_dynamic_block(
     tp: *mut u8,
     id: TlsModuleId,
     info: &TlsInfo,
-    source: Option<&TlsImageSource>,
+    source: Option<&TlsTemplate>,
 ) -> Option<*mut u8> {
+    let image = source?.as_ref();
     let align = info.align.max(1).checked_next_power_of_two().unwrap_or(1);
     let layout = Layout::from_size_align(info.memsz.max(1), align).ok()?;
     let ptr = unsafe { alloc_zeroed(layout) };
@@ -367,17 +367,9 @@ fn allocate_dynamic_block(
         handle_alloc_error(layout);
     }
 
-    let source = source?;
-    let mut init = |image: &[u8]| {
-        unsafe {
-            ptr::copy_nonoverlapping(image.as_ptr(), ptr, image.len());
-            ptr::write_bytes(ptr.add(image.len()), 0, info.memsz - image.len());
-        }
-        Ok(())
-    };
-    if source.with_image(&mut init).is_err() {
-        unsafe { dealloc(ptr, layout) };
-        return None;
+    unsafe {
+        ptr::copy_nonoverlapping(image.as_ptr(), ptr, image.len());
+        ptr::write_bytes(ptr.add(image.len()), 0, info.memsz - image.len());
     }
     if !unsafe { crate::glibc::set_dtv_value(tp, id.get(), ptr, ptr) } {
         unsafe { dealloc(ptr, layout) };
@@ -479,16 +471,11 @@ unsafe fn init_static_tls_module(tp: *mut u8, module: &StaticTlsModule) {
     let Some(source) = module.source.as_ref() else {
         return;
     };
-    let mut init = |image: &[u8]| {
-        unsafe {
-            ptr::copy_nonoverlapping(image.as_ptr(), dst, image.len());
-            ptr::write_bytes(dst.add(image.len()), 0, module.info.memsz - image.len());
-        }
-        Ok(())
-    };
-    if source.with_image(&mut init).is_err() {
-        return;
-    };
+    let image = source.as_ref();
+    unsafe {
+        ptr::copy_nonoverlapping(image.as_ptr(), dst, image.len());
+        ptr::write_bytes(dst.add(image.len()), 0, module.info.memsz - image.len());
+    }
     unsafe { crate::glibc::set_dtv_value(tp, module.id.get(), dst, ptr::null_mut()) };
 }
 

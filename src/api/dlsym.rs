@@ -90,8 +90,9 @@ pub unsafe extern "C" fn dlsym_with_caller(
         log::info!("dlsym: Use RTLD_NEXT flag to find symbol [{}]", name);
         unsafe { dlsym_next::<()>(caller as usize, name) }
     } else {
-        unsafe { handle_find::<()>(value, name) }
-            .ok_or_else(|| find_symbol_error(alloc::format!("can not find symbol:{name}")))
+        unsafe { handle_find::<()>(value, name) }.and_then(|symbol| {
+            symbol.ok_or_else(|| find_symbol_error(alloc::format!("can not find symbol:{name}")))
+        })
     };
     match sym {
         Ok(sym) => sym.into_raw().cast(),
@@ -105,7 +106,7 @@ pub unsafe extern "C" fn dlsym_with_caller(
 /// Find a symbol in the global search scope.
 #[inline]
 pub fn dlsym_default<T>(name: &str) -> Result<Symbol<'static, T>> {
-    unsafe { global_find(name) }
+    unsafe { global_find(name) }?
         .ok_or_else(|| find_symbol_error(alloc::format!("can not find symbol:{}", name)))
 }
 
@@ -114,6 +115,6 @@ pub fn dlsym_default<T>(name: &str) -> Result<Symbol<'static, T>> {
 /// # Safety
 /// `caller` must be an address in the calling module.
 pub unsafe fn dlsym_next<T>(caller: usize, name: &str) -> Result<Symbol<'static, T>> {
-    unsafe { next_find(caller, name) }
+    unsafe { next_find(caller, name) }?
         .ok_or_else(|| find_symbol_error(alloc::format!("can not find symbol:{}", name)))
 }

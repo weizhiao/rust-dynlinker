@@ -28,7 +28,7 @@ pub use elf_loader::{
     image::RawExec,
     input::PathBuf,
     memory::VmAddr,
-    tls::{TlsImageSource, TlsIndex, TlsInfo, TlsModuleId, TlsRequest, TlsTpOffset},
+    tls::{TlsIndex, TlsInfo, TlsModuleId, TlsRequest, TlsTemplate, TlsTpOffset},
 };
 
 #[doc(hidden)]
@@ -225,12 +225,17 @@ pub fn finalize_startup() {
 }
 
 #[doc(hidden)]
-pub unsafe fn find_loaded_symbol<T: Copy>(name: &str) -> Option<T> {
+pub unsafe fn find_loaded_symbol<T: Copy>(name: &str) -> elf_loader::Result<Option<T>> {
     let registry = REGISTRY.lock();
     let manager = registry.borrow();
     manager
         .all_values()
-        .find_map(|lib| unsafe { lib.get::<T>(name).map(|sym| *sym) })
+        .find_map(|lib| {
+            unsafe { lib.get::<T>(name) }
+                .map(|symbol| symbol.map(|sym| *sym))
+                .transpose()
+        })
+        .transpose()
 }
 
 mod tls {
@@ -239,8 +244,8 @@ mod tls {
         arch::NativeArch,
         memory::VmAddr,
         tls::{
-            DefaultTlsResolver, TlsBinding, TlsImageSource, TlsIndex, TlsInfo, TlsModule,
-            TlsModuleId, TlsRequest, TlsResolver, TlsTpOffset,
+            DefaultTlsResolver, TlsBinding, TlsIndex, TlsInfo, TlsModule, TlsModuleId,
+            TlsRegistration, TlsRequest, TlsResolver, TlsTemplate, TlsTpOffset,
         },
     };
     use spin::Once;
@@ -252,7 +257,7 @@ mod tls {
         pub register: fn(&TlsInfo) -> Result<TlsModuleId>,
         pub register_static: fn(&TlsInfo) -> Result<(TlsModuleId, TlsTpOffset)>,
         pub add_static_tls: fn(&TlsInfo, TlsTpOffset) -> Result<TlsModuleId>,
-        pub init_tls: fn(TlsImageSource, TlsModuleId) -> Result<()>,
+        pub init_tls: fn(TlsTemplate, TlsModuleId) -> Result<()>,
         pub unregister: fn(TlsModuleId),
         pub tls_get_addr: extern "C" fn(*const TlsIndex) -> *mut u8,
         pub tls_get_addr_soft: fn(TlsModuleId) -> *mut u8,
@@ -312,7 +317,7 @@ mod tls {
     impl TlsResolver<NativeArch> for RtldTlsResolver {
         const OVERRIDE_TLS_GET_ADDR: bool = true;
 
-        fn register(&self, info: TlsInfo, request: TlsRequest) -> Result<TlsModule> {
+        fn register(&self, info: TlsInfo, request: TlsRequest) -> Result<TlsRegistration> {
             let Backend::Rtld(ops) = self.backend else {
                 return DefaultTlsResolver::new().register(info, request);
             };
@@ -327,10 +332,14 @@ mod tls {
                     TlsBinding::new((ops.add_static_tls)(&info, tp_offset)?, Some(tp_offset))
                 }
             };
-            Ok(unsafe { TlsModule::new(module, entry) })
+            Ok(unsafe {
+                TlsRegistration::new(TlsModule::new(module, entry), move || {
+                    (ops.unregister)(module.mod_id());
+                })
+            })
         }
 
-        fn publish(&self, source: TlsImageSource, mod_id: TlsModuleId) -> Result<()> {
+        fn publish(&self, source: TlsTemplate, mod_id: TlsModuleId) -> Result<()> {
             let Backend::Rtld(ops) = self.backend else {
                 return DefaultTlsResolver::new().publish(source, mod_id);
             };

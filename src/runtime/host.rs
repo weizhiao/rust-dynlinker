@@ -70,7 +70,10 @@ fn init_libc_thread_atexit(lib: &LoadedDylib) {
     if LIBC_THREAD_ATEXIT.get().is_some() {
         return;
     }
-    if let Some(func) = unsafe { lib.get::<ThreadAtexitFn>("__cxa_thread_atexit_impl") } {
+    if let Some(func) = unsafe {
+        lib.get::<ThreadAtexitFn>("__cxa_thread_atexit_impl")
+            .expect("host symbol lookup failed")
+    } {
         LIBC_THREAD_ATEXIT.call_once(|| *func);
     }
 }
@@ -313,16 +316,9 @@ unsafe fn from_raw(
     link_map.l_entry = unsafe { (&*(base as *const ElfHeader)).e_entry() }.wrapping_add(base);
     link_map.l_phnum = use_phdrs.len().min(u16::MAX as usize) as u16;
 
-    let host_tls = extra.and_then(|e| e.1);
-    let tls = host_tls.as_ref().map(|registration| registration.0.clone());
-    // The caller owns the local bridge registration. Its provider retains the
-    // host dlopen handle; the imported Relink view only borrows its metadata.
-    let user_data = Some(ExtraData::with_dynamic_table(
-        name,
-        link_map,
-        dynamic_table,
-        host_tls,
-    ));
+    let tls = extra.and_then(|e| e.1);
+    let module_path = elf_loader::input::ModulePath::from(name.clone());
+    let user_data = Some(ExtraData::with_dynamic_table(name, link_map, dynamic_table));
 
     len = (len + 0xfff) & !0xfff; // align to page size
 
@@ -338,7 +334,7 @@ unsafe fn from_raw(
     );
     let lib = unsafe {
         LoadedDylib::new_unchecked(
-            name_str.clone(),
+            module_path,
             ModuleSourceId::fresh(),
             use_phdrs,
             segments,
@@ -418,21 +414,33 @@ fn update_libc_globals(lib: &LoadedDylib) {
         if ARGC == 0
             && let Some(s) = lib
                 .get::<*const c_int>("__libc_argc")
-                .or_else(|| lib.get::<*const c_int>("__argc"))
+                .expect("host symbol lookup failed")
+                .or_else(|| {
+                    lib.get::<*const c_int>("__argc")
+                        .expect("host symbol lookup failed")
+                })
         {
             *core::ptr::addr_of_mut!(ARGC) = (**s) as usize;
         }
         if ARGV.is_null()
             && let Some(s) = lib
                 .get::<*const *mut c_char>("__libc_argv")
-                .or_else(|| lib.get::<*const *mut c_char>("__argv"))
+                .expect("host symbol lookup failed")
+                .or_else(|| {
+                    lib.get::<*const *mut c_char>("__argv")
+                        .expect("host symbol lookup failed")
+                })
         {
             *core::ptr::addr_of_mut!(ARGV) = *s;
         }
         if ENVP.is_null()
             && let Some(s) = lib
                 .get::<*const *const *const c_char>("environ")
-                .or_else(|| lib.get::<*const *const *const c_char>("__environ"))
+                .expect("host symbol lookup failed")
+                .or_else(|| {
+                    lib.get::<*const *const *const c_char>("__environ")
+                        .expect("host symbol lookup failed")
+                })
         {
             *core::ptr::addr_of_mut!(ENVP) = **s;
         }
@@ -487,7 +495,9 @@ fn find_iterate_phdr(start: *mut LinkMap) -> Option<IterPhdr> {
             if let Some(lib) = lib {
                 if is_libc || is_loader {
                     tls_get_addr = tls_get_addr.or_else(|| unsafe {
-                        lib.get::<HostTlsFn>("__tls_get_addr").map(|symbol| *symbol)
+                        lib.get::<HostTlsFn>("__tls_get_addr")
+                            .expect("host symbol lookup failed")
+                            .map(|symbol| *symbol)
                     });
                 }
                 if is_libc {
@@ -498,7 +508,10 @@ fn find_iterate_phdr(start: *mut LinkMap) -> Option<IterPhdr> {
 
                 if is_libc
                     && iter_phdr.is_none()
-                    && let Some(iter) = unsafe { lib.get::<IterPhdr>("dl_iterate_phdr") }
+                    && let Some(iter) = unsafe {
+                        lib.get::<IterPhdr>("dl_iterate_phdr")
+                            .expect("host symbol lookup failed")
+                    }
                 {
                     log::info!("iterate_phdr: found [{}] and its dl_iterate_phdr", ns);
                     iter_phdr = Some(*iter);

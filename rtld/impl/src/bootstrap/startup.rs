@@ -223,9 +223,10 @@ unsafe fn link_startup_root(
             unsafe { publish_loaded_globals(state, startup.main, startup) };
             super::publish_tls_layout();
             type EarlyInit = unsafe extern "C" fn(bool);
-            if let Some(init) =
-                unsafe { rtld::find_loaded_symbol::<EarlyInit>("__libc_early_init") }
-            {
+            if let Some(init) = unsafe {
+                rtld::find_loaded_symbol::<EarlyInit>("__libc_early_init")
+                    .expect("libc early init lookup failed")
+            } {
                 unsafe { init(true) };
             }
             Ok(())

@@ -254,16 +254,16 @@ fn open_with<'bytes>(
     };
 
     let linker = Linker::new()
-        .loader(loader)
-        .relocator(Relocator::new().lazy_binder(NativeLazyBinder::new()))
+        .with_loader(loader)
+        .with_relocator(Relocator::new().with_lazy_binder(NativeLazyBinder::new()))
         .map_relocator(|relocator| {
-            relocator.binding(if flags.is_now() {
+            relocator.with_binding(if flags.is_now() {
                 BindingMode::Eager
             } else {
                 BindingMode::Default
             })
         })
-        .resolver((*SEARCH_PATHS).clone());
+        .with_resolver((*SEARCH_PATHS).clone());
     let mut manager = registry.borrow_mut();
     let caller = caller.and_then(|addr| {
         manager
@@ -273,7 +273,7 @@ fn open_with<'bytes>(
     });
     let mut linker_run = linker
         .run()
-        .lookup_order(if flags.is_deepbind() {
+        .with_lookup_order(if flags.is_deepbind() {
             LookupOrder::LocalFirst
         } else {
             LookupOrder::GlobalFirst

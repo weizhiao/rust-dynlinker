@@ -38,17 +38,30 @@ pub(super) static HOST_TLS: Once<HostTlsOps> = Once::new();
 
 impl HostTlsOps {
     pub(super) unsafe fn from_libc(lib: &LoadedDylib, get_addr: HostTlsFn) -> Option<Self> {
-        let version =
-            unsafe { lib.get::<unsafe extern "C" fn() -> *const c_char>("gnu_get_libc_version") }
-                .map(|version| unsafe { CStr::from_ptr(version()) }.to_bytes());
-        // The existing LinkMap adapter describes this glibc layout. Other
-        // versions still support dynamic TLS through public interfaces.
-        let static_layout = cfg!(target_arch = "x86_64") && version == Some(b"2.39".as_slice());
+        let version = unsafe {
+            lib.get::<unsafe extern "C" fn() -> *const c_char>("gnu_get_libc_version")
+                .expect("host symbol lookup failed")
+        }
+        .map(|version| unsafe { CStr::from_ptr(version()) }.to_bytes());
+        // The LinkMap adapter matches the x86_64 TLS fields in these versions.
+        // Keep unknown layouts on public dynamic-TLS interfaces; metadata is
+        // checked again before accepting a static offset below.
+        let static_layout =
+            cfg!(target_arch = "x86_64") && matches!(version, Some(b"2.39" | b"2.43"));
         Some(Self {
-            open: *unsafe { lib.get::<Open>("dlopen") }?,
-            close: *unsafe { lib.get::<Close>("dlclose") }?,
+            open: *unsafe {
+                lib.get::<Open>("dlopen")
+                    .expect("host symbol lookup failed")
+            }?,
+            close: *unsafe {
+                lib.get::<Close>("dlclose")
+                    .expect("host symbol lookup failed")
+            }?,
             info: if version.is_some() {
-                Some(*unsafe { lib.get::<Info>("dlinfo") }?)
+                Some(*unsafe {
+                    lib.get::<Info>("dlinfo")
+                        .expect("host symbol lookup failed")
+                }?)
             } else {
                 None
             },
@@ -168,5 +181,4 @@ pub(super) unsafe fn import_host_tls(
         }
     }
     unsafe { DefaultTlsResolver::new().register_provider(layout, offset, provider) }
-        .map(HostTlsRegistration)
 }
