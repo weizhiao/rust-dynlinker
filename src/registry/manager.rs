@@ -105,7 +105,7 @@ pub(crate) static REGISTRY: Lazy<Registry> = Lazy::new(|| {
     Registry::new(Manager {
         link_ctx: LinkContext::new(
             Domain::native(AddressSpaceId::PROCESS)
-                .with_tls(ActiveTlsResolver::default())
+                .with_tls(ActiveTlsResolver::new())
                 .expect("process TLS runtime must provide an entry"),
         ),
         handles: BTreeMap::new(),
@@ -248,6 +248,11 @@ fn libc_compat_aliases(name: &str) -> &'static [&'static str] {
 }
 
 impl Manager {
+    #[inline]
+    pub(crate) fn context(&self) -> &GlobalLinkContext {
+        &self.link_ctx
+    }
+
     #[inline]
     pub(crate) fn context_mut(&mut self) -> &mut GlobalLinkContext {
         &mut self.link_ctx

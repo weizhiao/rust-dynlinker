@@ -242,7 +242,7 @@ impl ElfLibrary {
             .iter()
             .find_map(|lib| unsafe { lib.get::<T>(name) }.transpose())
             .transpose()?
-            .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
+            .ok_or_else(|| find_symbol_error(format!("can not find symbol:{}", name)))
     }
 
     /// Load a versioned symbol from the dynamic library.
@@ -266,7 +266,7 @@ impl ElfLibrary {
             .iter()
             .find_map(|lib| unsafe { lib.get_version(name, version) }.transpose())
             .transpose()?
-            .ok_or(find_symbol_error(format!("can not find symbol:{}", name)))
+            .ok_or_else(|| find_symbol_error(format!("can not find symbol:{}", name)))
     }
 }
 

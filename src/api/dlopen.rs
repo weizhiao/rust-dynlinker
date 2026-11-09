@@ -4,7 +4,6 @@ use crate::{
     dlopen::{LinkRoot, open, open_main},
     registry::register_handle,
 };
-use alloc::borrow::ToOwned;
 use core::ffi::{CStr, c_char, c_int, c_void};
 
 /// # Safety
@@ -64,12 +63,7 @@ pub unsafe extern "C" fn dlopen_with_caller(
         let flags = OpenFlags::from_bits_retain(flags as _);
         let filename = unsafe { CStr::from_ptr(filename) };
         let path = elf_loader::input::Path::new(filename);
-        match open(
-            path,
-            flags,
-            LinkRoot::File(path.to_owned()),
-            Some(caller as usize),
-        ) {
+        match open(path, flags, LinkRoot::File, Some(caller as usize)) {
             Ok(opened) => opened,
             Err(error) => {
                 dlerror::set(error);

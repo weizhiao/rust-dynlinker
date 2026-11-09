@@ -1,4 +1,4 @@
-use super::{ld_cache::LdCache, observer::DlopenObserver};
+use super::{default_library_paths, observer::DlopenObserver};
 use crate::{
     OpenFlags, Result,
     library::{AsFilename, ElfLibrary, ExtraData, OpenedLibrary},
@@ -9,22 +9,19 @@ use alloc::{borrow::ToOwned, boxed::Box, format};
 use core::ffi::CStr;
 use elf_loader::{
     Loader,
-    input::{ElfBinary, Path, PathBuf as ElfPath},
+    input::{ElfBinary, Path},
     lazy::NativeLazyBinder,
-    linker::{Linker, ModuleId, SearchPathResolver},
+    linker::{LdCache, Linker, ModuleId, SearchPathResolver},
     memory::VmAddr,
     relocation::{BindingMode, LookupOrder, Relocator},
 };
-use spin::Lazy;
+use spin::Once;
 
 type DlopenLoader = Loader<Option<ExtraData>>;
 
 pub(crate) enum LinkRoot<'bytes> {
-    File(ElfPath),
-    Binary {
-        key: ElfPath,
-        bytes: &'bytes [u8],
-    },
+    File,
+    Binary(&'bytes [u8]),
     Mapped {
         key: alloc::vec::Vec<u8>,
         raw: Box<crate::library::ElfDylib>,
@@ -35,59 +32,56 @@ fn loader() -> DlopenLoader {
     Loader::new().with_data::<Option<ExtraData>>()
 }
 
-static SEARCH_PATHS: Lazy<SearchPathResolver> = Lazy::new(|| {
-    let mut resolver = SearchPathResolver::new();
-    resolver.push_rpath();
-    if let Some(paths) = get_env("LD_LIBRARY_PATH") {
-        for path in paths
-            .split(|byte| *byte == b':')
-            .filter(|path| !path.is_empty())
-        {
-            resolver.push_fixed_dir(Path::new(path));
+static SEARCH_PATHS: Once<SearchPathResolver> = Once::new();
+
+fn search_paths(executable: Option<&Path>) -> &'static SearchPathResolver {
+    SEARCH_PATHS.call_once(|| {
+        let library_path = get_env("LD_LIBRARY_PATH");
+        let executable_dir = library_path
+            .filter(|paths| contains_origin(paths))
+            .and_then(|_| crate::os::executable_dir(executable));
+        let mut resolver = SearchPathResolver::new();
+        resolver.push_rpath();
+        if let Some(paths) = library_path {
+            if executable_dir.is_none() && contains_origin(paths) {
+                // An empty origin would turn "$ORIGIN/lib" into "/lib". Omit only
+                // those components when the executable directory is unavailable.
+                for path in paths.split(|byte| matches!(byte, b':' | b';')) {
+                    if contains_origin(path) {
+                        continue;
+                    }
+                    resolver.push_library_path(
+                        Path::new(if path.is_empty() { b".".as_slice() } else { path }),
+                        Path::new(""),
+                    );
+                }
+            } else {
+                resolver.push_library_path(
+                    Path::new(paths),
+                    executable_dir.as_deref().unwrap_or_else(|| Path::new("")),
+                );
+            }
         }
-    }
-    resolver.push_runpath();
-    let cache = LdCache::new().ok();
-    resolver.push_candidate_provider(move |request, candidates| {
-        if let Some(path) = cache
-            .as_ref()
-            .and_then(|cache| cache.lookup(request.requested().as_bytes()))
-        {
-            candidates.push(path);
+        resolver.push_runpath();
+        if let Ok(cache) = LdCache::load_system() {
+            resolver.push_ld_cache(cache);
         }
-        Ok(())
-    });
-    push_platform_default_paths(&mut resolver);
-    for path in ["/lib", "/usr/lib", "/lib64", "/usr/lib64"] {
-        resolver.push_fixed_dir(Path::new(path));
-    }
-    resolver
-});
-
-#[cfg(target_arch = "x86_64")]
-fn push_platform_default_paths(resolver: &mut SearchPathResolver) {
-    resolver.push_fixed_dir("/lib/x86_64-linux-gnu");
-    resolver.push_fixed_dir("/usr/lib/x86_64-linux-gnu");
+        for dir in default_library_paths() {
+            resolver.push_fixed_dir(dir);
+        }
+        resolver
+    })
 }
 
-#[cfg(target_arch = "aarch64")]
-fn push_platform_default_paths(resolver: &mut SearchPathResolver) {
-    resolver.push_fixed_dir("/lib/aarch64-linux-gnu");
-    resolver.push_fixed_dir("/usr/lib/aarch64-linux-gnu");
+fn contains_origin(path: &[u8]) -> bool {
+    path.split(|byte| *byte == b'$').skip(1).any(|token| {
+        token.starts_with(b"{ORIGIN}")
+            || token.strip_prefix(b"ORIGIN").is_some_and(|rest| {
+                rest.first()
+                    .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+            })
+    })
 }
-
-#[cfg(target_arch = "riscv64")]
-fn push_platform_default_paths(resolver: &mut SearchPathResolver) {
-    resolver.push_fixed_dir("/lib/riscv64-linux-gnu");
-    resolver.push_fixed_dir("/usr/lib/riscv64-linux-gnu");
-}
-
-#[cfg(not(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    target_arch = "riscv64"
-)))]
-fn push_platform_default_paths(_resolver: &mut SearchPathResolver) {}
 
 #[inline(always)]
 fn caller_module_address() -> usize {
@@ -138,6 +132,7 @@ pub(crate) fn open_mapped(
     flags: OpenFlags,
     before_init: impl FnOnce(ModuleId) -> Result<()>,
 ) -> Result<OpenedLibrary> {
+    search_paths((!request.as_bytes().is_empty()).then_some(request));
     open_with(
         request,
         flags,
@@ -169,7 +164,7 @@ impl ElfLibrary {
     pub fn dlopen(path: impl AsFilename, flags: OpenFlags) -> Result<ElfLibrary> {
         let caller = caller_module_address();
         let path = path.as_filename();
-        open(path, flags, LinkRoot::File(path.to_owned()), Some(caller)).map(ElfLibrary::from)
+        open(path, flags, LinkRoot::File, Some(caller)).map(ElfLibrary::from)
     }
 
     /// Load a shared library from bytes. It is the same as dlopen. However, it can also be used in the no_std environment,
@@ -182,16 +177,7 @@ impl ElfLibrary {
     ) -> Result<ElfLibrary> {
         let caller = caller_module_address();
         let path = path.as_filename();
-        open(
-            path,
-            flags,
-            LinkRoot::Binary {
-                key: path.to_owned(),
-                bytes,
-            },
-            Some(caller),
-        )
-        .map(ElfLibrary::from)
+        open(path, flags, LinkRoot::Binary(bytes), Some(caller)).map(ElfLibrary::from)
     }
 }
 
@@ -218,7 +204,7 @@ fn open_with<'bytes>(
 
     log::info!("dlopen: Try to open [{}] with [{:?}] ", request, flags);
 
-    if matches!(root, LinkRoot::File(_) | LinkRoot::Binary { .. })
+    if matches!(root, LinkRoot::File | LinkRoot::Binary(_))
         && let Some(lib) = registry
             .borrow_mut()
             .open_existing(request.as_bytes(), flags)
@@ -230,23 +216,23 @@ fn open_with<'bytes>(
         );
         return Ok(lib);
     }
-    if flags.is_noload() && matches!(root, LinkRoot::Binary { .. }) {
+    if flags.is_noload() && matches!(root, LinkRoot::Binary(_)) {
         return Err(crate::error::find_lib_error(format!(
             "can not find file: {request}"
         )));
     }
 
-    let domain = registry.borrow_mut().context_mut().domain().clone();
+    let domain = registry.borrow().context().domain().clone();
     let loader = loader();
     let mut observer = DlopenObserver;
     let root = match root {
-        LinkRoot::Binary { key, bytes } => {
+        LinkRoot::Binary(bytes) => {
             let raw = loader
                 .run(domain)
                 .with_observer(&mut observer)
-                .load_dylib(ElfBinary::new(key.clone(), bytes))?;
+                .load_dylib(ElfBinary::new(request, bytes))?;
             LinkRoot::Mapped {
-                key: key.into_bytes(),
+                key: request.as_bytes().to_owned(),
                 raw: Box::new(raw.into()),
             }
         }
@@ -263,7 +249,7 @@ fn open_with<'bytes>(
                 BindingMode::Default
             })
         })
-        .with_resolver((*SEARCH_PATHS).clone());
+        .with_resolver(search_paths(None).clone());
     let mut manager = registry.borrow_mut();
     let caller = caller.and_then(|addr| {
         manager
@@ -281,10 +267,10 @@ fn open_with<'bytes>(
         .with_observer(observer)
         .with_caller(caller);
     let prepared = match root {
-        LinkRoot::File(path) => {
+        LinkRoot::File => {
             if flags.is_noload() {
                 let id = linker_run
-                    .resolve_committed(manager.context_mut(), path)?
+                    .resolve_committed(manager.context_mut(), request.to_owned())?
                     .ok_or_else(|| {
                         crate::error::find_lib_error(format!("can not find file: {request}"))
                     })?;
@@ -293,9 +279,9 @@ fn open_with<'bytes>(
                     .open_module(id)
                     .expect("resolved module must remain committed"));
             }
-            linker_run.prepare_load(manager.context_mut(), path)
+            linker_run.prepare_load(manager.context_mut(), request.to_owned())
         }
-        LinkRoot::Binary { .. } => unreachable!("binary roots are mapped before linking"),
+        LinkRoot::Binary(_) => unreachable!("binary roots are mapped before linking"),
         LinkRoot::Mapped { key, raw } => {
             linker_run.prepare_mapped(manager.context_mut(), key.into(), *raw)
         }

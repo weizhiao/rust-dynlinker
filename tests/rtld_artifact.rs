@@ -1,5 +1,9 @@
 #![cfg(target_arch = "x86_64")]
 
+#[path = "support/cargo.rs"]
+mod cargo_support;
+
+use cargo_support::target_dir;
 use std::{
     collections::BTreeSet,
     fs,
@@ -9,12 +13,6 @@ use std::{
 };
 
 const RTLD_TARGET: &str = "x86_64-unknown-linux-none";
-
-fn target_dir() -> PathBuf {
-    option_env!("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target"))
-}
 
 fn rtld_path() -> PathBuf {
     target_dir()
@@ -113,47 +111,52 @@ fn exported_symbols(path: &Path) -> BTreeSet<SymbolId> {
 }
 
 fn cargo_is_nightly() -> bool {
-    static IS_NIGHTLY: OnceLock<bool> = OnceLock::new();
-
-    *IS_NIGHTLY.get_or_init(|| {
-        Command::new("cargo")
-            .arg("--version")
-            .output()
-            .map(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("-nightly")
-            })
-            .unwrap_or(false)
-    })
+    cargo_support::cargo_command()
+        .arg("--version")
+        .output()
+        .map(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("-nightly")
+        })
+        .unwrap_or(false)
 }
 
 fn build_rtld() -> Option<PathBuf> {
-    if !cargo_is_nightly() {
-        eprintln!(
-            "skipping rtld artifact test because building the rtld artifact requires nightly Cargo"
-        );
-        return None;
-    }
+    static ARTIFACT: OnceLock<Result<Option<PathBuf>, String>> = OnceLock::new();
 
-    let mut cmd = Command::new("cargo");
-    cmd.args([
-        "-Z",
-        "build-std=core,alloc,compiler_builtins",
-        "build",
-        "-p",
-        "rtld",
-        "--release",
-        "--target",
-        RTLD_TARGET,
-    ]);
-    let output = cmd.output().expect("failed to invoke cargo");
-    assert!(
-        output.status.success(),
-        "rtld release build failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Some(rtld_path())
+    ARTIFACT
+        .get_or_init(|| {
+            if !cargo_is_nightly() {
+                eprintln!(
+                    "skipping rtld artifact test because building the rtld artifact requires nightly Cargo"
+                );
+                return Ok(None);
+            }
+
+            let output = cargo_support::cargo_command()
+                .args([
+                    "-Z",
+                    "build-std=core,alloc,compiler_builtins",
+                    "build",
+                    "-p",
+                    "rtld",
+                    "--release",
+                    "--target",
+                    RTLD_TARGET,
+                ])
+                .output()
+                .map_err(|err| format!("failed to invoke cargo: {err}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "rtld release build failed\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Ok(Some(rtld_path()))
+        })
+        .as_ref()
+        .unwrap_or_else(|err| panic!("{err}"))
+        .clone()
 }
 
 fn test_work_dir(name: &str) -> PathBuf {
@@ -1338,6 +1341,141 @@ int main(void) {
 }
 
 #[test]
+fn rtld_artifact_command_line_lists_bounded_dependency_strings() {
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+
+    fn dynamic_elf(strings: &[u8], declared_size: usize, needed: usize) -> Vec<u8> {
+        const LOAD_PHDR: usize = 64;
+        const DYNAMIC_PHDR: usize = LOAD_PHDR + 56;
+        const DYNAMIC_OFFSET: usize = DYNAMIC_PHDR + 56;
+        const DYNAMIC_SIZE: usize = 4 * 16;
+        const STRTAB_OFFSET: usize = DYNAMIC_OFFSET + DYNAMIC_SIZE;
+
+        let mut elf = vec![0u8; STRTAB_OFFSET];
+        elf.extend_from_slice(strings);
+        let file_size = elf.len() as u64;
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (offset, value) in [(16, 3u16), (18, 62), (52, 64), (54, 56), (56, 2)] {
+            elf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        for (offset, value) in [
+            (20, 1u32),
+            (LOAD_PHDR, 1),
+            (LOAD_PHDR + 4, 4),
+            (DYNAMIC_PHDR, 2),
+            (DYNAMIC_PHDR + 4, 4),
+        ] {
+            elf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (offset, value) in [
+            (32, LOAD_PHDR as u64),
+            (LOAD_PHDR + 32, file_size),
+            (LOAD_PHDR + 40, file_size),
+            (LOAD_PHDR + 48, 1),
+            (DYNAMIC_PHDR + 8, DYNAMIC_OFFSET as u64),
+            (DYNAMIC_PHDR + 16, DYNAMIC_OFFSET as u64),
+            (DYNAMIC_PHDR + 32, DYNAMIC_SIZE as u64),
+            (DYNAMIC_PHDR + 40, DYNAMIC_SIZE as u64),
+            (DYNAMIC_PHDR + 48, 8),
+        ] {
+            elf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        for (index, (tag, value)) in [
+            (1u64, needed as u64),
+            (5, STRTAB_OFFSET as u64),
+            (10, declared_size as u64),
+            (0, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = DYNAMIC_OFFSET + index * 16;
+            elf[offset..offset + 8].copy_from_slice(&tag.to_le_bytes());
+            elf[offset + 8..offset + 16].copy_from_slice(&value.to_le_bytes());
+        }
+        elf
+    }
+
+    let long_name = format!("lib{}.so", "x".repeat(300));
+    let long_strings = format!("\0{long_name}\0").into_bytes();
+    let cases = [
+        (
+            "cross-chunk",
+            long_strings.as_slice(),
+            long_strings.len(),
+            1,
+            Ok(long_name.as_str()),
+        ),
+        (
+            "short-read",
+            b"\0short.so\0".as_slice(),
+            512,
+            1,
+            Ok("short.so"),
+        ),
+        (
+            "nul-outside-strtab",
+            b"\0broken\0".as_slice(),
+            7,
+            1,
+            Err("invalid dynamic section"),
+        ),
+        (
+            "truncated-string",
+            b"\0broken".as_slice(),
+            512,
+            1,
+            Err("cannot read ELF metadata"),
+        ),
+        (
+            "offset-at-end",
+            b"\0name\0".as_slice(),
+            6,
+            6,
+            Err("invalid dynamic section"),
+        ),
+        (
+            "offset-past-end",
+            b"\0name\0".as_slice(),
+            6,
+            7,
+            Err("invalid dynamic section"),
+        ),
+    ];
+    let dir = test_work_dir("cli-dependency-strings");
+    for (case, strings, declared_size, needed, expected) in cases {
+        let path = dir.join(case);
+        fs::write(&path, dynamic_elf(strings, declared_size, needed)).unwrap();
+        let output = Command::new(rtld_interp_path())
+            .arg("--list")
+            .arg(&path)
+            .output()
+            .expect("failed to execute rtld --list");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match expected {
+            Ok(name) => {
+                assert!(output.status.success(), "{case}: {stderr}");
+                assert!(stderr.is_empty(), "{case}: {stderr}");
+                assert_eq!(
+                    stdout,
+                    format!(
+                        "\t{name} => not resolved by stage-0 rtld CLI\n\tld-linux-x86-64.so.2 => self\n"
+                    ),
+                    "{case}"
+                );
+            }
+            Err(message) => {
+                assert!(!output.status.success(), "{case}: {stdout}");
+                assert!(stderr.contains(message), "{case}: {stderr}");
+            }
+        }
+    }
+}
+
+#[test]
 fn rtld_artifact_command_line_can_run_simple_c_program_directly() {
     if !has_command("cc") {
         eprintln!("skipping direct rtld CLI execution test because cc is unavailable");
@@ -1393,6 +1531,99 @@ int main(int argc, char **argv) {
         "direct:2:custom-argv0\n"
     );
     assert_eq!(output.status.code(), Some(9));
+}
+
+#[test]
+fn rtld_artifact_direct_exec_expands_library_path_origin_from_main() {
+    if !has_command("cc") {
+        eprintln!("skipping direct rtld library origin test because cc is unavailable");
+        return;
+    }
+
+    let Some(_artifact) = build_rtld() else {
+        return;
+    };
+    let interp = rtld_interp_path();
+    let dir = test_work_dir("cli-direct-library-origin");
+    let dependency_dir = dir.join("subdir");
+    let run_dir = dir.join("unrelated-cwd");
+    fs::create_dir_all(&dependency_dir).unwrap();
+    fs::create_dir_all(&run_dir).unwrap();
+    let dependency_source = dir.join("dependency.c");
+    let dependency = dependency_dir.join("libcli_origin_dependency.so");
+    let main_source = dir.join("main.c");
+    let program = dir.join("main");
+    fs::write(
+        &dependency_source,
+        b"int cli_origin_value(void) { return 42; }\n",
+    )
+    .unwrap();
+    fs::write(
+        &main_source,
+        br#"
+#include <stdio.h>
+
+extern int cli_origin_value(void);
+
+int main(void) {
+    int value = cli_origin_value();
+    printf("direct-origin:%d\n", value);
+    return value == 42 ? 0 : 1;
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&dependency_source)
+            .arg("-Wl,-soname,libcli_origin_dependency.so")
+            .arg("-o")
+            .arg(&dependency)
+            .status()
+            .expect("failed to compile direct rtld origin dependency")
+            .success(),
+        "failed to compile direct rtld origin dependency"
+    );
+    assert!(
+        Command::new("cc")
+            .env_remove("LD_RUN_PATH")
+            .arg(&main_source)
+            .arg("-L")
+            .arg(&dependency_dir)
+            .arg("-lcli_origin_dependency")
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .expect("failed to compile direct rtld origin program")
+            .success(),
+        "failed to compile direct rtld origin program"
+    );
+
+    // No RPATH/RUNPATH is linked into main; its dependency exists only beside
+    // main, while /proc/self/exe identifies the directly invoked interpreter.
+    let output = Command::new(&interp)
+        .current_dir(&run_dir)
+        .env("LD_LIBRARY_PATH", "$ORIGIN/subdir")
+        .arg(&program)
+        .output()
+        .expect("failed to execute direct rtld origin program");
+    assert!(
+        output.status.success(),
+        "direct rtld origin test failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "direct-origin:42\n"
+    );
 }
 
 #[test]

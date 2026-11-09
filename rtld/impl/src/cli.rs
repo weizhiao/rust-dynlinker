@@ -185,9 +185,7 @@ fn print_help(program: *const u8) {
         b"  --preload LIST        accepted for compatibility; preload loading is pending\n",
     );
     write_stdout(b"  --audit LIST          accepted for compatibility; auditing is pending\n");
-    write_stdout(
-        b"  --argv0 STRING        accepted for compatibility; direct execution is pending\n",
-    );
+    write_stdout(b"  --argv0 STRING        set argv[0] for the executed program\n");
     write_stdout(b"  --glibc-hwcaps-prepend LIST\n");
     write_stdout(b"                        accepted for command-line compatibility\n");
     write_stdout(b"  --glibc-hwcaps-mask LIST\n");
@@ -225,33 +223,37 @@ fn verify(path: *const u8) -> bool {
 }
 
 fn list(path: *const u8) -> bool {
-    let info = match inspect(path) {
-        Ok(info) => info,
-        Err(err) => {
-            print_inspect_error(path, err);
-            return false;
-        }
-    };
-
     let Some(fd) = open(path) else {
         print_inspect_error(path, InspectError::Open);
         return false;
     };
 
-    let mut index = 0usize;
-    while index < info.needed_len {
-        write_stdout(b"\t");
-        print_string_from_file(
-            fd,
-            info.strtab_offset + info.needed[index],
-            info.strtab_size,
-        );
-        write_stdout(b" => not resolved by stage-0 rtld CLI\n");
-        index = index.wrapping_add(1);
-    }
-    write_stdout(b"\tld-linux-x86-64.so.2 => self\n");
+    let result = (|| -> Result<(), InspectError> {
+        let info = inspect_fd(fd)?;
+        for &needed in &info.needed[..info.needed_len] {
+            let offset = info
+                .strtab_offset
+                .checked_add(needed)
+                .ok_or(InspectError::BadDynamic)?;
+            let remaining = info
+                .strtab_size
+                .checked_sub(needed)
+                .ok_or(InspectError::BadDynamic)?;
+            write_stdout(b"\t");
+            print_string_from_file(fd, offset, remaining)?;
+            write_stdout(b" => not resolved by stage-0 rtld CLI\n");
+        }
+        write_stdout(b"\tld-linux-x86-64.so.2 => self\n");
+        Ok(())
+    })();
     close(fd);
-    true
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            print_inspect_error(path, err);
+            false
+        }
+    }
 }
 
 fn inspect(path: *const u8) -> Result<ElfInfo, InspectError> {
@@ -371,17 +373,28 @@ fn vaddr_to_offset(vaddr: usize, loads: &[LoadSegment]) -> Option<usize> {
     None
 }
 
-fn print_string_from_file(fd: usize, offset: usize, limit: usize) {
-    let mut cursor = offset;
-    let end = offset + limit;
-    let mut byte = [0u8; 1];
-    while cursor < end {
-        if pread_exact(fd, &mut byte, cursor).is_none() || byte[0] == 0 {
-            return;
+fn print_string_from_file(
+    fd: usize,
+    mut offset: usize,
+    mut remaining: usize,
+) -> Result<(), InspectError> {
+    let mut buffer = [0u8; 256];
+    while remaining != 0 {
+        let count = remaining.min(buffer.len());
+        let read = pread(fd, &mut buffer[..count], offset).ok_or(InspectError::Read)?;
+        if read == 0 {
+            return Err(InspectError::Read);
         }
-        write_stdout(&byte);
-        cursor = cursor.wrapping_add(1);
+        let bytes = &buffer[..read];
+        if let Some(end) = bytes.iter().position(|&byte| byte == 0) {
+            write_stdout(&bytes[..end]);
+            return Ok(());
+        }
+        write_stdout(bytes);
+        remaining -= read;
+        offset = offset.checked_add(read).ok_or(InspectError::BadDynamic)?;
     }
+    Err(InspectError::BadDynamic)
 }
 
 fn print_inspect_error(path: *const u8, err: InspectError) {
@@ -406,19 +419,24 @@ fn close(fd: usize) {
     let _ = unsafe { syscalls::syscall1(Sysno::close, fd) };
 }
 
+fn pread(fd: usize, buf: &mut [u8], offset: usize) -> Option<usize> {
+    let read = unsafe {
+        syscalls::syscall4(
+            Sysno::pread64,
+            fd,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+            offset,
+        )
+        .ok()?
+    };
+    (read <= buf.len()).then_some(read)
+}
+
 fn pread_exact(fd: usize, mut buf: &mut [u8], mut offset: usize) -> Option<()> {
     while !buf.is_empty() {
-        let read = unsafe {
-            syscalls::syscall4(
-                Sysno::pread64,
-                fd,
-                buf.as_mut_ptr() as usize,
-                buf.len(),
-                offset,
-            )
-            .ok()?
-        };
-        if read == 0 || read > buf.len() {
+        let read = pread(fd, buf, offset)?;
+        if read == 0 {
             return None;
         }
         let (_, rest) = buf.split_at_mut(read);

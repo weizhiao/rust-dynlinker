@@ -1,4 +1,4 @@
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use core::fmt::Display;
 
 /// Errors that can occur during dynamic library loading or symbol resolution.
@@ -10,8 +10,6 @@ pub enum Error {
     FindLibError { msg: String },
     /// Failed to find the specified symbol.
     FindSymbolError { msg: String },
-    /// Failed to parse the `ld.so.cache`.
-    ParseLdCacheError { msg: String },
     /// The operation is not supported on the current target or without the required feature.
     Unsupported,
     /// An I/O error occurred.
@@ -28,7 +26,6 @@ impl Display for Error {
             Error::LoaderError { err } => write!(f, "{err}"),
             Error::FindLibError { msg } => write!(f, "{msg}"),
             Error::FindSymbolError { msg } => write!(f, "{msg}"),
-            Error::ParseLdCacheError { msg } => write!(f, "{msg}"),
             Error::Unsupported => write!(f, "unsupported"),
             #[cfg(feature = "std")]
             Error::IO(err) => write!(f, "IO error: {err}"),
@@ -57,24 +54,12 @@ impl From<elf_loader::Error> for Error {
 
 #[cold]
 #[inline(never)]
-pub(crate) fn find_lib_error(msg: impl ToString) -> Error {
-    Error::FindLibError {
-        msg: msg.to_string(),
-    }
+pub(crate) fn find_lib_error(msg: impl Into<String>) -> Error {
+    Error::FindLibError { msg: msg.into() }
 }
 
 #[cold]
 #[inline(never)]
-pub(crate) fn find_symbol_error(msg: impl ToString) -> Error {
-    Error::FindSymbolError {
-        msg: msg.to_string(),
-    }
-}
-
-#[cold]
-#[inline(never)]
-pub(crate) fn parse_ld_cache_error(msg: impl ToString) -> Error {
-    Error::ParseLdCacheError {
-        msg: msg.to_string(),
-    }
+pub(crate) fn find_symbol_error(msg: impl Into<String>) -> Error {
+    Error::FindSymbolError { msg: msg.into() }
 }

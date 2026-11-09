@@ -1,69 +1,21 @@
+#[path = "support/dylib.rs"]
+mod support;
+
 use dlopen_rs::{ElfLibrary, OpenFlags};
-use std::env::consts;
 use std::ffi::{CStr, CString};
-use std::path::PathBuf;
 use std::sync::{
-    Arc, Barrier, OnceLock,
+    Arc, Barrier,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-
-const TARGET_DIR: Option<&'static str> = option_env!("CARGO_TARGET_DIR");
-static TARGET_TRIPLE: OnceLock<String> = OnceLock::new();
-
-fn lib_path(file_name: &str) -> String {
-    let path: PathBuf = TARGET_DIR.unwrap_or("target").into();
-    path.join(TARGET_TRIPLE.get().unwrap())
-        .join("release")
-        .join(file_name)
-        .to_str()
-        .unwrap()
-        .to_string()
-}
-
-const PACKAGE_NAME: [&str; 2] = ["example_dylib", "promotion_dylib"];
+use support::lib_path;
 
 fn compile() {
     static ONCE: ::std::sync::Once = ::std::sync::Once::new();
     ONCE.call_once(|| {
         unsafe { std::env::set_var("RUST_LOG", "trace") };
         env_logger::init();
-        let arch = consts::ARCH;
-        if arch.contains("x86_64") {
-            TARGET_TRIPLE
-                .set("x86_64-unknown-linux-gnu".to_string())
-                .unwrap();
-        } else if arch.contains("riscv64") {
-            TARGET_TRIPLE
-                .set("riscv64gc-unknown-linux-gnu".to_string())
-                .unwrap();
-        } else if arch.contains("aarch64") {
-            TARGET_TRIPLE
-                .set("aarch64-unknown-linux-gnu".to_string())
-                .unwrap();
-        } else if arch.contains("loongarch64") {
-            TARGET_TRIPLE
-                .set("loongarch64-unknown-linux-musl".to_string())
-                .unwrap();
-        } else {
-            unimplemented!()
-        }
-
-        for name in PACKAGE_NAME {
-            let mut cmd = ::std::process::Command::new("cargo");
-            cmd.arg("build")
-                .arg("-r")
-                .arg("-p")
-                .arg(name)
-                .env("CARGO_PROFILE_RELEASE_PANIC", "unwind")
-                .arg("--target")
-                .arg(TARGET_TRIPLE.get().unwrap().as_str());
-            assert!(
-                cmd.status()
-                    .expect("could not compile the test helpers!")
-                    .success()
-            );
-        }
+        support::build_dylibs(&["example_dylib", "promotion_dylib"]);
 
         let libexample = lib_path("libexample.so");
         let _ = std::fs::copy(&libexample, lib_path("libnodelete.so"));
@@ -103,7 +55,7 @@ fn dlopen() {
 fn c_dlopen_reuses_stable_handle() {
     compile();
     let path = lib_path("libstable_c_handle.so");
-    let filename = CString::new(path.as_str()).unwrap();
+    let filename = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
     let flags = OpenFlags::RTLD_NOW.bits() as core::ffi::c_int;
 
     let first = unsafe { dlopen_rs::api::dlopen(filename.as_ptr(), flags) };
@@ -476,7 +428,11 @@ fn thread_destructor_keeps_library_loaded() {
 fn linker_script_is_not_a_runtime_input() {
     compile();
     let path = lib_path("runtime_linker_script.so");
-    std::fs::write(&path, format!("GROUP ( {} )", lib_path("libexample.so"))).unwrap();
+    std::fs::write(
+        &path,
+        format!("GROUP ( {} )", lib_path("libexample.so").display()),
+    )
+    .unwrap();
 
     let result = ElfLibrary::dlopen(&path, OpenFlags::RTLD_NOW);
     let _ = std::fs::remove_file(path);

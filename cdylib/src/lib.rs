@@ -5,7 +5,7 @@ use std::{
 
 pub use dlopen_rs::api::*;
 
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn init() {
     env_logger::init();
 }

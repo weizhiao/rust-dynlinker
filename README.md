@@ -141,7 +141,7 @@ cargo test --test rtld_artifact rtld_artifact_has_interpreter_shape
 | Feature | Default | Description |
 | --- | --- | --- |
 | `std` | Yes | Enables standard library integration, host initialization, and ctor support. |
-| `use-syscall` | No | Uses the Linux syscall backend, mainly for `no_std` and rtld paths. |
+| `use-syscall` | No | Uses the Linux syscall backend for `no_std` and rtld paths; incompatible with `std`. |
 | `version` | No | Enables ELF symbol version support. |
 
 ## Architecture Support

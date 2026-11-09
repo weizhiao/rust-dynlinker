@@ -232,6 +232,31 @@ mod tests {
     };
 
     #[test]
+    fn host_tls_can_initialize_while_registry_is_borrowed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct OnExit;
+        impl Drop for OnExit {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        std::thread_local! {
+            static VALUE: OnExit = const { OnExit };
+        }
+
+        thread::spawn(|| {
+            let registry = REGISTRY.lock();
+            let _manager = registry.borrow_mut();
+            VALUE.with(|_| {});
+        })
+        .join()
+        .unwrap();
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn loader_lock_is_reentrant_and_serializes_threads() {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (start_tx, start_rx) = mpsc::channel();

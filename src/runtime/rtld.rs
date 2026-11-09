@@ -17,6 +17,11 @@ type RuntimeLoader = ElfLoader<Option<ExtraData>>;
 static STARTUP_ROOT: Mutex<Option<ModuleId>> = Mutex::new(None);
 
 #[doc(hidden)]
+pub fn default_library_paths() -> &'static [&'static core::ffi::CStr] {
+    crate::dlopen::default_library_paths()
+}
+
+#[doc(hidden)]
 pub use self::tls::{ActiveTlsResolver, RtldTlsOps};
 #[doc(hidden)]
 pub use crate::library::ElfDylib;
@@ -48,7 +53,7 @@ fn loader() -> RuntimeLoader {
 }
 
 fn domain() -> Domain<NativeArch, ActiveTlsResolver> {
-    REGISTRY.lock().borrow_mut().context_mut().domain().clone()
+    REGISTRY.lock().borrow().context().domain().clone()
 }
 
 #[doc(hidden)]
@@ -321,6 +326,7 @@ mod tls {
             let Backend::Rtld(ops) = self.backend else {
                 return DefaultTlsResolver::new().register(info, request);
             };
+            info.validate()?;
             let entry = self.bind_tls_get_addr()?;
             let module = match request {
                 TlsRequest::Dynamic => TlsBinding::new((ops.register)(&info)?, None),
@@ -344,14 +350,6 @@ mod tls {
                 return DefaultTlsResolver::new().publish(source, mod_id);
             };
             (ops.init_tls)(source, mod_id)
-        }
-
-        fn unregister(&self, mod_id: TlsModuleId) {
-            if let Backend::Rtld(ops) = self.backend {
-                (ops.unregister)(mod_id);
-                return;
-            }
-            DefaultTlsResolver::new().unregister(mod_id);
         }
 
         fn bind_tls_get_addr(&self) -> Result<VmAddr> {

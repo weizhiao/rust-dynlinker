@@ -1,4 +1,4 @@
-use crate::abi::auxv::{AT_BASE, AT_PHDR, AT_PHNUM};
+use crate::abi::auxv::{AT_BASE, AT_NULL, AT_PHDR, AT_PHNUM};
 use crate::runtime::debug::GDBDebug;
 use crate::{
     OpenFlags, Result,
@@ -8,7 +8,7 @@ use crate::{
     registry::{DestructorFn, REGISTRY, ThreadAtexitFn, register_thread_destructor},
     runtime::{ARGC, ARGV, ENVP},
 };
-use alloc::{borrow::ToOwned, boxed::Box, ffi::CString, vec::Vec};
+use alloc::{borrow::ToOwned, boxed::Box, ffi::CString, sync::Arc, vec::Vec};
 use core::{
     ffi::{CStr, c_char, c_int, c_void},
     ptr::null_mut,
@@ -18,6 +18,7 @@ use elf_loader::{
     elf::{ElfDyn, ElfDynamicTag, ElfHeader, ElfPhdr, ElfProgramType},
     image::ElfSegments,
     input::ModuleSourceId,
+    linker::AddressIndex,
     memory::{MappedRegion, VmAddr, VmOffset},
     runtime::{AddressSpaceId, Domain},
     tls::{DefaultTlsResolver, TlsInfo},
@@ -29,9 +30,9 @@ mod host_tls;
 use host_tls::{HOST_TLS, HostTlsFn, HostTlsOps, import_host_tls};
 
 #[inline]
-fn get_debug_struct() -> Option<&'static mut GDBDebug> {
+fn get_debug_struct(auxv: &HostAuxv) -> Option<&'static mut GDBDebug> {
     unsafe {
-        let ptr = get_r_debug();
+        let ptr = find_r_debug(auxv.phdr_addr, auxv.phnum, auxv.interpreter_base);
         if !ptr.is_null() && (*ptr).version != 0 {
             return Some(&mut *ptr);
         }
@@ -64,6 +65,7 @@ const DT_ADDR_TAGS: &[ElfDynamicTag] = &[
 ];
 
 static LIBC_THREAD_ATEXIT: Once<ThreadAtexitFn> = Once::new();
+static HOST_MODULES: Once<Arc<AddressIndex>> = Once::new();
 static IS_MUSL: AtomicBool = AtomicBool::new(false);
 
 fn init_libc_thread_atexit(lib: &LoadedDylib) {
@@ -88,39 +90,48 @@ pub unsafe extern "C" fn __cxa_thread_atexit_impl(
         log::error!("unable to find libc __cxa_thread_atexit_impl");
         return -1;
     };
+    // Host modules are pinned at startup and their TLS lifetime belongs to libc.
+    // In particular, logging can initialize host TLS while REGISTRY is borrowed.
+    if HOST_MODULES
+        .get()
+        .is_some_and(|index| index.find(VmAddr::from_ptr(dso_handle)).is_some())
+    {
+        return unsafe { thread_atexit(func, arg, dso_handle) };
+    }
     unsafe { register_thread_destructor(thread_atexit, func, arg, dso_handle) }
 }
 
-unsafe fn get_r_debug() -> *mut GDBDebug {
-    let phdr_addr = get_auxv(AT_PHDR);
-    let phnum = get_auxv(AT_PHNUM);
-    let base = get_auxv(AT_BASE);
-
-    unsafe { find_r_debug(phdr_addr, phnum, base) }
+#[derive(Default)]
+struct HostAuxv {
+    phdr_addr: usize,
+    phnum: usize,
+    interpreter_base: usize,
 }
 
 #[cfg(target_os = "linux")]
-fn get_auxv(target_type: usize) -> usize {
+fn read_auxv() -> HostAuxv {
+    let mut auxv = HostAuxv::default();
     let Ok(data) = crate::os::read_file("/proc/self/auxv") else {
-        return 0;
+        return auxv;
     };
     let size = core::mem::size_of::<usize>();
     for chunk in data.chunks_exact(size * 2) {
         let type_ = usize::from_ne_bytes(chunk[..size].try_into().unwrap());
         let val = usize::from_ne_bytes(chunk[size..].try_into().unwrap());
-        if type_ == target_type {
-            return val;
-        }
-        if type_ == 0 {
-            break;
+        match type_ {
+            AT_PHDR => auxv.phdr_addr = val,
+            AT_PHNUM => auxv.phnum = val,
+            AT_BASE => auxv.interpreter_base = val,
+            AT_NULL => break,
+            _ => {}
         }
     }
-    0
+    auxv
 }
 
 #[cfg(not(target_os = "linux"))]
-fn get_auxv(_target_type: usize) -> usize {
-    0
+fn read_auxv() -> HostAuxv {
+    HostAuxv::default()
 }
 
 unsafe fn find_r_debug(phdr_addr: usize, phnum: usize, interpreter_base: usize) -> *mut GDBDebug {
@@ -447,7 +458,7 @@ fn update_libc_globals(lib: &LoadedDylib) {
     }
 }
 
-fn find_iterate_phdr(start: *mut LinkMap) -> Option<IterPhdr> {
+fn find_iterate_phdr(start: *mut LinkMap, interpreter_base: usize) -> Option<IterPhdr> {
     log::info!("iterate_phdr: start={:?}", start);
     if start.is_null() {
         log::warn!("iterate_phdr: start is NULL, skipping initialization");
@@ -457,7 +468,6 @@ fn find_iterate_phdr(start: *mut LinkMap) -> Option<IterPhdr> {
     let mut iter_phdr = None;
     let mut tls_get_addr = None;
     let mut tls_libc = None;
-    let interpreter_base = get_auxv(AT_BASE);
     for cur_map in (LinkMapIter { current: start }) {
         let name_ptr = if cur_map.l_name.is_null() {
             c"".as_ptr()
@@ -572,10 +582,14 @@ unsafe extern "C" fn callback(info: *mut CDlPhdrInfo, _size: usize, _data: *mut 
 #[ctor::ctor(unsafe)]
 fn init() {
     log::info!("init: starting initialization");
-    if let Some(debug) = get_debug_struct() {
+    let auxv = read_auxv();
+    if let Some(debug) = get_debug_struct(&auxv) {
         init_host_debug(debug);
-        if let Some(iter) = find_iterate_phdr(debug.map) {
+        if let Some(iter) = find_iterate_phdr(debug.map, auxv.interpreter_base) {
             iter(Some(callback), null_mut());
+            // Imported host modules are pinned. Keep this startup-only snapshot
+            // so later custom loads do not become classified as host modules.
+            HOST_MODULES.call_once(|| REGISTRY.lock().borrow().context().address_index());
         }
         REGISTRY.lock().borrow_mut().register_initial_aliases();
     }

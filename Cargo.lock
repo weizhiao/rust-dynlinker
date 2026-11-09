@@ -326,13 +326,17 @@ checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
 
 [[package]]
 name = "elf_loader"
-version = "0.17.0"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b34512194200afee4d65d871709ff17551aac42947cb615d40932520e244d7b"
 dependencies = [
  "bitflags 2.13.1",
  "cfg-if",
  "elf",
+ "hashbrown",
  "libc",
  "log",
+ "memchr",
  "spin 0.10.1",
  "syscalls",
  "windows-sys",
@@ -405,6 +409,12 @@ dependencies = [
  "crunchy",
  "zerocopy",
 ]
+
+[[package]]
+name = "hashbrown"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "is_terminal_polyfill"

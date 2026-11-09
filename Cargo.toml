@@ -32,8 +32,7 @@ default-features = false
 features = ["lazy", "mutex", "spin_mutex"]
 
 [dependencies.elf_loader]
-path = "../Relink"
-version = "0.17.0"
+version = "0.19.1"
 default-features = false
 features = ["log", "lazy-binding"]
 
@@ -48,7 +47,7 @@ ctor = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
-std = ["spin/std", "dep:ctor", "dep:libc", "elf_loader/libc", "elf_loader/std", "log/std"]
+std = ["spin/std", "dep:ctor", "dep:libc", "elf_loader/std", "log/std"]
 # activate specific versions of symbols for dynamic library loading
 version = ["elf_loader/version"]
 use-syscall = ["elf_loader/use-syscall"]

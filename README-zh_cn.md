@@ -141,7 +141,7 @@ cargo test --test rtld_artifact rtld_artifact_has_interpreter_shape
 | Feature | 默认开启 | 说明 |
 | --- | --- | --- |
 | `std` | 是 | 启用标准库集成、host 初始化和 ctor。 |
-| `use-syscall` | 否 | 使用 Linux syscall 后端，主要用于 `no_std`/rtld 路径。 |
+| `use-syscall` | 否 | 使用 Linux syscall 后端，用于 `no_std`/rtld 路径；不能与 `std` 同时启用。 |
 | `version` | 否 | 启用 ELF 符号版本支持。 |
 
 ## 架构支持

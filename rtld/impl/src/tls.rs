@@ -228,23 +228,32 @@ fn init_tls_module(source: TlsTemplate, id: TlsModuleId) -> ElfResult<()> {
             .and_then(|index| modules.get_mut(index))
             .and_then(Option::as_mut)
             .ok_or(TlsError::InvalidModuleId { mod_id: id })?;
-        if let TlsModule::Dynamic { source: image, .. } = module {
+        if let TlsModule::Dynamic {
+            info,
+            source: image,
+        } = module
+        {
+            if source.len() != info.filesz {
+                return Err(TlsError::InvalidInfo.into());
+            }
             assert!(image.is_none(), "TLS template must be published only once");
             *image = Some(source);
             return Ok(());
         }
     }
-    init_static_tls(source, id);
-    Ok(())
+    init_static_tls(source, id)
 }
 
-fn init_static_tls(source: TlsTemplate, id: TlsModuleId) {
+fn init_static_tls(source: TlsTemplate, id: TlsModuleId) -> ElfResult<()> {
     let module = {
         let mut modules = STATIC_TLS_MODULES.lock();
         let module = modules
             .iter_mut()
             .find(|module| module.id == id)
             .expect("registered static TLS module must have an initialization record");
+        if source.len() != module.info.filesz {
+            return Err(TlsError::InvalidInfo.into());
+        }
         assert!(
             module.source.is_none(),
             "TLS template must be published only once"
@@ -260,6 +269,7 @@ fn init_static_tls(source: TlsTemplate, id: TlsModuleId) {
             init_rseq_area(tp, used);
         }
     }
+    Ok(())
 }
 
 fn ensure_static_tls_area() -> ElfResult<StaticTlsArea> {
@@ -369,7 +379,6 @@ fn allocate_dynamic_block(
 
     unsafe {
         ptr::copy_nonoverlapping(image.as_ptr(), ptr, image.len());
-        ptr::write_bytes(ptr.add(image.len()), 0, info.memsz - image.len());
     }
     if !unsafe { crate::glibc::set_dtv_value(tp, id.get(), ptr, ptr) } {
         unsafe { dealloc(ptr, layout) };
