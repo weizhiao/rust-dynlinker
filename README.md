@@ -18,7 +18,7 @@ Requires **Rust 1.93.0 or later**. Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dlopen-rs = "0.8.0"
+dlopen-rs = "0.9.0"
 ```
 
 Open a shared library with `ElfLibrary::dlopen`, then look up an exported symbol with `get`:
@@ -69,7 +69,7 @@ See the [API documentation](https://docs.rs/dlopen-rs/) and repository examples 
 
 ```toml
 [dependencies]
-dlopen-rs = { version = "0.8.0", default-features = false, features = ["use-syscall"] }
+dlopen-rs = { version = "0.9.0", default-features = false, features = ["use-syscall"] }
 ```
 
 The `no_std` configuration still uses `alloc`; the final program must provide an allocator.

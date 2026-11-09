@@ -18,7 +18,7 @@
 
 ```toml
 [dependencies]
-dlopen-rs = "0.8.0"
+dlopen-rs = "0.9.0"
 ```
 
 使用 `ElfLibrary::dlopen` 打开动态库，再通过 `get` 查找导出的符号：
@@ -69,7 +69,7 @@ cargo run --release --example dlopen
 
 ```toml
 [dependencies]
-dlopen-rs = { version = "0.8.0", default-features = false, features = ["use-syscall"] }
+dlopen-rs = { version = "0.9.0", default-features = false, features = ["use-syscall"] }
 ```
 
 `no_std` 模式仍依赖 `alloc`，最终程序需要提供内存分配器。
