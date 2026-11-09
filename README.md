@@ -1,81 +1,36 @@
 # dlopen-rs
 
-<p align="center">
-  <a href="https://crates.io/crates/dlopen-rs"><img src="https://img.shields.io/crates/v/dlopen-rs.svg" alt="Crates.io"></a>
-  <a href="https://crates.io/crates/dlopen-rs"><img src="https://img.shields.io/crates/d/dlopen-rs.svg" alt="Downloads"></a>
-  <a href="https://docs.rs/dlopen-rs/"><img src="https://docs.rs/dlopen-rs/badge.svg" alt="Docs.rs"></a>
-  <a href="https://github.com/weizhiao/dlopen-rs/actions"><img src="https://github.com/weizhiao/dlopen-rs/actions/workflows/rust.yml/badge.svg" alt="Build Status"></a>
-  <img src="https://img.shields.io/badge/rust-1.93.0%2B-blue.svg" alt="MSRV">
-  <img src="https://img.shields.io/crates/l/dlopen-rs.svg" alt="License">
-</p>
+[![Crates.io](https://img.shields.io/crates/v/dlopen-rs.svg)](https://crates.io/crates/dlopen-rs)
+[![Docs.rs](https://docs.rs/dlopen-rs/badge.svg)](https://docs.rs/dlopen-rs/)
+[![Build](https://github.com/weizhiao/rust-dynlinker/actions/workflows/rust.yml/badge.svg)](https://github.com/weizhiao/rust-dynlinker/actions/workflows/rust.yml)
+![MSRV](https://img.shields.io/badge/rust-1.93.0%2B-blue.svg)
+[![License](https://img.shields.io/crates/l/dlopen-rs.svg)](LICENSE)
 
-<p align="center">
-  <b>A pure-Rust ELF dynamic linker, dlopen compatibility layer, and experimental Linux rtld.</b>
-</p>
+English | [简体中文](README-zh_cn.md)
 
-<p align="center">
-  <a href="README.md">English</a> | <a href="README-zh_cn.md">简体中文</a>
-</p>
+`dlopen-rs` is an ELF dynamic linker written in Rust. It loads shared libraries and resolves symbols.
 
-`dlopen-rs` provides a Rust-friendly dynamic library loading API and exports libc-compatible entry points such as `dlopen`, `dlsym`, `dladdr`, and `dl_iterate_phdr`. The project moves ELF loading, dependency resolution, relocation, symbol lookup, and TLS management into Rust, while steadily growing an rtld implementation that can eventually replace glibc `ld.so`.
+Built on `elf_loader`, it supports `std` and `no_std` on Linux for x86_64, AArch64, and RISC-V 64-bit architectures. The repository also includes a C ABI adapter and an experimental standalone dynamic linker, `rtld`.
 
-## Capabilities
+## Quick Start
 
-- **Dynamic loading:** Load ELF shared objects from paths or in-memory bytes.
-- **Dependency resolution:** Handle `DT_NEEDED`, `RPATH`, `RUNPATH`, `ld.so.cache`, and common system search paths.
-- **Symbol lookup:** Provide Rust APIs and C ABI entry points, including global lookup, dependency scopes, `RTLD_NEXT`, and `RTLD_DEFAULT`.
-- **Relocation:** Support regular dynamic relocations, PLT/GOT relocation, lazy binding, and RELR.
-- **TLS:** Support dynamic TLS, static TLS registration, and initial-thread TLS needed during rtld startup. Imported host TLS keeps its native storage and library handle; Relink resolves it through the original host runtime. Host static TP offsets currently use the x86_64 glibc 2.39 layout adapter; other layouts do not expose a static offset.
-- **`no_std`:** Run the core loading path without `std`, with an optional Linux syscall backend via `use-syscall`.
-- **Replacement rtld:** Build an experimental ELF interpreter that advertises itself as `ld-linux-x86-64.so.2`.
-
-## Project Status
-
-| Area | Status |
-| --- | --- |
-| Rust `ElfLibrary` API | Usable |
-| libc-compatible dlopen/dlsym/dladdr/dl_iterate_phdr | Usable |
-| `LD_PRELOAD` compatibility library | Usable |
-| `no_std` + syscall loading path | Usable, still being refined |
-| Replacement rtld | Experimental, focused on x86_64 Linux/glibc compatibility |
-
-## Installation
-
-For regular Rust programs:
+Requires **Rust 1.93.0 or later**. Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 dlopen-rs = "0.8.0"
 ```
 
-For `no_std` with the syscall backend:
-
-```toml
-[dependencies]
-dlopen-rs = { version = "0.8.0", default-features = false, features = ["use-syscall"] }
-```
-
-## Rust API Example
-
-Build the example shared object first:
-
-```shell
-cargo build --release -p example_dylib
-```
-
-Then run the `dlopen-rs` example:
-
-```shell
-cargo run --release --example dlopen
-```
-
-Core usage:
+Open a shared library with `ElfLibrary::dlopen`, then look up an exported symbol with `get`:
 
 ```rust
 use dlopen_rs::{ElfLibrary, OpenFlags, Result};
 
 fn main() -> Result<()> {
-    let lib = ElfLibrary::dlopen("./target/release/libexample.so", OpenFlags::RTLD_LAZY)?;
+    let lib = ElfLibrary::dlopen(
+        "./target/release/libexample.so",
+        OpenFlags::RTLD_NOW,
+    )?;
     let add = unsafe { lib.get::<fn(i32, i32) -> i32>("add")? };
 
     println!("add(1, 1) = {}", add(1, 1));
@@ -83,101 +38,64 @@ fn main() -> Result<()> {
 }
 ```
 
-## LD_PRELOAD Compatibility Library
+This example calls a Rust function exported by the repository's example library. When using `get`, the caller must ensure that the symbol's type and calling convention are correct. For C functions, use the appropriate `extern "C" fn` type. The returned symbol borrows the library handle, which must remain alive while the symbol is in use.
 
-The `cdylib` crate builds a libc dlopen-family compatibility library:
+From the repository root, build the example library and run the loading example:
 
-```shell
-cargo build --release -p cdylib
+```sh
 cargo build --release -p example_dylib
-cargo build --release --example preload
-
-RUST_LOG=trace \
-LD_PRELOAD=./target/release/libdlopen.so \
-./target/release/examples/preload
+cargo run --release --example dlopen
 ```
 
-This is useful for checking how well `dlopen-rs` can interpose existing `dlopen`/`dlsym` calls.
+The example prints `add(1, 1) = 2` along with loading logs. These paths assume Cargo's default `target` directory.
 
-## Replacement rtld
+See the [API documentation](https://docs.rs/dlopen-rs/) and repository examples for more:
 
-The `rtld` crate builds an experimental ELF interpreter intended to grow into a replacement for glibc `ld-linux-x86-64.so.2`:
+| Example | Description |
+| --- | --- |
+| [dlopen](examples/dlopen.rs) | Load a shared library from a file and call a function |
+| [dlopen_from_binary](examples/dlopen_from_binary.rs) | Load a shared library from ELF bytes in memory |
+| [symbol_info](examples/symbol_info.rs) | Find the library and symbol associated with an address |
 
-```shell
-cargo build-rtld
-```
-
-Artifacts are written to:
-
-```text
-target/x86_64-unknown-linux-none/release/librtld.so
-target/x86_64-unknown-linux-none/release/ld-linux-x86-64.so.2
-```
-
-This path uses `x86_64-unknown-linux-none`, `-Z build-std=core,alloc,compiler_builtins`, and custom linker arguments. Use a nightly toolchain, or another toolchain capable of `-Z build-std`, when building this target.
-
-## Development Commands
-
-The repository defines Cargo aliases that keep host/std checks separate from rtld/no_std checks:
-
-```shell
-cargo check-host
-cargo check-rtld
-cargo build-rtld
-```
-
-Common validation set:
-
-```shell
-cargo check-host
-cargo check-rtld
-cargo check --no-default-features --lib
-cargo check --no-default-features --features use-syscall --lib
-cargo test --test rtld_artifact rtld_artifact_has_interpreter_shape
-```
-
-## Feature Flags
+## Configuration
 
 | Feature | Default | Description |
 | --- | --- | --- |
-| `std` | Yes | Enables standard library integration, host initialization, and ctor support. |
-| `use-syscall` | No | Uses the Linux syscall backend for `no_std` and rtld paths; incompatible with `std`. |
-| `version` | No | Enables ELF symbol version support. |
+| `std` | Yes | Use the standard library and initialize integration with the host dynamic linker |
+| `use-syscall` | No | Use the Linux syscall backend for `no_std` environments |
+| `version` | No | Enable ELF symbol version queries, such as `ElfLibrary::get_version` |
 
-## Architecture Support
+`std` and `use-syscall` cannot be enabled together. For `no_std` with the syscall backend:
 
-| Architecture | Dynamic Loading | Lazy Binding | Replacement rtld |
-| --- | --- | --- | --- |
-| x86_64 Linux | Supported | Supported | Experimental |
-| aarch64 | Supported | Supported | Not enabled |
-| riscv64 | Supported | Some paths still being validated | Not enabled |
-
-## Repository Layout
-
-```text
-src/              Rust API, C ABI, loader/register core logic
-src/rtld.rs       no_std rtld entry points and rtld-specific TLS glue
-src/host_init.rs  std/host import of objects already loaded by the host ld.so
-cdylib/           LD_PRELOAD compatibility library
-rtld/             replacement ld.so artifact crate
-rtld/impl/        no_std rtld implementation
-example-dylib/    example shared object
-examples/         API and LD_PRELOAD examples
-tests/            integration tests and rtld artifact checks
+```toml
+[dependencies]
+dlopen-rs = { version = "0.8.0", default-features = false, features = ["use-syscall"] }
 ```
+
+The `no_std` configuration still uses `alloc`; the final program must provide an allocator.
+
+## C ABI and LD_PRELOAD
+
+`dlopen_rs::api` provides C ABI entry points including `dlopen`, `dlsym`, `dlclose`, `dlerror`, `dladdr`, and `dl_iterate_phdr`.
+
+The [`cdylib`](cdylib/) crate exports these interfaces as `libdlopen.so` for experiments with `LD_PRELOAD`:
+
+```sh
+cargo build --release -p cdylib
+```
+
+The default output is `target/release/libdlopen.so`. This adapter is incomplete: for example, `dlinfo` in `cdylib` is not implemented, and `dlerror` is a placeholder. See the [preload example](examples/preload.rs) for usage.
+
+## Standalone Dynamic Linker rtld (Experimental)
+
+The repository also provides an experimental standalone dynamic linker, `rtld`, currently targeting x86_64 Linux. It is not yet fully compatible with glibc `ld.so`. Build it with `cargo +nightly build-rtld`; see the [rtld README](rtld/README.md) for details.
+
+## Contributing
+
+[Issues](https://github.com/weizhiao/rust-dynlinker/issues) and pull requests are welcome. When reporting a loading problem, include your operating system, CPU architecture, Rust version, enabled features, and minimal steps to reproduce it.
+
+For debugging issues involving GDB, `r_debug`, or `link_map`, see the [GDB troubleshooting guide](TroubleshootingGdb.md).
 
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
-
-## Contributing
-
-Issues and pull requests are welcome. For GDB/r_debug/link_map related debugging notes, see [TroubleshootingGdb.md](TroubleshootingGdb.md).
-
-<a href="https://github.com/weizhiao/dlopen-rs/graphs/contributors">
-  <img src="https://contributors-img.web.app/image?repo=weizhiao/dlopen-rs" alt="Project Contributors" />
-</a>
-
----
-
-**Minimum Supported Rust Version (MSRV):** 1.93.0 or higher.

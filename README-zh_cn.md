@@ -1,81 +1,36 @@
 # dlopen-rs
 
-<p align="center">
-  <a href="https://crates.io/crates/dlopen-rs"><img src="https://img.shields.io/crates/v/dlopen-rs.svg" alt="Crates.io"></a>
-  <a href="https://crates.io/crates/dlopen-rs"><img src="https://img.shields.io/crates/d/dlopen-rs.svg" alt="Downloads"></a>
-  <a href="https://docs.rs/dlopen-rs/"><img src="https://docs.rs/dlopen-rs/badge.svg" alt="Docs.rs"></a>
-  <a href="https://github.com/weizhiao/dlopen-rs/actions"><img src="https://github.com/weizhiao/dlopen-rs/actions/workflows/rust.yml/badge.svg" alt="Build Status"></a>
-  <img src="https://img.shields.io/badge/rust-1.93.0%2B-blue.svg" alt="MSRV">
-  <img src="https://img.shields.io/crates/l/dlopen-rs.svg" alt="License">
-</p>
+[![Crates.io](https://img.shields.io/crates/v/dlopen-rs.svg)](https://crates.io/crates/dlopen-rs)
+[![Docs.rs](https://docs.rs/dlopen-rs/badge.svg)](https://docs.rs/dlopen-rs/)
+[![Build](https://github.com/weizhiao/rust-dynlinker/actions/workflows/rust.yml/badge.svg)](https://github.com/weizhiao/rust-dynlinker/actions/workflows/rust.yml)
+![MSRV](https://img.shields.io/badge/rust-1.93.0%2B-blue.svg)
+[![License](https://img.shields.io/crates/l/dlopen-rs.svg)](LICENSE)
 
-<p align="center">
-  <b>纯 Rust 实现的 ELF 动态链接器、dlopen 兼容层，以及实验性的 Linux rtld。</b>
-</p>
+[English](README.md) | 简体中文
 
-<p align="center">
-  <a href="README.md">English</a> | <a href="README-zh_cn.md">简体中文</a>
-</p>
+`dlopen-rs` 是一个用 Rust 实现的 ELF 动态链接器，支持加载共享库和查询符号。
 
-`dlopen-rs` 提供了一套 Rust 友好的动态库加载 API，同时导出与 libc 兼容的 `dlopen`、`dlsym`、`dladdr`、`dl_iterate_phdr` 等接口。项目的核心目标是把 ELF 加载、依赖解析、重定位、符号查询和 TLS 管理放进 Rust 代码中，并逐步推进到可替换 glibc `ld.so` 的运行时链接器实现。
+项目基于 `elf_loader`，支持 `std` 和 `no_std`，面向 Linux 的 x86_64、AArch64 和 RISC-V 64 位架构。仓库还包含 C ABI 适配库和实验性的独立动态链接器 `rtld`。
 
-## 核心能力
+## 快速开始
 
-- **动态库加载：** 支持从路径或内存中的 ELF 字节加载动态库。
-- **依赖解析：** 支持 `DT_NEEDED`、`RPATH`、`RUNPATH`、`ld.so.cache` 和常见系统搜索路径。
-- **符号解析：** 提供 Rust API 与 C ABI 两套入口，支持全局作用域、依赖作用域和 `RTLD_NEXT` / `RTLD_DEFAULT`。
-- **重定位：** 支持常规动态重定位、PLT/GOT、延迟绑定和 RELR。
-- **TLS：** 支持动态 TLS、静态 TLS 注册，以及 rtld 启动阶段需要的初始线程 TLS。
-- **`no_std`：** 核心加载链路可在禁用 `std` 时工作，并可通过 `use-syscall` 走 Linux syscall 后端。
-- **replacement rtld：** `rtld` workspace crate 正在实现可作为 `ld-linux-x86-64.so.2` 使用的动态链接器产物。
-
-## 项目状态
-
-| 模块 | 状态 |
-| --- | --- |
-| Rust `ElfLibrary` API | 可用 |
-| libc 兼容 dlopen/dlsym/dladdr/dl_iterate_phdr | 可用 |
-| `LD_PRELOAD` 兼容库 | 可用 |
-| `no_std` + syscall 加载路径 | 可用，仍在完善边界 |
-| replacement rtld | 实验中，当前重点是 x86_64 Linux/glibc 兼容 |
-
-## 安装
-
-在普通 Rust 程序中使用：
+需要 **Rust 1.93.0 或更新版本**。在 `Cargo.toml` 中添加：
 
 ```toml
 [dependencies]
 dlopen-rs = "0.8.0"
 ```
 
-禁用 `std` 并使用 syscall 后端：
-
-```toml
-[dependencies]
-dlopen-rs = { version = "0.8.0", default-features = false, features = ["use-syscall"] }
-```
-
-## Rust API 示例
-
-先构建示例动态库：
-
-```shell
-cargo build --release -p example_dylib
-```
-
-然后运行 `dlopen-rs` 示例：
-
-```shell
-cargo run --release --example dlopen
-```
-
-核心代码：
+使用 `ElfLibrary::dlopen` 打开动态库，再通过 `get` 查找导出的符号：
 
 ```rust
 use dlopen_rs::{ElfLibrary, OpenFlags, Result};
 
 fn main() -> Result<()> {
-    let lib = ElfLibrary::dlopen("./target/release/libexample.so", OpenFlags::RTLD_LAZY)?;
+    let lib = ElfLibrary::dlopen(
+        "./target/release/libexample.so",
+        OpenFlags::RTLD_NOW,
+    )?;
     let add = unsafe { lib.get::<fn(i32, i32) -> i32>("add")? };
 
     println!("add(1, 1) = {}", add(1, 1));
@@ -83,101 +38,64 @@ fn main() -> Result<()> {
 }
 ```
 
-## LD_PRELOAD 兼容库
+这里使用的是仓库中示例库导出的 Rust 函数。`get` 要求调用方保证符号的类型和调用约定正确；如果加载的是 C 函数，应使用对应的 `extern "C" fn` 类型。返回的符号借用库句柄，使用期间需要保留该句柄。
 
-`cdylib` crate 会构建一个导出 libc dlopen 系列符号的兼容库：
+在仓库根目录运行下面的命令，即可构建示例库并体验加载流程：
 
-```shell
-cargo build --release -p cdylib
+```sh
 cargo build --release -p example_dylib
-cargo build --release --example preload
-
-RUST_LOG=trace \
-LD_PRELOAD=./target/release/libdlopen.so \
-./target/release/examples/preload
+cargo run --release --example dlopen
 ```
 
-这适合用来验证 `dlopen-rs` 对现有程序中 `dlopen`/`dlsym` 调用的接管能力。
+示例会输出 `add(1, 1) = 2`，同时打印加载日志。上面的路径使用 Cargo 默认的 `target` 目录。
 
-## replacement rtld
+更多用法见 [API 文档](https://docs.rs/dlopen-rs/) 和仓库示例：
 
-`rtld` crate 会构建一个实验性的 ELF interpreter，目标是逐步替换 glibc `ld-linux-x86-64.so.2`：
+| 示例 | 内容 |
+| --- | --- |
+| [dlopen](examples/dlopen.rs) | 从文件加载动态库并调用函数 |
+| [dlopen_from_binary](examples/dlopen_from_binary.rs) | 从内存中的 ELF 字节加载动态库 |
+| [symbol_info](examples/symbol_info.rs) | 查询地址对应的动态库与符号信息 |
 
-```shell
-cargo build-rtld
-```
+## 配置
 
-产物位于：
-
-```text
-target/x86_64-unknown-linux-none/release/librtld.so
-target/x86_64-unknown-linux-none/release/ld-linux-x86-64.so.2
-```
-
-这个路径使用 `x86_64-unknown-linux-none`、`-Z build-std=core,alloc,compiler_builtins` 和自定义 linker 参数。若当前工具链不支持 `-Z build-std`，请使用 nightly 工具链或配置对应的 Rust 工具链。
-
-## 开发命令
-
-仓库提供了几个 Cargo alias，用来区分 host/std 与 rtld/no_std 检查：
-
-```shell
-cargo check-host
-cargo check-rtld
-cargo build-rtld
-```
-
-常用验证组合：
-
-```shell
-cargo check-host
-cargo check-rtld
-cargo check --no-default-features --lib
-cargo check --no-default-features --features use-syscall --lib
-cargo test --test rtld_artifact rtld_artifact_has_interpreter_shape
-```
-
-## Feature Flags
-
-| Feature | 默认开启 | 说明 |
+| Feature | 默认启用 | 作用 |
 | --- | --- | --- |
-| `std` | 是 | 启用标准库集成、host 初始化和 ctor。 |
-| `use-syscall` | 否 | 使用 Linux syscall 后端，用于 `no_std`/rtld 路径；不能与 `std` 同时启用。 |
-| `version` | 否 | 启用 ELF 符号版本支持。 |
+| `std` | 是 | 使用标准库，并初始化与宿主动态链接器的集成 |
+| `use-syscall` | 否 | 使用 Linux 系统调用后端，适用于 `no_std` 场景 |
+| `version` | 否 | 启用 ELF 符号版本查询，如 `ElfLibrary::get_version` |
 
-## 架构支持
+`std` 与 `use-syscall` 不能同时启用。使用 `no_std` 和系统调用后端时，配置为：
 
-| 架构 | 动态库加载 | 延迟绑定 | replacement rtld |
-| --- | --- | --- | --- |
-| x86_64 Linux | 支持 | 支持 | 实验中 |
-| aarch64 | 支持 | 支持 | 暂未启用 |
-| riscv64 | 支持 | 部分路径仍在验证 | 暂未启用 |
-
-## 目录结构
-
-```text
-src/              Rust API、C ABI、loader/register 核心逻辑
-src/rtld.rs       no_std rtld 入口和 rtld 专用 TLS glue
-src/host_init.rs  std/host 模式下从宿主 ld.so 导入已加载对象
-cdylib/           LD_PRELOAD 兼容库
-rtld/             replacement ld.so 产物 crate
-rtld/impl/        no_std rtld 实现
-example-dylib/    示例动态库
-examples/         API 与 LD_PRELOAD 示例
-tests/            集成测试和 rtld 产物检查
+```toml
+[dependencies]
+dlopen-rs = { version = "0.8.0", default-features = false, features = ["use-syscall"] }
 ```
+
+`no_std` 模式仍依赖 `alloc`，最终程序需要提供内存分配器。
+
+## C ABI 与 LD_PRELOAD
+
+`dlopen_rs::api` 提供 `dlopen`、`dlsym`、`dlclose`、`dlerror`、`dladdr` 和 `dl_iterate_phdr` 等 C ABI 入口。
+
+仓库中的 [`cdylib`](cdylib/) 将相关接口导出为 `libdlopen.so`，用于 `LD_PRELOAD` 适配实验：
+
+```sh
+cargo build --release -p cdylib
+```
+
+默认产物为 `target/release/libdlopen.so`。这一适配层仍不完整，例如 `cdylib` 中的 `dlinfo` 尚未实现，`dlerror` 仍是占位实现。使用方式可参考 [preload 示例](examples/preload.rs)。
+
+## 独立动态链接器 rtld（实验性）
+
+仓库还提供实验性的独立动态链接器 `rtld`，目前面向 x86_64 Linux，尚未完整兼容 glibc `ld.so`。使用 nightly 工具链执行 `cargo +nightly build-rtld` 构建，详细说明见 [rtld README](rtld/README-zh_cn.md)。
+
+## 参与贡献
+
+欢迎通过 [Issue](https://github.com/weizhiao/rust-dynlinker/issues) 反馈问题，或提交 Pull Request。报告加载问题时，请附上操作系统、CPU 架构、Rust 版本、启用的 feature 和最小复现步骤。
+
+涉及 GDB、`r_debug` 或 `link_map` 的调试问题，可参考 [GDB 排查说明](TroubleshootingGdb.md)。
 
 ## 许可证
 
-基于 [Apache License 2.0](LICENSE) 许可。
-
-## 贡献
-
-欢迎提交 Issue 和 PR。涉及 GDB/r_debug/link_map 的调试问题，可以参考 [TroubleshootingGdb.md](TroubleshootingGdb.md)。
-
-<a href="https://github.com/weizhiao/dlopen-rs/graphs/contributors">
-  <img src="https://contributors-img.web.app/image?repo=weizhiao/dlopen-rs" alt="Project Contributors" />
-</a>
-
----
-
-**最低支持 Rust 版本 (MSRV):** 1.93.0 或更高。
+本项目采用 [Apache License 2.0](LICENSE)。
